@@ -30,7 +30,7 @@ T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
-TARGET_METRIC_PERCENTILES = ("p50", "p90", "p99")
+TARGET_METRIC_PERCENTILES = ("p50", "p90")
 
 
 def _opt_int(row: dict, key: str) -> int | None:
@@ -807,33 +807,25 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     if not changed:
         return ""
 
-    def target_metric_change_summary(metric: dict) -> str:
-        parts = []
+    lines = [
+        "### Target Counter Metrics",
+        "",
+        "| Metric | Baseline / block | Feature / block | Change |",
+        "|--------|------------------|-----------------|--------|",
+    ]
+    for metric in changed:
         for stat_name in TARGET_METRIC_PERCENTILES:
             change = metric["changes"][stat_name]
             if change["sig"] == "neutral":
                 continue
-            parts.append(
-                f"{stat_name.upper()} {change_str(change['pct'], change['ci_pct'], metric['target'] == 'decrease')}"
+            lines.append(
+                "| `{}` | {} | {} | {} |".format(
+                    f"{metric['name']} {stat_name}",
+                    fmt_metric_value(change["baseline"]),
+                    fmt_metric_value(change["feature"]),
+                    change_str(change["pct"], change["ci_pct"], metric["target"] == "decrease"),
+                )
             )
-        return ", ".join(parts)
-
-    lines = [
-        "### Target Counter Metrics",
-        "",
-        "| Metric | Target | Baseline / block | Feature / block | Change |",
-        "|--------|--------|------------------|-----------------|--------|",
-    ]
-    for metric in changed:
-        lines.append(
-            "| `{}` | {} | {} | {} | {} |".format(
-                metric["name"],
-                metric["target"],
-                fmt_metric_value(metric["baseline"]["mean"]),
-                fmt_metric_value(metric["feature"]["mean"]),
-                target_metric_change_summary(metric),
-            )
-        )
 
     lines.extend(
         [

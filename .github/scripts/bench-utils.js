@@ -22,17 +22,6 @@ function fmtChange(ch) {
   return `${pctStr}${ciStr} ${SIG_EMOJI[ch.sig]}`;
 }
 
-function fmtTargetMetricChange(metric) {
-  const changes = metric && metric.changes ? metric.changes : {};
-  const parts = [];
-  for (const stat of ['p50', 'p90', 'p99']) {
-    const change = changes[stat];
-    if (!change || change.sig === 'neutral') continue;
-    parts.push(`${stat.toUpperCase()} ${fmtChange(change)}`);
-  }
-  return parts.join(', ');
-}
-
 function allChanges(summary) {
   const primary = Object.values(summary.changes || {}).filter(v => v && typeof v === 'object' && typeof v.sig === 'string');
   const target = ((summary.target_metrics && summary.target_metrics.changed) || [])
@@ -123,13 +112,20 @@ function waitTimeRows(summary) {
 
 function targetMetricRows(summary) {
   const changed = (summary.target_metrics && summary.target_metrics.changed) || [];
-  return changed.map(metric => ({
-    title: metric.name,
-    target: metric.target,
-    baseline: fmtMetricValue(metric.baseline.mean),
-    feature: fmtMetricValue(metric.feature.mean),
-    change: fmtTargetMetricChange(metric),
-  }));
+  const rows = [];
+  for (const metric of changed) {
+    for (const stat of ['p50', 'p90']) {
+      const change = metric.changes && metric.changes[stat];
+      if (!change || change.sig === 'neutral') continue;
+      rows.push({
+        title: `${metric.name} ${stat}`,
+        baseline: fmtMetricValue(change.baseline),
+        feature: fmtMetricValue(change.feature),
+        change: fmtChange(change),
+      });
+    }
+  }
+  return rows;
 }
 
 module.exports = {
@@ -139,7 +135,6 @@ module.exports = {
   fmtS,
   fmtMetricValue,
   fmtChange,
-  fmtTargetMetricChange,
   allChanges,
   verdict,
   loadSamplyUrls,
