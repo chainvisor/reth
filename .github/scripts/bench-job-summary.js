@@ -69,13 +69,13 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
 
   const tmRows = targetMetricRows(summary);
   if (tmRows.length > 0) {
-    md += `### Target Prometheus Metrics\n\n`;
+    md += `### Target Counter Metrics\n\n`;
     md += `| Metric | Target | Baseline / block | Feature / block | Change |\n`;
     md += `|--------|--------|------------------|-----------------|--------|\n`;
     for (const r of tmRows) {
       md += `| \`${r.title}\` | ${r.target} | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
     }
-    md += `\n*Values are Prometheus counter increases divided by the canonical chain-height delta over each benchmark window.*\n\n`;
+    md += `\n*Values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*\n\n`;
   }
 
   // Charts

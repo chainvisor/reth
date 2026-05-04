@@ -11,12 +11,27 @@ Returns empty 200 when reth is not running (clean Grafana gaps).
 import argparse
 import ipaddress
 import json
+from pathlib import Path
+import re
 import subprocess
 import sys
+import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import urlopen
 from urllib.error import URLError
+from urllib.request import urlopen
+
+
+TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
+SAMPLE_RE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+"
+    r"(?P<value>[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?Inf|NaN)"
+    r"(?:\s+[0-9]+)?$"
+)
+SELECTOR_RE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
+)
+INTERNAL_LABEL_KEYS = ("run_start_epoch", "reference_epoch", "target_metrics_file")
 
 
 def read_labels(path):
@@ -25,6 +40,160 @@ def read_labels(path):
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def read_target_metrics_config(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def parse_label_string(text):
+    if not text:
+        return {}
+
+    labels = {}
+    parts = []
+    current = []
+    in_quotes = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            current.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            current.append(ch)
+            in_quotes = not in_quotes
+            continue
+        if ch == "," and not in_quotes:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+
+    for part in parts:
+        if not part:
+            continue
+        key, value = part.split("=", 1)
+        labels[key.strip()] = bytes(value.strip()[1:-1], "utf-8").decode("unicode_escape")
+    return labels
+
+
+def parse_target_metric_query(query):
+    query = query.strip()
+    aggregate = "single"
+    inner = query
+    if query.startswith("sum(") and query.endswith(")"):
+        aggregate = "sum"
+        inner = query[4:-1].strip()
+
+    match = SELECTOR_RE.match(inner)
+    if not match:
+        raise ValueError(f"Unsupported target metric query: {query}")
+    return aggregate, match.group("name"), parse_label_string(match.group("labels"))
+
+
+def parse_samples(metrics_text):
+    samples = []
+    for line in metrics_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = SAMPLE_RE.match(line)
+        if not match:
+            continue
+        samples.append(
+            {
+                "name": match.group("name"),
+                "labels": parse_label_string(match.group("labels")),
+                "value": float(match.group("value")),
+            }
+        )
+    return samples
+
+
+def evaluate_query(samples, query):
+    aggregate, metric_name, label_filters = parse_target_metric_query(query)
+    matches = [
+        sample["value"]
+        for sample in samples
+        if sample["name"] == metric_name
+        and all(sample["labels"].get(key) == value for key, value in label_filters.items())
+    ]
+
+    if not matches:
+        raise ValueError(f"Query matched no samples: {query}")
+
+    if aggregate == "sum":
+        return float(sum(matches))
+    if len(matches) > 1:
+        raise ValueError(
+            f"Query matched {len(matches)} samples; use sum(...) or label filters: {query}"
+        )
+    return float(matches[0])
+
+
+def scrape_target_metrics(metrics_text, config):
+    samples = parse_samples(metrics_text)
+    values = {
+        TARGET_METRIC_BLOCK_HEIGHT_QUERY: evaluate_query(samples, TARGET_METRIC_BLOCK_HEIGHT_QUERY),
+    }
+    for counter in config.get("counters", []):
+        values[counter["query"]] = evaluate_query(samples, counter["query"])
+    return values
+
+
+class TargetMetricScraper(threading.Thread):
+    def __init__(self, labels_file, upstream, config_path, interval_s):
+        super().__init__(daemon=True)
+        self.labels_file = labels_file
+        self.upstream = upstream
+        self.config = read_target_metrics_config(config_path)
+        self.interval_s = interval_s
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                self.scrape_once()
+            except Exception as exc:
+                print(f"target metric scrape failed: {exc}", file=sys.stderr, flush=True)
+            self.stop_event.wait(self.interval_s)
+
+    def scrape_once(self):
+        labels = read_labels(self.labels_file)
+        output_path = labels.get("target_metrics_file")
+        if not output_path:
+            return
+
+        try:
+            with urlopen(self.upstream, timeout=2) as resp:
+                metrics_text = resp.read().decode("utf-8")
+        except (URLError, ConnectionError, OSError):
+            return
+
+        values = scrape_target_metrics(metrics_text, self.config)
+        record = {
+            "benchmark_id": labels.get("benchmark_id"),
+            "benchmark_run": labels.get("benchmark_run"),
+            "timestamp_ms": time.time_ns() // 1_000_000,
+            "block_height": values.pop(TARGET_METRIC_BLOCK_HEIGHT_QUERY),
+            "values": values,
+        }
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "a") as f:
+            json.dump(record, f, sort_keys=True)
+            f.write("\n")
 
 
 def inject_labels(metrics_bytes, label_str, label_names):
@@ -112,8 +281,7 @@ def build_elapsed_gauge(labels):
     except (ValueError, TypeError):
         return b""
     # Build labels excluding internal keys
-    display = {k: v for k, v in labels.items()
-               if k not in ("run_start_epoch", "reference_epoch")}
+    display = {k: v for k, v in labels.items() if k not in INTERNAL_LABEL_KEYS}
     lstr = build_label_str(display)
     return (
         f"# HELP bench_elapsed_seconds Seconds since benchmark run started\n"
@@ -178,8 +346,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
         all_labels = read_labels(self.server.labels_file)
         # Internal keys — not injected as Prometheus labels
-        internal = ("run_start_epoch", "reference_epoch")
-        labels = {k: v for k, v in all_labels.items() if k not in internal}
+        labels = {k: v for k, v in all_labels.items() if k not in INTERNAL_LABEL_KEYS}
         label_str = build_label_str(labels)
         label_names = sorted(labels.keys())
 
@@ -243,6 +410,10 @@ def main():
                         help="Path to JSON file with labels to inject (default: /tmp/bench-metrics-labels.json)")
     parser.add_argument("--upstream", default="http://127.0.0.1:9100/",
                         help="Upstream reth metrics URL (default: http://127.0.0.1:9100/)")
+    parser.add_argument("--target-metrics-config", default=None,
+                        help="Target metrics config to periodically scrape into per-run files")
+    parser.add_argument("--scrape-interval", type=float, default=1.0,
+                        help="Seconds between background target-metric scrapes (default: 1.0)")
 
     bind_group = parser.add_mutually_exclusive_group()
     bind_group.add_argument("--bind", default=None,
@@ -265,11 +436,27 @@ def main():
     server.upstream = args.upstream
     server.labels_file = args.labels
 
+    scraper = None
+    if args.target_metrics_config:
+        scraper = TargetMetricScraper(
+            labels_file=args.labels,
+            upstream=args.upstream,
+            config_path=args.target_metrics_config,
+            interval_s=args.scrape_interval,
+        )
+        scraper.start()
+
     print(f"bench-metrics-proxy listening on {bind_addr}:{args.port}")
     print(f"  upstream: {args.upstream}")
     print(f"  labels:   {args.labels}")
+    if args.target_metrics_config:
+        print(f"  target metrics: {args.target_metrics_config} ({args.scrape_interval:.2f}s interval)")
     sys.stdout.flush()
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if scraper is not None:
+            scraper.stop()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,17 @@ function fmtChange(ch) {
   return `${pctStr}${ciStr} ${SIG_EMOJI[ch.sig]}`;
 }
 
+function fmtTargetMetricChange(metric) {
+  const changes = metric && metric.changes ? metric.changes : {};
+  const parts = [];
+  for (const stat of ['p50', 'p90', 'p99']) {
+    const change = changes[stat];
+    if (!change || change.sig === 'neutral') continue;
+    parts.push(`${stat.toUpperCase()} ${fmtChange(change)}`);
+  }
+  return parts.join(', ');
+}
+
 function allChanges(summary) {
   const primary = Object.values(summary.changes || {}).filter(v => v && typeof v === 'object' && typeof v.sig === 'string');
   const target = ((summary.target_metrics && summary.target_metrics.changed) || [])
@@ -117,7 +128,7 @@ function targetMetricRows(summary) {
     target: metric.target,
     baseline: fmtMetricValue(metric.baseline.mean),
     feature: fmtMetricValue(metric.feature.mean),
-    change: fmtChange(metric.change),
+    change: fmtTargetMetricChange(metric),
   }));
 }
 
@@ -128,6 +139,7 @@ module.exports = {
   fmtS,
   fmtMetricValue,
   fmtChange,
+  fmtTargetMetricChange,
   allChanges,
   verdict,
   loadSamplyUrls,

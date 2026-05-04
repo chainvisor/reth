@@ -480,11 +480,17 @@ jobs:
           echo '{}' > "$LABELS_FILE"
           echo "BENCH_LABELS_FILE=${LABELS_FILE}" >> "$GITHUB_ENV"
 
-          python3 .github/scripts/bench-metrics-proxy.py \
-            --labels "$LABELS_FILE" \
-            --upstream "http://${BENCH_METRICS_ADDR}/" \
-            --subnet 10.10.0.0/24 \
-            --port 9090 &
+          METRICS_PROXY_ARGS=(
+            --labels "$LABELS_FILE"
+            --upstream "http://${BENCH_METRICS_ADDR}/"
+            --subnet 10.10.0.0/24
+            --port 9090
+          )
+          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+            METRICS_PROXY_ARGS+=(--target-metrics-config "$BENCH_TARGET_METRICS_CONFIG")
+          fi
+
+          python3 .github/scripts/bench-metrics-proxy.py "${METRICS_PROXY_ARGS[@]}" &
           PROXY_PID=$!
           echo "BENCH_METRICS_PROXY_PID=${PROXY_PID}" >> "$GITHUB_ENV"
           echo "Metrics proxy started (PID $PROXY_PID)"
@@ -493,24 +499,27 @@ jobs:
       - name: "Run benchmark: baseline (1/2)"
         id: run-baseline-1
         run: |
+          LAST_RUN_START=$(date +%s)
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
+          {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/baseline-1/target-metrics-scrapes.jsonl"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh baseline ../reth-baseline/target/profiling/reth "$BENCH_WORK_DIR/baseline-1"
 
       - name: "Run benchmark: feature (1/2)"
         id: run-feature-1
         run: |
+          LAST_RUN_START=$(date +%s)
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
+          {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/feature-1/target-metrics-scrapes.jsonl"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh feature ../reth-feature/target/profiling/reth "$BENCH_WORK_DIR/feature-1"
 
       - name: "Run benchmark: feature (2/2)"
         id: run-feature-2
         run: |
+          LAST_RUN_START=$(date +%s)
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
+          {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/feature-2/target-metrics-scrapes.jsonl"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh feature ../reth-feature/target/profiling/reth "$BENCH_WORK_DIR/feature-2"
 
@@ -520,7 +529,7 @@ jobs:
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"baseline-2","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
+          {"benchmark_run":"baseline-2","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/baseline-2/target-metrics-scrapes.jsonl"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh baseline ../reth-baseline/target/profiling/reth "$BENCH_WORK_DIR/baseline-2"
 
@@ -730,13 +739,13 @@ jobs:
 
             const tmRows = targetMetricRows(summary);
             if (tmRows.length > 0) {
-              md += `### Target Prometheus Metrics\n\n`;
+              md += `### Target Counter Metrics\n\n`;
               md += `| Metric | Target | Baseline | Feature | Change |\n`;
               md += `|--------|--------|----------|---------|--------|\n`;
               for (const r of tmRows) {
                 md += `| \`${r.title}\` | ${r.target} | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
               }
-              md += '\n';
+              md += `\n*Values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*\n\n`;
             }
 
             // Charts

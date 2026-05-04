@@ -20,19 +20,17 @@ import argparse
 import csv
 import json
 import math
-import os
 from pathlib import Path
 import random
 import re
 import sys
-import urllib.parse
-import urllib.request
 
 GIGAGAS = 1_000_000_000
 T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
+TARGET_METRIC_PERCENTILES = ("p50", "p90", "p99")
 
 
 def _opt_int(row: dict, key: str) -> int | None:
@@ -354,12 +352,6 @@ def change_str(pct: float, ci_pct: float, lower_is_better: bool) -> str:
     return f"{pct:+.2f}% {emoji} (±{ci_pct:.2f}%)"
 
 
-def target_change_str(pct: float, lower_is_better: bool) -> str:
-    sig = significance(pct, 0.0, lower_is_better)
-    emoji = {"good": "✅", "bad": "❌", "neutral": "⚪"}[sig]
-    return f"{pct:+.2f}% {emoji}"
-
-
 def compute_changes(
     baseline_stats: dict, feature_stats: dict, paired_stats: dict
 ) -> dict:
@@ -402,89 +394,6 @@ def target_metric_label(query: str) -> str:
     return re.sub(r"\s+", "", target_metric_name(query))
 
 
-def parse_label_string(text: str | None) -> dict[str, str]:
-    if not text:
-        return {}
-
-    labels = {}
-    parts = []
-    current = []
-    in_quotes = False
-    escaped = False
-    for ch in text:
-        if escaped:
-            current.append(ch)
-            escaped = False
-            continue
-        if ch == "\\":
-            current.append(ch)
-            escaped = True
-            continue
-        if ch == '"':
-            current.append(ch)
-            in_quotes = not in_quotes
-            continue
-        if ch == "," and not in_quotes:
-            parts.append("".join(current).strip())
-            current = []
-            continue
-        current.append(ch)
-    if current:
-        parts.append("".join(current).strip())
-
-    for part in parts:
-        if not part:
-            continue
-        key, value = part.split("=", 1)
-        labels[key.strip()] = bytes(value.strip()[1:-1], "utf-8").decode("unicode_escape")
-    return labels
-
-
-SELECTOR_RE = re.compile(
-    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
-)
-
-
-def parse_target_metric_query(query: str) -> tuple[str, str, dict[str, str]]:
-    query = query.strip()
-    aggregate = "single"
-    inner = query
-    if query.startswith("sum(") and query.endswith(")"):
-        aggregate = "sum"
-        inner = query[4:-1].strip()
-
-    match = SELECTOR_RE.match(inner)
-    if not match:
-        raise ValueError(f"Unsupported target metric query: {query}")
-    return aggregate, match.group("name"), parse_label_string(match.group("labels"))
-
-
-def escape_prometheus_label_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def selector_with_labels(metric_name: str, labels: dict[str, str]) -> str:
-    if not labels:
-        return metric_name
-    label_text = ",".join(
-        f'{key}="{escape_prometheus_label_value(value)}"'
-        for key, value in sorted(labels.items())
-    )
-    return f"{metric_name}{{{label_text}}}"
-
-
-def merge_label_filters(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
-    merged = dict(base)
-    for key, value in extra.items():
-        existing = merged.get(key)
-        if existing is not None and existing != value:
-            raise ValueError(
-                f"Target metric query already constrains label '{key}' to '{existing}', cannot also require '{value}'"
-            )
-        merged[key] = value
-    return merged
-
-
 def load_target_metric_range(path: str) -> dict:
     range_path = Path(path).with_name("target-metrics-range.json")
     with open(range_path) as f:
@@ -493,135 +402,122 @@ def load_target_metric_range(path: str) -> dict:
         raise ValueError(f"Missing benchmark_id in {range_path}")
     metadata["benchmark_run"] = run_label_from_path(path)
     if metadata.get("duration_ms", 0) <= 0:
-        raise ValueError(f"Non-positive target metric query range in {range_path}")
+        raise ValueError(f"Non-positive target metric scrape range in {range_path}")
     return metadata
 
 
-def prometheus_api_base_url() -> str:
-    api_url = os.environ.get("BENCH_PROMETHEUS_API_URL", "")
-    if api_url:
-        return api_url.rstrip("/")
-
-    grafana_url = (
-        os.environ.get("BENCH_GRAFANA_URL")
-        or os.environ.get("FETCH_GRAFANA_DASHBOARD_URL")
-        or ""
-    ).rstrip("/")
-    if not grafana_url:
-        return ""
-
-    datasource_uid = os.environ.get("BENCH_GRAFANA_DATASOURCE_UID", "ef57fux92e9z4e")
-    return f"{grafana_url}/api/datasources/proxy/uid/{datasource_uid}"
-
-
-def prometheus_api_token() -> str:
-    return (
-        os.environ.get("BENCH_PROMETHEUS_API_TOKEN")
-        or os.environ.get("BENCH_GRAFANA_TOKEN")
-        or os.environ.get("FETCH_GRAFANA_DASHBOARD_TOKEN")
-        or ""
-    )
+def load_target_metric_scrapes(path: str) -> list[dict]:
+    scrape_path = Path(path).with_name("target-metrics-scrapes.jsonl")
+    scrapes = []
+    with open(scrape_path) as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                scrape = json.loads(line)
+            except json.JSONDecodeError as err:
+                raise ValueError(f"Invalid target metric scrape JSON in {scrape_path}:{line_number}: {err}") from err
+            if "timestamp_ms" not in scrape or "block_height" not in scrape or "values" not in scrape:
+                raise ValueError(f"Incomplete target metric scrape record in {scrape_path}:{line_number}")
+            scrapes.append(scrape)
+    if not scrapes:
+        raise ValueError(f"No target metric scrapes found in {scrape_path}")
+    return scrapes
 
 
-def query_prometheus(query: str, eval_time_s: float) -> list[float]:
-    base_url = prometheus_api_base_url()
-    token = prometheus_api_token()
-    if not base_url or not token:
-        raise ValueError(
-            "Target metrics require Grafana/Prometheus query access. Set BENCH_GRAFANA_URL and BENCH_GRAFANA_TOKEN, "
-            "or BENCH_PROMETHEUS_API_URL and BENCH_PROMETHEUS_API_TOKEN."
-        )
-
-    params = urllib.parse.urlencode({"query": query, "time": f"{eval_time_s:.3f}"})
-    req = urllib.request.Request(
-        f"{base_url}/api/v1/query?{params}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    with urllib.request.urlopen(req) as resp:
-        payload = json.loads(resp.read())
-
-    if payload.get("status") != "success":
-        raise ValueError(f"Prometheus query failed: {payload}")
-
-    data = payload.get("data", {})
-    result_type = data.get("resultType")
-    if result_type == "scalar":
-        return [float(data["result"][1])]
-    if result_type != "vector":
-        raise ValueError(f"Unsupported Prometheus result type '{result_type}' for query: {query}")
-    return [float(item["value"][1]) for item in data.get("result", [])]
-
-
-def query_single_prometheus_value(query: str, eval_time_s: float) -> float:
-    values = query_prometheus(query, eval_time_s)
+def compute_target_metric_series_stats(values: list[float]) -> dict[str, float]:
     if not values:
-        raise ValueError(f"Prometheus query returned no series: {query}")
-    if len(values) > 1:
-        raise ValueError(f"Prometheus query returned {len(values)} series; expected 1: {query}")
-    return values[0]
+        raise ValueError("Target metric series was empty")
+    sorted_values = sorted(values)
+    return {
+        "mean": sum(values) / len(values),
+        "p50": percentile(sorted_values, 50),
+        "p90": percentile(sorted_values, 90),
+        "p99": percentile(sorted_values, 99),
+    }
 
 
-def build_counter_increase_query(
-    query: str,
-    benchmark_id: str,
-    benchmark_run: str,
-    duration_ms: int,
-) -> str:
-    aggregate, metric_name, label_filters = parse_target_metric_query(query)
-    labels = merge_label_filters(
-        label_filters,
-        {"benchmark_id": benchmark_id, "benchmark_run": benchmark_run},
-    )
-    selector = selector_with_labels(metric_name, labels)
-    range_selector = f"{selector}[{duration_ms}ms]"
-    if aggregate == "sum":
-        return f"sum(increase({range_selector}))"
-    return f"increase({range_selector})"
-
-
-def build_block_height_delta_query(benchmark_id: str, benchmark_run: str, duration_ms: int) -> str:
-    selector = selector_with_labels(
-        TARGET_METRIC_BLOCK_HEIGHT_QUERY,
-        {"benchmark_id": benchmark_id, "benchmark_run": benchmark_run},
-    )
-    return f"max(delta({selector}[{duration_ms}ms]))"
+def target_metric_stat_value(values: list[float], stat_name: str) -> float:
+    if stat_name == "mean":
+        return sum(values) / len(values)
+    if stat_name == "p50":
+        return percentile(sorted(values), 50)
+    if stat_name == "p90":
+        return percentile(sorted(values), 90)
+    if stat_name == "p99":
+        return percentile(sorted(values), 99)
+    raise ValueError(f"Unsupported target metric statistic: {stat_name}")
 
 
 def query_target_metric_run(path: str, config: dict) -> tuple[str, dict[str, dict]]:
     run_label = run_label_from_path(path)
     metadata = load_target_metric_range(path)
-    benchmark_id = metadata["benchmark_id"]
-    benchmark_run = metadata["benchmark_run"]
-    duration_ms = int(metadata["duration_ms"])
-    eval_time_s = float(metadata["range_end_ms"]) / 1000.0
-
-    block_height_delta = query_single_prometheus_value(
-        build_block_height_delta_query(benchmark_id, benchmark_run, duration_ms),
-        eval_time_s,
-    )
-    if block_height_delta <= EPSILON:
+    scrapes = load_target_metric_scrapes(path)
+    range_start_ms = int(metadata["range_start_ms"])
+    range_end_ms = int(metadata["range_end_ms"])
+    relevant_scrapes = [
+        scrape
+        for scrape in scrapes
+        if range_start_ms <= int(scrape["timestamp_ms"]) <= range_end_ms
+    ]
+    relevant_scrapes.sort(key=lambda scrape: int(scrape["timestamp_ms"]))
+    if len(relevant_scrapes) < 2:
         raise ValueError(
-            f"Prometheus block-height delta for run '{run_label}' was {block_height_delta}; expected a positive value"
+            f"Target metric scrapes for run '{run_label}' only had {len(relevant_scrapes)} samples inside the benchmark window"
         )
 
     counters = {}
     for counter in config.get("counters", []):
         query = counter["query"]
-        counter_increase = query_single_prometheus_value(
-            build_counter_increase_query(query, benchmark_id, benchmark_run, duration_ms),
-            eval_time_s,
-        )
+        interval_values = []
+        counter_increase = 0.0
+        block_height_delta = 0.0
+        for previous_scrape, current_scrape in zip(relevant_scrapes, relevant_scrapes[1:]):
+            previous_values = previous_scrape.get("values", {})
+            current_values = current_scrape.get("values", {})
+            if query not in previous_values or query not in current_values:
+                raise ValueError(f"Missing target metric '{query}' in scrape file for run '{run_label}'")
+
+            current_block_height = float(current_scrape["block_height"])
+            previous_block_height = float(previous_scrape["block_height"])
+            interval_block_height_delta = current_block_height - previous_block_height
+            if interval_block_height_delta <= EPSILON:
+                continue
+
+            interval_counter_delta = float(current_values[query]) - float(previous_values[query])
+            if interval_counter_delta < -EPSILON:
+                raise ValueError(
+                    f"Target metric '{query}' decreased within run '{run_label}', which is not valid for counters"
+                )
+
+            counter_increase += interval_counter_delta
+            block_height_delta += interval_block_height_delta
+            interval_values.append(interval_counter_delta / interval_block_height_delta)
+
+        if not interval_values:
+            raise ValueError(
+                f"Target metric '{query}' in run '{run_label}' had no positive block-height scrape intervals"
+            )
+
+        stats = compute_target_metric_series_stats(interval_values)
         counters[query] = {
             "query": query,
             "target": counter["target"],
             "counter_increase": counter_increase,
             "block_height_delta": block_height_delta,
-            "value": counter_increase / block_height_delta,
-            "duration_ms": duration_ms,
-            "range_start_ms": int(metadata["range_start_ms"]),
-            "range_end_ms": int(metadata["range_end_ms"]),
-            "benchmark_id": benchmark_id,
-            "benchmark_run": benchmark_run,
+            "mean": stats["mean"],
+            "p50": stats["p50"],
+            "p90": stats["p90"],
+            "p99": stats["p99"],
+            "intervals": len(interval_values),
+            "scrapes": len(relevant_scrapes),
+            "duration_ms": int(metadata["duration_ms"]),
+            "range_start_ms": range_start_ms,
+            "range_end_ms": range_end_ms,
+            "benchmark_id": metadata["benchmark_id"],
+            "benchmark_run": metadata["benchmark_run"],
+            "_values": interval_values,
         }
     return run_label, counters
 
@@ -630,39 +526,71 @@ def run_label_from_path(path: str) -> str:
     return Path(path).parent.name or Path(path).stem
 
 
-def consistent_direction(diffs: list[float], positive: bool) -> bool:
-    if not diffs:
-        return False
-    if positive:
-        return all(diff >= -EPSILON for diff in diffs) and any(diff > EPSILON for diff in diffs)
-    return all(diff <= EPSILON for diff in diffs) and any(diff < -EPSILON for diff in diffs)
+def summarize_target_metric_runs(run_items: list[dict]) -> dict:
+    return {
+        "mean": sum(item["mean"] for item in run_items) / len(run_items),
+        "p50": sum(item["p50"] for item in run_items) / len(run_items),
+        "p90": sum(item["p90"] for item in run_items) / len(run_items),
+        "p99": sum(item["p99"] for item in run_items) / len(run_items),
+        "runs": run_items,
+    }
 
 
-def classify_target_metric(
-    baseline_values: list[float], feature_values: list[float], target: str
-) -> tuple[str, str]:
-    baseline_mean = sum(baseline_values) / len(baseline_values)
-    feature_mean = sum(feature_values) / len(feature_values)
-    mean_diff = feature_mean - baseline_mean
-    improved_positive = target == "increase"
+def compute_target_metric_change(
+    baseline_runs: list[dict],
+    feature_runs: list[dict],
+    query: str,
+    target: str,
+    stat_name: str,
+) -> dict:
+    baseline_value = sum(run[stat_name] for run in baseline_runs) / len(baseline_runs)
+    feature_value = sum(run[stat_name] for run in feature_runs) / len(feature_runs)
+    diff = feature_value - baseline_value
 
-    if len(baseline_values) > 1 and len(feature_values) > 1:
-        pair_diffs = [feature - baseline for baseline, feature in zip(baseline_values, feature_values)]
-        if consistent_direction(pair_diffs, improved_positive) and (
-            mean_diff >= -EPSILON if improved_positive else mean_diff <= EPSILON
-        ):
-            return "good", "abba-paired-runs"
-        if consistent_direction(pair_diffs, not improved_positive) and (
-            mean_diff <= EPSILON if improved_positive else mean_diff >= -EPSILON
-        ):
-            return "bad", "abba-paired-runs"
-        return "neutral", "abba-paired-runs"
+    rng = random.Random(f"{query}:{stat_name}")
+    boot_diffs = []
+    for _ in range(BOOTSTRAP_ITERATIONS):
+        pair_diffs = []
+        for baseline_run, feature_run in zip(baseline_runs, feature_runs):
+            baseline_sample = rng.choices(baseline_run["_values"], k=len(baseline_run["_values"]))
+            feature_sample = rng.choices(feature_run["_values"], k=len(feature_run["_values"]))
+            pair_diffs.append(
+                target_metric_stat_value(feature_sample, stat_name)
+                - target_metric_stat_value(baseline_sample, stat_name)
+            )
+        boot_diffs.append(sum(pair_diffs) / len(pair_diffs))
 
-    if abs(mean_diff) <= EPSILON:
-        return "neutral", "single-run"
-    if improved_positive:
-        return ("good", "single-run") if mean_diff > 0 else ("bad", "single-run")
-    return ("good", "single-run") if mean_diff < 0 else ("bad", "single-run")
+    boot_diffs.sort()
+    lo = int(BOOTSTRAP_ITERATIONS * 0.025)
+    hi = int(BOOTSTRAP_ITERATIONS * 0.975)
+    ci = (boot_diffs[hi] - boot_diffs[lo]) / 2
+    pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+    ci_pct = (ci / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+    return {
+        "baseline": baseline_value,
+        "feature": feature_value,
+        "diff": round(diff, 6),
+        "pct": round(pct, 4),
+        "ci": round(ci, 6),
+        "ci_pct": round(ci_pct, 4),
+        "sig": significance(pct, ci_pct, lower_is_better=target == "decrease"),
+        "method": "abba-paired-interval-bootstrap" if len(baseline_runs) > 1 else "single-run-interval-bootstrap",
+    }
+
+
+def summarize_target_metric_change(changes: dict[str, dict]) -> dict:
+    significant = [name for name in TARGET_METRIC_PERCENTILES if changes[name]["sig"] != "neutral"]
+    if not significant:
+        sig = "neutral"
+    elif any(changes[name]["sig"] == "bad" for name in significant):
+        sig = "bad"
+    else:
+        sig = "good"
+    return {
+        "sig": sig,
+        "method": changes[TARGET_METRIC_PERCENTILES[0]]["method"],
+        "significant_percentiles": significant,
+    }
 
 
 def compute_target_metric_summary(
@@ -683,71 +611,93 @@ def compute_target_metric_summary(
 
         baseline_values = []
         feature_values = []
+        baseline_runs_for_stats = []
+        feature_runs_for_stats = []
         for run_label, run_data in baseline_runs:
             if query not in run_data:
                 raise ValueError(f"Missing target metric '{query}' in baseline run '{run_label}'")
+            run_metric = run_data[query]
+            baseline_runs_for_stats.append(run_metric)
             baseline_values.append(
                 {
                     "run": run_label,
-                    "value": float(run_data[query]["value"]),
-                    "counter_increase": float(run_data[query]["counter_increase"]),
-                    "block_height_delta": float(run_data[query]["block_height_delta"]),
-                    "duration_ms": int(run_data[query]["duration_ms"]),
+                    "mean": float(run_metric["mean"]),
+                    "p50": float(run_metric["p50"]),
+                    "p90": float(run_metric["p90"]),
+                    "p99": float(run_metric["p99"]),
+                    "counter_increase": float(run_metric["counter_increase"]),
+                    "block_height_delta": float(run_metric["block_height_delta"]),
+                    "intervals": int(run_metric["intervals"]),
+                    "scrapes": int(run_metric["scrapes"]),
+                    "duration_ms": int(run_metric["duration_ms"]),
                 }
             )
         for run_label, run_data in feature_runs:
             if query not in run_data:
                 raise ValueError(f"Missing target metric '{query}' in feature run '{run_label}'")
+            run_metric = run_data[query]
+            feature_runs_for_stats.append(run_metric)
             feature_values.append(
                 {
                     "run": run_label,
-                    "value": float(run_data[query]["value"]),
-                    "counter_increase": float(run_data[query]["counter_increase"]),
-                    "block_height_delta": float(run_data[query]["block_height_delta"]),
-                    "duration_ms": int(run_data[query]["duration_ms"]),
+                    "mean": float(run_metric["mean"]),
+                    "p50": float(run_metric["p50"]),
+                    "p90": float(run_metric["p90"]),
+                    "p99": float(run_metric["p99"]),
+                    "counter_increase": float(run_metric["counter_increase"]),
+                    "block_height_delta": float(run_metric["block_height_delta"]),
+                    "intervals": int(run_metric["intervals"]),
+                    "scrapes": int(run_metric["scrapes"]),
+                    "duration_ms": int(run_metric["duration_ms"]),
                 }
             )
 
-        baseline_series = [item["value"] for item in baseline_values]
-        feature_series = [item["value"] for item in feature_values]
-        baseline_mean = sum(baseline_series) / len(baseline_series)
-        feature_mean = sum(feature_series) / len(feature_series)
-        pct = (feature_mean - baseline_mean) / baseline_mean * 100.0 if abs(baseline_mean) > EPSILON else 0.0
-        sig, method = classify_target_metric(baseline_series, feature_series, target)
+        changes = {
+            stat_name: compute_target_metric_change(
+                baseline_runs_for_stats,
+                feature_runs_for_stats,
+                query,
+                target,
+                stat_name,
+            )
+            for stat_name in TARGET_METRIC_PERCENTILES
+        }
+        change = summarize_target_metric_change(changes)
 
         entry = {
             "kind": "counter",
             "name": target_metric_label(query),
             "query": query,
             "target": target,
-            "baseline": {"mean": baseline_mean, "runs": baseline_values},
-            "feature": {"mean": feature_mean, "runs": feature_values},
-            "change": {
-                "pct": round(pct, 4),
-                "sig": sig,
-                "method": method,
-            },
+            "baseline": summarize_target_metric_runs(baseline_values),
+            "feature": summarize_target_metric_runs(feature_values),
+            "changes": changes,
+            "change": change,
         }
         if len(baseline_values) > 1 and len(feature_values) > 1:
             entry["pairs"] = [
                 {
                     "baseline_run": baseline_item["run"],
                     "feature_run": feature_item["run"],
-                    "baseline_value": baseline_item["value"],
-                    "feature_value": feature_item["value"],
-                    "diff": feature_item["value"] - baseline_item["value"],
+                    "baseline_mean": baseline_item["mean"],
+                    "feature_mean": feature_item["mean"],
+                    "mean_diff": feature_item["mean"] - baseline_item["mean"],
+                    "p50_diff": feature_item["p50"] - baseline_item["p50"],
+                    "p90_diff": feature_item["p90"] - baseline_item["p90"],
+                    "p99_diff": feature_item["p99"] - baseline_item["p99"],
                 }
                 for baseline_item, feature_item in zip(baseline_values, feature_values)
             ]
         metrics.append(entry)
 
-    changed = [metric for metric in metrics if metric["change"]["sig"] != "neutral"]
+    changed = [metric for metric in metrics if metric["change"]["significant_percentiles"]]
     return {
         "config": config_path,
-        "source": "prometheus",
+        "source": "proxy-scrape-files",
         "normalization": {
-            "method": "counter increase / canonical chain height delta",
+            "method": "counter delta / canonical chain height delta between adjacent scrapes",
             "block_height_query": TARGET_METRIC_BLOCK_HEIGHT_QUERY,
+            "scrape_file": "target-metrics-scrapes.jsonl",
         },
         "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,
@@ -857,8 +807,19 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     if not changed:
         return ""
 
+    def target_metric_change_summary(metric: dict) -> str:
+        parts = []
+        for stat_name in TARGET_METRIC_PERCENTILES:
+            change = metric["changes"][stat_name]
+            if change["sig"] == "neutral":
+                continue
+            parts.append(
+                f"{stat_name.upper()} {change_str(change['pct'], change['ci_pct'], metric['target'] == 'decrease')}"
+            )
+        return ", ".join(parts)
+
     lines = [
-        "### Target Prometheus Metrics",
+        "### Target Counter Metrics",
         "",
         "| Metric | Target | Baseline / block | Feature / block | Change |",
         "|--------|--------|------------------|-----------------|--------|",
@@ -870,20 +831,20 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
                 metric["target"],
                 fmt_metric_value(metric["baseline"]["mean"]),
                 fmt_metric_value(metric["feature"]["mean"]),
-                target_change_str(metric["change"]["pct"], metric["target"] == "decrease"),
+                target_metric_change_summary(metric),
             )
         )
 
     lines.extend(
         [
             "",
-            "*Values are Prometheus counter increases divided by the canonical chain-height delta over each benchmark window.*",
+            "*Values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*",
         ]
     )
     if target_metrics.get("abba"):
         lines.extend(
             [
-                "*ABBA target-metric checks compare matching run replicas (`*-1` and `*-2`) and only report metrics whose paired deltas agree in direction.*",
+                "*ABBA target-metric checks bootstrap matching run replicas (`baseline-1` vs `feature-1`, `baseline-2` vs `feature-2`) before reporting significant percentile changes.*",
             ]
         )
     return "\n".join(lines)

@@ -412,11 +412,16 @@ LABELS_FILE="/tmp/bench-metrics-labels.json"
 echo '{}' > "$LABELS_FILE"
 METRICS_SUBNET="${METRICS_SUBNET:-10.10.0.0/24}"
 METRICS_PORT="${METRICS_PORT:-9090}"
-python3 "${SELF_DIR}/bench-metrics-proxy.py" \
-  --labels "$LABELS_FILE" \
-  --upstream "http://${BENCH_METRICS_ADDR}/" \
-  --subnet "$METRICS_SUBNET" \
-  --port "$METRICS_PORT" &
+METRICS_PROXY_ARGS=(
+  --labels "$LABELS_FILE"
+  --upstream "http://${BENCH_METRICS_ADDR}/"
+  --subnet "$METRICS_SUBNET"
+  --port "$METRICS_PORT"
+)
+if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+  METRICS_PROXY_ARGS+=(--target-metrics-config "$BENCH_TARGET_METRICS_CONFIG")
+fi
+python3 "${SELF_DIR}/bench-metrics-proxy.py" "${METRICS_PROXY_ARGS[@]}" &
 METRICS_PROXY_PID=$!
 echo "▸ Metrics proxy started (PID $METRICS_PROXY_PID) on subnet ${METRICS_SUBNET}, port ${METRICS_PORT}"
 
@@ -427,10 +432,10 @@ export BENCH_ID="local-$(basename "$BENCH_WORK_DIR" | sed 's/bench-work-//')"
 export BENCH_REFERENCE_EPOCH=$(date +%s)
 
 write_labels() {
-  local run_label="$1" run_type="$2" ref="$3" sha="$4"
+  local run_label="$1" run_type="$2" ref="$3" sha="$4" output_dir="$5"
   LAST_RUN_START=$(date +%s)
   cat > "$LABELS_FILE" <<-EOF
-	{"benchmark_run":"${run_label}","run_type":"${run_type}","git_ref":"${ref}","bench_sha":"${sha}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
+	{"benchmark_run":"${run_label}","run_type":"${run_type}","git_ref":"${ref}","bench_sha":"${sha}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${output_dir}/target-metrics-scrapes.jsonl"}
 	EOF
 }
 
@@ -447,16 +452,16 @@ run_bench() {
   echo
 }
 
-write_labels "baseline-1" "baseline" "$BASELINE_REF" "$BASELINE_SHA"
+write_labels "baseline-1" "baseline" "$BASELINE_REF" "$BASELINE_SHA" "$BENCH_WORK_DIR/baseline-1"
 run_bench "baseline-1" "$BASELINE_BIN" "$BENCH_WORK_DIR/baseline-1"
 
-write_labels "feature-1" "feature" "$FEATURE_REF" "$FEATURE_SHA"
+write_labels "feature-1" "feature" "$FEATURE_REF" "$FEATURE_SHA" "$BENCH_WORK_DIR/feature-1"
 run_bench "feature-1"  "$FEATURE_BIN"  "$BENCH_WORK_DIR/feature-1"
 
-write_labels "feature-2" "feature" "$FEATURE_REF" "$FEATURE_SHA"
+write_labels "feature-2" "feature" "$FEATURE_REF" "$FEATURE_SHA" "$BENCH_WORK_DIR/feature-2"
 run_bench "feature-2"  "$FEATURE_BIN"  "$BENCH_WORK_DIR/feature-2"
 
-write_labels "baseline-2" "baseline" "$BASELINE_REF" "$BASELINE_SHA"
+write_labels "baseline-2" "baseline" "$BASELINE_REF" "$BASELINE_SHA" "$BENCH_WORK_DIR/baseline-2"
 run_bench "baseline-2" "$BASELINE_BIN" "$BENCH_WORK_DIR/baseline-2"
 
 # ── Compute Grafana URL ──────────────────────────────────────────────
