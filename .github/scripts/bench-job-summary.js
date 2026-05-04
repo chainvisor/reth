@@ -70,12 +70,12 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
   const tmRows = targetMetricRows(summary);
   if (tmRows.length > 0) {
     md += `### Target Prometheus Metrics\n\n`;
-    md += `| Metric | Target | Baseline | Feature | Change |\n`;
-    md += `|--------|--------|----------|---------|--------|\n`;
+    md += `| Metric | Target | Baseline / block | Feature / block | Change |\n`;
+    md += `|--------|--------|------------------|-----------------|--------|\n`;
     for (const r of tmRows) {
       md += `| \`${r.title}\` | ${r.target} | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
     }
-    md += '\n';
+    md += `\n*Values are Prometheus counter increases divided by the canonical chain-height delta over each benchmark window.*\n\n`;
   }
 
   // Charts

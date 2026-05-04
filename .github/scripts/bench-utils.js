@@ -11,8 +11,8 @@ function fmtMs(v) { return v.toFixed(2) + 'ms'; }
 function fmtMgas(v) { return v.toFixed(2); }
 function fmtS(v) { return v.toFixed(2) + 's'; }
 function fmtMetricValue(v) {
-  if (Math.abs(v - Math.round(v)) <= 0.005) return String(Math.round(v));
-  return v.toFixed(2).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+  if (Math.abs(v - Math.round(v)) <= 0.00005) return String(Math.round(v));
+  return v.toFixed(4).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
 }
 
 function fmtChange(ch) {

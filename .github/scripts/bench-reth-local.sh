@@ -199,7 +199,13 @@ export BENCH_WORK_DIR
 export SCHELK_MOUNT="${SCHELK_MOUNT:-/reth-bench}"
 export BENCH_RPC_URL="${BENCH_RPC_URL:-https://ethereum.reth.rs/rpc}"
 export BENCH_METRICS_ADDR="127.0.0.1:9100"
-if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ] && [ -f "$RETH_REPO/.github/config/bench-prometheus-counters.json" ]; then
+export BENCH_GRAFANA_URL="${BENCH_GRAFANA_URL:-${FETCH_GRAFANA_DASHBOARD_URL:-}}"
+export BENCH_GRAFANA_TOKEN="${BENCH_GRAFANA_TOKEN:-${FETCH_GRAFANA_DASHBOARD_TOKEN:-}}"
+export BENCH_GRAFANA_DATASOURCE_UID="${BENCH_GRAFANA_DATASOURCE_UID:-ef57fux92e9z4e}"
+if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ] \
+  && [ -n "${BENCH_GRAFANA_URL:-}" ] \
+  && [ -n "${BENCH_GRAFANA_TOKEN:-}" ] \
+  && [ -f "$RETH_REPO/.github/config/bench-prometheus-counters.json" ]; then
   export BENCH_TARGET_METRICS_CONFIG="$RETH_REPO/.github/config/bench-prometheus-counters.json"
 fi
 
@@ -415,10 +421,10 @@ METRICS_PROXY_PID=$!
 echo "▸ Metrics proxy started (PID $METRICS_PROXY_PID) on subnet ${METRICS_SUBNET}, port ${METRICS_PORT}"
 
 # Unique benchmark ID: local-<timestamp> for local runs, ci-<run_id> for CI
-BENCH_ID="local-$(basename "$BENCH_WORK_DIR" | sed 's/bench-work-//')"
+export BENCH_ID="local-$(basename "$BENCH_WORK_DIR" | sed 's/bench-work-//')"
 # Reference epoch: shared time origin so all runs overlay in Grafana.
 # The proxy maps each run's elapsed time onto this common origin.
-BENCH_REFERENCE_EPOCH=$(date +%s)
+export BENCH_REFERENCE_EPOCH=$(date +%s)
 
 write_labels() {
   local run_label="$1" run_type="$2" ref="$3" sha="$4"
@@ -518,8 +524,6 @@ SUMMARY_ARGS=(
 if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
   SUMMARY_ARGS+=(
     --target-metrics-config "$BENCH_TARGET_METRICS_CONFIG"
-    --baseline-target-metrics "$BENCH_WORK_DIR/baseline-1/target-metrics-delta.json" "$BENCH_WORK_DIR/baseline-2/target-metrics-delta.json"
-    --feature-target-metrics "$BENCH_WORK_DIR/feature-1/target-metrics-delta.json" "$BENCH_WORK_DIR/feature-2/target-metrics-delta.json"
   )
 fi
 

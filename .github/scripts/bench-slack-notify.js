@@ -178,7 +178,7 @@ function buildSuccessBlocks({ summary, prNumber, actor, actorSlackId, jobUrl, re
   const tmRows = targetMetricRows(summary);
   if (tmRows.length > 0) {
     const targetTableRows = [
-      [cell('Metric'), cell('Target'), cell('Baseline'), cell('Feature'), cell('Change')],
+      [cell('Metric'), cell('Target'), cell('Baseline/block'), cell('Feature/block'), cell('Change')],
       ...tmRows.map(r => [cell(r.title), cell(r.target), cell(r.baseline), cell(r.feature), cell(r.change || ' ')]),
     ];
     threadBlocks.push({

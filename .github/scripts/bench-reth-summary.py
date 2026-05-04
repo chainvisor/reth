@@ -20,15 +20,19 @@ import argparse
 import csv
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import sys
+import urllib.parse
+import urllib.request
 
 GIGAGAS = 1_000_000_000
 T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
+TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 
 
 def _opt_int(row: dict, key: str) -> int | None:
@@ -316,9 +320,9 @@ def fmt_s(v: float) -> str:
 
 
 def fmt_metric_value(v: float) -> str:
-    if abs(v - round(v)) <= 0.005:
+    if abs(v - round(v)) <= 0.00005:
         return f"{round(v):.0f}"
-    return f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{v:.4f}".rstrip("0").rstrip(".")
 
 
 def display_bal_mode(bal_mode: str | None) -> str | None:
@@ -398,10 +402,229 @@ def target_metric_label(query: str) -> str:
     return re.sub(r"\s+", "", target_metric_name(query))
 
 
-def parse_target_metric_delta(path: str) -> dict[str, dict]:
-    with open(path) as f:
-        data = json.load(f)
-    return {item["query"]: item for item in data.get("counters", [])}
+def parse_label_string(text: str | None) -> dict[str, str]:
+    if not text:
+        return {}
+
+    labels = {}
+    parts = []
+    current = []
+    in_quotes = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            current.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            current.append(ch)
+            in_quotes = not in_quotes
+            continue
+        if ch == "," and not in_quotes:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+
+    for part in parts:
+        if not part:
+            continue
+        key, value = part.split("=", 1)
+        labels[key.strip()] = bytes(value.strip()[1:-1], "utf-8").decode("unicode_escape")
+    return labels
+
+
+SELECTOR_RE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
+)
+
+
+def parse_target_metric_query(query: str) -> tuple[str, str, dict[str, str]]:
+    query = query.strip()
+    aggregate = "single"
+    inner = query
+    if query.startswith("sum(") and query.endswith(")"):
+        aggregate = "sum"
+        inner = query[4:-1].strip()
+
+    match = SELECTOR_RE.match(inner)
+    if not match:
+        raise ValueError(f"Unsupported target metric query: {query}")
+    return aggregate, match.group("name"), parse_label_string(match.group("labels"))
+
+
+def escape_prometheus_label_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def selector_with_labels(metric_name: str, labels: dict[str, str]) -> str:
+    if not labels:
+        return metric_name
+    label_text = ",".join(
+        f'{key}="{escape_prometheus_label_value(value)}"'
+        for key, value in sorted(labels.items())
+    )
+    return f"{metric_name}{{{label_text}}}"
+
+
+def merge_label_filters(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
+    merged = dict(base)
+    for key, value in extra.items():
+        existing = merged.get(key)
+        if existing is not None and existing != value:
+            raise ValueError(
+                f"Target metric query already constrains label '{key}' to '{existing}', cannot also require '{value}'"
+            )
+        merged[key] = value
+    return merged
+
+
+def load_target_metric_range(path: str) -> dict:
+    range_path = Path(path).with_name("target-metrics-range.json")
+    with open(range_path) as f:
+        metadata = json.load(f)
+    if not metadata.get("benchmark_id"):
+        raise ValueError(f"Missing benchmark_id in {range_path}")
+    if not metadata.get("benchmark_run"):
+        metadata["benchmark_run"] = run_label_from_path(path)
+    if metadata.get("duration_ms", 0) <= 0:
+        raise ValueError(f"Non-positive target metric query range in {range_path}")
+    return metadata
+
+
+def prometheus_api_base_url() -> str:
+    api_url = os.environ.get("BENCH_PROMETHEUS_API_URL", "")
+    if api_url:
+        return api_url.rstrip("/")
+
+    grafana_url = (
+        os.environ.get("BENCH_GRAFANA_URL")
+        or os.environ.get("FETCH_GRAFANA_DASHBOARD_URL")
+        or ""
+    ).rstrip("/")
+    if not grafana_url:
+        return ""
+
+    datasource_uid = os.environ.get("BENCH_GRAFANA_DATASOURCE_UID", "ef57fux92e9z4e")
+    return f"{grafana_url}/api/datasources/proxy/uid/{datasource_uid}"
+
+
+def prometheus_api_token() -> str:
+    return (
+        os.environ.get("BENCH_PROMETHEUS_API_TOKEN")
+        or os.environ.get("BENCH_GRAFANA_TOKEN")
+        or os.environ.get("FETCH_GRAFANA_DASHBOARD_TOKEN")
+        or ""
+    )
+
+
+def query_prometheus(query: str, eval_time_s: float) -> list[float]:
+    base_url = prometheus_api_base_url()
+    token = prometheus_api_token()
+    if not base_url or not token:
+        raise ValueError(
+            "Target metrics require Grafana/Prometheus query access. Set BENCH_GRAFANA_URL and BENCH_GRAFANA_TOKEN, "
+            "or BENCH_PROMETHEUS_API_URL and BENCH_PROMETHEUS_API_TOKEN."
+        )
+
+    params = urllib.parse.urlencode({"query": query, "time": f"{eval_time_s:.3f}"})
+    req = urllib.request.Request(
+        f"{base_url}/api/v1/query?{params}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        payload = json.loads(resp.read())
+
+    if payload.get("status") != "success":
+        raise ValueError(f"Prometheus query failed: {payload}")
+
+    data = payload.get("data", {})
+    result_type = data.get("resultType")
+    if result_type == "scalar":
+        return [float(data["result"][1])]
+    if result_type != "vector":
+        raise ValueError(f"Unsupported Prometheus result type '{result_type}' for query: {query}")
+    return [float(item["value"][1]) for item in data.get("result", [])]
+
+
+def query_single_prometheus_value(query: str, eval_time_s: float) -> float:
+    values = query_prometheus(query, eval_time_s)
+    if not values:
+        raise ValueError(f"Prometheus query returned no series: {query}")
+    if len(values) > 1:
+        raise ValueError(f"Prometheus query returned {len(values)} series; expected 1: {query}")
+    return values[0]
+
+
+def build_counter_increase_query(
+    query: str,
+    benchmark_id: str,
+    benchmark_run: str,
+    duration_ms: int,
+) -> str:
+    aggregate, metric_name, label_filters = parse_target_metric_query(query)
+    labels = merge_label_filters(
+        label_filters,
+        {"benchmark_id": benchmark_id, "benchmark_run": benchmark_run},
+    )
+    selector = selector_with_labels(metric_name, labels)
+    range_selector = f"{selector}[{duration_ms}ms]"
+    if aggregate == "sum":
+        return f"sum(increase({range_selector}))"
+    return f"increase({range_selector})"
+
+
+def build_block_height_delta_query(benchmark_id: str, benchmark_run: str, duration_ms: int) -> str:
+    selector = selector_with_labels(
+        TARGET_METRIC_BLOCK_HEIGHT_QUERY,
+        {"benchmark_id": benchmark_id, "benchmark_run": benchmark_run},
+    )
+    return f"max(delta({selector}[{duration_ms}ms]))"
+
+
+def query_target_metric_run(path: str, config: dict) -> tuple[str, dict[str, dict]]:
+    run_label = run_label_from_path(path)
+    metadata = load_target_metric_range(path)
+    benchmark_id = metadata["benchmark_id"]
+    benchmark_run = metadata["benchmark_run"]
+    duration_ms = int(metadata["duration_ms"])
+    eval_time_s = float(metadata["range_end_ms"]) / 1000.0
+
+    block_height_delta = query_single_prometheus_value(
+        build_block_height_delta_query(benchmark_id, benchmark_run, duration_ms),
+        eval_time_s,
+    )
+    if block_height_delta <= EPSILON:
+        raise ValueError(
+            f"Prometheus block-height delta for run '{run_label}' was {block_height_delta}; expected a positive value"
+        )
+
+    counters = {}
+    for counter in config.get("counters", []):
+        query = counter["query"]
+        counter_increase = query_single_prometheus_value(
+            build_counter_increase_query(query, benchmark_id, benchmark_run, duration_ms),
+            eval_time_s,
+        )
+        counters[query] = {
+            "query": query,
+            "target": counter["target"],
+            "counter_increase": counter_increase,
+            "block_height_delta": block_height_delta,
+            "value": counter_increase / block_height_delta,
+            "duration_ms": duration_ms,
+            "range_start_ms": int(metadata["range_start_ms"]),
+            "range_end_ms": int(metadata["range_end_ms"]),
+            "benchmark_id": benchmark_id,
+            "benchmark_run": benchmark_run,
+        }
+    return run_label, counters
 
 
 def run_label_from_path(path: str) -> str:
@@ -445,14 +668,14 @@ def classify_target_metric(
 
 def compute_target_metric_summary(
     config_path: str,
-    baseline_metric_paths: list[str],
-    feature_metric_paths: list[str],
+    baseline_csv_paths: list[str],
+    feature_csv_paths: list[str],
 ) -> dict:
     with open(config_path) as f:
         config = json.load(f)
 
-    baseline_runs = [(run_label_from_path(path), parse_target_metric_delta(path)) for path in baseline_metric_paths]
-    feature_runs = [(run_label_from_path(path), parse_target_metric_delta(path)) for path in feature_metric_paths]
+    baseline_runs = [query_target_metric_run(path, config) for path in baseline_csv_paths]
+    feature_runs = [query_target_metric_run(path, config) for path in feature_csv_paths]
 
     metrics = []
     for counter in config.get("counters", []):
@@ -464,11 +687,27 @@ def compute_target_metric_summary(
         for run_label, run_data in baseline_runs:
             if query not in run_data:
                 raise ValueError(f"Missing target metric '{query}' in baseline run '{run_label}'")
-            baseline_values.append({"run": run_label, "value": float(run_data[query]["delta"])})
+            baseline_values.append(
+                {
+                    "run": run_label,
+                    "value": float(run_data[query]["value"]),
+                    "counter_increase": float(run_data[query]["counter_increase"]),
+                    "block_height_delta": float(run_data[query]["block_height_delta"]),
+                    "duration_ms": int(run_data[query]["duration_ms"]),
+                }
+            )
         for run_label, run_data in feature_runs:
             if query not in run_data:
                 raise ValueError(f"Missing target metric '{query}' in feature run '{run_label}'")
-            feature_values.append({"run": run_label, "value": float(run_data[query]["delta"])})
+            feature_values.append(
+                {
+                    "run": run_label,
+                    "value": float(run_data[query]["value"]),
+                    "counter_increase": float(run_data[query]["counter_increase"]),
+                    "block_height_delta": float(run_data[query]["block_height_delta"]),
+                    "duration_ms": int(run_data[query]["duration_ms"]),
+                }
+            )
 
         baseline_series = [item["value"] for item in baseline_values]
         feature_series = [item["value"] for item in feature_values]
@@ -506,7 +745,12 @@ def compute_target_metric_summary(
     changed = [metric for metric in metrics if metric["change"]["sig"] != "neutral"]
     return {
         "config": config_path,
-        "abba": len(baseline_metric_paths) > 1 and len(feature_metric_paths) > 1,
+        "source": "prometheus",
+        "normalization": {
+            "method": "counter increase / canonical chain height delta",
+            "block_height_query": TARGET_METRIC_BLOCK_HEIGHT_QUERY,
+        },
+        "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,
         "changed": changed,
         "improvements": [metric["name"] for metric in changed if metric["change"]["sig"] == "good"],
@@ -617,8 +861,8 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     lines = [
         "### Target Prometheus Metrics",
         "",
-        "| Metric | Target | Baseline | Feature | Change |",
-        "|--------|--------|----------|---------|--------|",
+        "| Metric | Target | Baseline / block | Feature / block | Change |",
+        "|--------|--------|------------------|-----------------|--------|",
     ]
     for metric in changed:
         lines.append(
@@ -631,10 +875,15 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
             )
         )
 
+    lines.extend(
+        [
+            "",
+            "*Values are Prometheus counter increases divided by the canonical chain-height delta over each benchmark window.*",
+        ]
+    )
     if target_metrics.get("abba"):
         lines.extend(
             [
-                "",
                 "*ABBA target-metric checks compare matching run replicas (`*-1` and `*-2`) and only report metrics whose paired deltas agree in direction.*",
             ]
         )
@@ -704,14 +953,6 @@ def main():
     parser.add_argument("--bal-mode", default=None, help="BAL mode (true, feature, baseline)")
     parser.add_argument("--grafana-url", default=None, help="Grafana dashboard URL for this benchmark run")
     parser.add_argument("--target-metrics-config", default=None, help="Target metrics config path")
-    parser.add_argument(
-        "--baseline-target-metrics", nargs="+", default=None,
-        help="Baseline target metric delta JSON files",
-    )
-    parser.add_argument(
-        "--feature-target-metrics", nargs="+", default=None,
-        help="Feature target metric delta JSON files",
-    )
     args = parser.parse_args()
 
     if len(args.baseline_csv) != len(args.feature_csv):
@@ -796,16 +1037,10 @@ def main():
     target_metric_summary = None
     target_metric_table = ""
     if args.target_metrics_config:
-        if not args.baseline_target_metrics or not args.feature_target_metrics:
-            print("Target metrics config requires baseline and feature target metric files", file=sys.stderr)
-            sys.exit(1)
-        if len(args.baseline_target_metrics) != len(args.feature_target_metrics):
-            print("Must provide equal number of baseline and feature target metric files", file=sys.stderr)
-            sys.exit(1)
         target_metric_summary = compute_target_metric_summary(
             args.target_metrics_config,
-            args.baseline_target_metrics,
-            args.feature_target_metrics,
+            args.baseline_csv,
+            args.feature_csv,
         )
         target_metric_table = generate_target_metric_table(target_metric_summary)
 

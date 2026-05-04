@@ -29,33 +29,43 @@ DATADIR="$SCHELK_MOUNT/$DATADIR_NAME"
 mkdir -p "$OUTPUT_DIR"
 LOG="${OUTPUT_DIR}/node.log"
 
-TARGET_METRICS_START="$OUTPUT_DIR/target-metrics-start.json"
-TARGET_METRICS_END="$OUTPUT_DIR/target-metrics-end.json"
-TARGET_METRICS_DELTA="$OUTPUT_DIR/target-metrics-delta.json"
+TARGET_METRICS_RANGE="$OUTPUT_DIR/target-metrics-range.json"
 
 RETH_SCOPE="${RETH_SCOPE:-reth-bench.scope}"
 
-scrape_target_metrics() {
-  local output="$1"
-  if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
-    return 0
-  fi
-
-  python3 "$SCRIPT_DIR/bench-target-metrics.py" scrape \
-    --metrics-url "http://${BENCH_METRICS_ADDR}/" \
-    --config "$BENCH_TARGET_METRICS_CONFIG" \
-    --output "$output"
+capture_unix_time_ms() {
+  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
 }
 
-record_target_metrics_delta() {
+record_target_metric_range() {
+  local start_ms="$1"
+  local end_ms="$2"
   if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
     return 0
   fi
 
-  python3 "$SCRIPT_DIR/bench-target-metrics.py" diff \
-    --start "$TARGET_METRICS_START" \
-    --end "$TARGET_METRICS_END" \
-    --output "$TARGET_METRICS_DELTA"
+  python3 - "$TARGET_METRICS_RANGE" "$start_ms" "$end_ms" "${BENCH_ID:-}" "$LABEL" <<'PY'
+import json
+import sys
+
+output_path, start_ms, end_ms, benchmark_id, benchmark_run = sys.argv[1:6]
+start_ms = int(start_ms)
+end_ms = int(end_ms)
+
+with open(output_path, "w") as f:
+    json.dump(
+        {
+            "benchmark_id": benchmark_id,
+            "benchmark_run": benchmark_run,
+            "range_start_ms": start_ms,
+            "range_end_ms": end_ms,
+            "duration_ms": end_ms - start_ms,
+        },
+        f,
+        indent=2,
+    )
+    f.write("\n")
+PY
 }
 
 cleanup() {
@@ -333,7 +343,10 @@ if [ "$BIG_BLOCKS" = "true" ]; then
     sleep 0.5  # give tracy-capture time to connect
   fi
 
-  scrape_target_metrics "$TARGET_METRICS_START"
+  TARGET_METRICS_START_MS=""
+  if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+    TARGET_METRICS_START_MS="$(capture_unix_time_ms)"
+  fi
 
   # Benchmark — skip warmup payloads so they aren't measured
   BB_SKIP=0
@@ -353,8 +366,10 @@ if [ "$BIG_BLOCKS" = "true" ]; then
     --jwt-secret "$DATADIR/jwt.hex" \
     --output "$OUTPUT_DIR" 2>&1 | sed -u "s/^/[bench] /"
 
-  scrape_target_metrics "$TARGET_METRICS_END"
-  record_target_metrics_delta
+  if [ -n "$TARGET_METRICS_START_MS" ]; then
+    TARGET_METRICS_END_MS="$(capture_unix_time_ms)"
+    record_target_metric_range "$TARGET_METRICS_START_MS" "$TARGET_METRICS_END_MS"
+  fi
 else
   # Standard mode: warmup + new-payload-fcu
   WARMUP="${BENCH_WARMUP_BLOCKS:-50}"
@@ -378,7 +393,10 @@ else
     sleep 0.5  # give tracy-capture time to connect
   fi
 
-  scrape_target_metrics "$TARGET_METRICS_START"
+  TARGET_METRICS_START_MS=""
+  if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+    TARGET_METRICS_START_MS="$(capture_unix_time_ms)"
+  fi
 
   # Benchmark
   $BENCH_NICE "$RETH_BENCH" new-payload-fcu \
@@ -389,8 +407,10 @@ else
     "${EXTRA_BENCH_ARGS[@]}" \
     --output "$OUTPUT_DIR" 2>&1 | sed -u "s/^/[bench] /"
 
-  scrape_target_metrics "$TARGET_METRICS_END"
-  record_target_metrics_delta
+  if [ -n "$TARGET_METRICS_START_MS" ]; then
+    TARGET_METRICS_END_MS="$(capture_unix_time_ms)"
+    record_target_metric_range "$TARGET_METRICS_START_MS" "$TARGET_METRICS_END_MS"
+  fi
 fi
 
 # cleanup runs via trap

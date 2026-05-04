@@ -274,6 +274,9 @@ jobs:
       BENCH_SLACK: ${{ github.event_name == 'workflow_dispatch' && inputs.slack || 'always' }}
       BENCH_METRICS_ADDR: "127.0.0.1:9100"
       BENCH_TARGET_METRICS_CONFIG: .github/config/bench-prometheus-counters.json
+      BENCH_GRAFANA_URL: ${{ secrets.FETCH_GRAFANA_DASHBOARD_URL }}
+      BENCH_GRAFANA_TOKEN: ${{ secrets.FETCH_GRAFANA_DASHBOARD_TOKEN }}
+      BENCH_GRAFANA_DATASOURCE_UID: "ef57fux92e9z4e"
       BENCH_OTLP_DISABLED: "true"
       BASELINE_REF: ${{ needs.resolve-refs.outputs.baseline-ref }}
       FEATURE_REF: ${{ needs.resolve-refs.outputs.feature-ref }}
@@ -591,8 +594,6 @@ jobs:
           SUMMARY_ARGS="$SUMMARY_ARGS --gas-csv $BENCH_WORK_DIR/feature-1/total_gas.csv"
           if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
             SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
-            SUMMARY_ARGS="$SUMMARY_ARGS --baseline-target-metrics $BENCH_WORK_DIR/baseline-1/target-metrics-delta.json $BENCH_WORK_DIR/baseline-2/target-metrics-delta.json"
-            SUMMARY_ARGS="$SUMMARY_ARGS --feature-target-metrics $BENCH_WORK_DIR/feature-1/target-metrics-delta.json $BENCH_WORK_DIR/feature-2/target-metrics-delta.json"
           fi
 
           GRAFANA_URL='${{ steps.metrics.outputs.grafana-url }}'
