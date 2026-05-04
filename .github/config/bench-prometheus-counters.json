@@ -31,26 +31,6 @@
     {
       "query": "reth_executor_spawn_critical_tasks_total",
       "target": "decrease"
-    },
-    {
-      "query": "reth_consensus_engine_beacon_new_payload_messages",
-      "target": "increase"
-    },
-    {
-      "query": "reth_consensus_engine_beacon_forkchoice_updated_messages",
-      "target": "increase"
-    },
-    {
-      "query": "reth_consensus_engine_beacon_failed_new_payload_response_deliveries",
-      "target": "decrease"
-    },
-    {
-      "query": "reth_consensus_engine_beacon_failed_forkchoice_updated_response_deliveries",
-      "target": "decrease"
-    },
-    {
-      "query": "reth_consensus_engine_beacon_pipeline_runs",
-      "target": "decrease"
     }
   ]
 }
