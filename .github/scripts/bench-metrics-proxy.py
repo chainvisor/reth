@@ -118,7 +118,7 @@ def parse_samples(metrics_text):
     return samples
 
 
-def evaluate_query(samples, query):
+def evaluate_query(samples, query, allow_missing=False):
     aggregate, metric_name, label_filters = parse_target_metric_query(query)
     matches = [
         sample["value"]
@@ -128,6 +128,8 @@ def evaluate_query(samples, query):
     ]
 
     if not matches:
+        if allow_missing:
+            return 0.0
         raise ValueError(f"Query matched no samples: {query}")
 
     if aggregate == "sum":
@@ -145,7 +147,7 @@ def scrape_target_metrics(metrics_text, config):
         TARGET_METRIC_BLOCK_HEIGHT_QUERY: evaluate_query(samples, TARGET_METRIC_BLOCK_HEIGHT_QUERY),
     }
     for counter in config.get("counters", []):
-        values[counter["query"]] = evaluate_query(samples, counter["query"])
+        values[counter["query"]] = evaluate_query(samples, counter["query"], allow_missing=True)
     return values
 
 
