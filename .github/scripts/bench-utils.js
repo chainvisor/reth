@@ -10,6 +10,10 @@ const SIG_EMOJI = { good: '✅', bad: '❌', neutral: '⚪' };
 function fmtMs(v) { return v.toFixed(2) + 'ms'; }
 function fmtMgas(v) { return v.toFixed(2); }
 function fmtS(v) { return v.toFixed(2) + 's'; }
+function fmtMetricValue(v) {
+  if (Math.abs(v - Math.round(v)) <= 0.005) return String(Math.round(v));
+  return v.toFixed(2).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+}
 
 function fmtChange(ch) {
   if (!ch || (!ch.pct && !ch.ci_pct)) return '';
@@ -18,8 +22,16 @@ function fmtChange(ch) {
   return `${pctStr}${ciStr} ${SIG_EMOJI[ch.sig]}`;
 }
 
-function verdict(changes) {
-  const vals = Object.values(changes);
+function allChanges(summary) {
+  const primary = Object.values(summary.changes || {}).filter(v => v && typeof v === 'object' && typeof v.sig === 'string');
+  const target = ((summary.target_metrics && summary.target_metrics.changed) || [])
+    .map(metric => metric.change)
+    .filter(v => v && typeof v.sig === 'string');
+  return [...primary, ...target];
+}
+
+function verdict(summary) {
+  const vals = allChanges(summary);
   const hasBad = vals.some(v => v.sig === 'bad');
   const hasGood = vals.some(v => v.sig === 'good');
   if (hasBad && hasGood) return { emoji: '⚠️', label: 'Mixed Results' };
@@ -98,15 +110,29 @@ function waitTimeRows(summary) {
   return rows;
 }
 
+function targetMetricRows(summary) {
+  const changed = (summary.target_metrics && summary.target_metrics.changed) || [];
+  return changed.map(metric => ({
+    title: metric.name,
+    target: metric.target,
+    baseline: fmtMetricValue(metric.baseline.mean),
+    feature: fmtMetricValue(metric.feature.mean),
+    change: fmtChange(metric.change),
+  }));
+}
+
 module.exports = {
   SIG_EMOJI,
   fmtMs,
   fmtMgas,
   fmtS,
+  fmtMetricValue,
   fmtChange,
+  allChanges,
   verdict,
   loadSamplyUrls,
   blocksLabel,
   metricRows,
   waitTimeRows,
+  targetMetricRows,
 };

@@ -589,6 +589,11 @@ jobs:
           SUMMARY_ARGS="$SUMMARY_ARGS --baseline-csv $BASELINE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --feature-csv $FEATURE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --gas-csv $BENCH_WORK_DIR/feature-1/total_gas.csv"
+          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+            SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
+            SUMMARY_ARGS="$SUMMARY_ARGS --baseline-target-metrics $BENCH_WORK_DIR/baseline-1/target-metrics-delta.json $BENCH_WORK_DIR/baseline-2/target-metrics-delta.json"
+            SUMMARY_ARGS="$SUMMARY_ARGS --feature-target-metrics $BENCH_WORK_DIR/feature-1/target-metrics-delta.json $BENCH_WORK_DIR/feature-2/target-metrics-delta.json"
+          fi
 
           GRAFANA_URL='${{ steps.metrics.outputs.grafana-url }}'
           if [ -n "$GRAFANA_URL" ]; then
@@ -679,7 +684,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const { verdict, metricRows, waitTimeRows, blocksLabel } = require('./.github/scripts/bench-utils');
+            const { verdict, metricRows, waitTimeRows, targetMetricRows, blocksLabel } = require('./.github/scripts/bench-utils');
 
             let summary;
             try {
@@ -691,7 +696,7 @@ jobs:
 
             const repo = `${context.repo.owner}/${context.repo.repo}`;
             const commitUrl = `https://github.com/${repo}/commit`;
-            const { emoji, label } = verdict(summary.changes);
+            const { emoji, label } = verdict(summary);
             const baselineLink = `[\`${summary.baseline.name}\`](${commitUrl}/${summary.baseline.ref})`;
             const featureLink = `[\`${summary.feature.name}\`](${commitUrl}/${summary.feature.ref})`;
             const diffUrl = `https://github.com/${repo}/compare/${summary.baseline.ref}...${summary.feature.ref}`;
@@ -718,6 +723,17 @@ jobs:
               md += `|--------|----------|--------|\n`;
               for (const r of wtRows) {
                 md += `| ${r.title} | ${r.baseline} | ${r.feature} |\n`;
+              }
+              md += '\n';
+            }
+
+            const tmRows = targetMetricRows(summary);
+            if (tmRows.length > 0) {
+              md += `### Target Prometheus Metrics\n\n`;
+              md += `| Metric | Target | Baseline | Feature | Change |\n`;
+              md += `|--------|--------|----------|---------|--------|\n`;
+              for (const r of tmRows) {
+                md += `| \`${r.title}\` | ${r.target} | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
               }
               md += '\n';
             }
@@ -761,7 +777,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const { verdict, fmtChange, fmtMs, metricRows, waitTimeRows, blocksLabel } = require('./.github/scripts/bench-utils');
+            const { verdict, fmtChange, fmtMs, metricRows, waitTimeRows, targetMetricRows, blocksLabel, allChanges } = require('./.github/scripts/bench-utils');
 
             const token = process.env.SLACK_BENCH_BOT_TOKEN;
             const channel = process.env.SLACK_BENCH_CHANNEL;
@@ -779,11 +795,11 @@ jobs:
             }
 
             // Filter notifications based on mode
-            const changes = summary.changes || {};
+            const changes = allChanges(summary);
             const mode = process.env.BENCH_MODE || 'nightly';
             const slackMode = process.env.BENCH_SLACK || 'always';
-            const hasRegression = Object.values(changes).some(c => c.sig === 'bad');
-            const hasImprovement = Object.values(changes).some(c => c.sig === 'good');
+            const hasRegression = changes.some(c => c.sig === 'bad');
+            const hasImprovement = changes.some(c => c.sig === 'good');
 
             // on-win mode: only notify on improvements
             if (slackMode === 'on-win' && !hasImprovement) {
@@ -807,7 +823,7 @@ jobs:
             };
 
             const repo = `${context.repo.owner}/${context.repo.repo}`;
-            const { emoji, label } = verdict(changes);
+            const { emoji, label } = verdict(summary);
             const headerEmoji = SLACK_VERDICT[emoji] || emoji;
             const commitUrl = `https://github.com/${repo}/commit`;
             const baselineLink = `<${commitUrl}/${summary.baseline.ref}|${summary.baseline.name}>`;
@@ -902,6 +918,32 @@ jobs:
                     rows: waitTableRows,
                   }],
                   text: 'Wait time breakdown',
+                  unfurl_links: false,
+                }),
+              });
+            }
+
+            const tmRows = targetMetricRows(summary);
+            if (data.ts && tmRows.length > 0) {
+              const targetTableRows = [
+                [cell('Metric'), cell('Target'), cell('Baseline'), cell('Feature'), cell('Change')],
+                ...tmRows.map(r => [cell(r.title), cell(r.target), cell(r.baseline), cell(r.feature), cell(r.change || ' ')]),
+              ];
+              await fetch('https://slack.com/api/chat.postMessage', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  channel,
+                  thread_ts: data.ts,
+                  blocks: [{
+                    type: 'table',
+                    column_settings: [{ align: 'left' }, { align: 'left' }, { align: 'right' }, { align: 'right' }, { align: 'right' }],
+                    rows: targetTableRows,
+                  }],
+                  text: 'Target Prometheus metrics',
                   unfurl_links: false,
                 }),
               });

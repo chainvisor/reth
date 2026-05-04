@@ -20,12 +20,15 @@ import argparse
 import csv
 import json
 import math
+from pathlib import Path
 import random
+import re
 import sys
 
 GIGAGAS = 1_000_000_000
 T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
+EPSILON = 1e-9
 
 
 def _opt_int(row: dict, key: str) -> int | None:
@@ -312,6 +315,12 @@ def fmt_s(v: float) -> str:
     return f"{v:.2f}s"
 
 
+def fmt_metric_value(v: float) -> str:
+    if abs(v - round(v)) <= 0.005:
+        return f"{round(v):.0f}"
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
 def display_bal_mode(bal_mode: str | None) -> str | None:
     if not bal_mode or bal_mode == "false":
         return None
@@ -339,6 +348,12 @@ def change_str(pct: float, ci_pct: float, lower_is_better: bool) -> str:
     sig = significance(pct, ci_pct, lower_is_better)
     emoji = {"good": "✅", "bad": "❌", "neutral": "⚪"}[sig]
     return f"{pct:+.2f}% {emoji} (±{ci_pct:.2f}%)"
+
+
+def target_change_str(pct: float, lower_is_better: bool) -> str:
+    sig = significance(pct, 0.0, lower_is_better)
+    emoji = {"good": "✅", "bad": "❌", "neutral": "⚪"}[sig]
+    return f"{pct:+.2f}% {emoji}"
 
 
 def compute_changes(
@@ -370,6 +385,133 @@ def compute_changes(
             "sig": significance(p, c, lower_is_better),
         }
     return changes
+
+
+def target_metric_name(query: str) -> str:
+    query = query.strip()
+    if query.startswith("sum(") and query.endswith(")"):
+        query = query[4:-1].strip()
+    return query
+
+
+def target_metric_label(query: str) -> str:
+    return re.sub(r"\s+", "", target_metric_name(query))
+
+
+def parse_target_metric_delta(path: str) -> dict[str, dict]:
+    with open(path) as f:
+        data = json.load(f)
+    return {item["query"]: item for item in data.get("counters", [])}
+
+
+def run_label_from_path(path: str) -> str:
+    return Path(path).parent.name or Path(path).stem
+
+
+def consistent_direction(diffs: list[float], positive: bool) -> bool:
+    if not diffs:
+        return False
+    if positive:
+        return all(diff >= -EPSILON for diff in diffs) and any(diff > EPSILON for diff in diffs)
+    return all(diff <= EPSILON for diff in diffs) and any(diff < -EPSILON for diff in diffs)
+
+
+def classify_target_metric(
+    baseline_values: list[float], feature_values: list[float], target: str
+) -> tuple[str, str]:
+    baseline_mean = sum(baseline_values) / len(baseline_values)
+    feature_mean = sum(feature_values) / len(feature_values)
+    mean_diff = feature_mean - baseline_mean
+    improved_positive = target == "increase"
+
+    if len(baseline_values) > 1 and len(feature_values) > 1:
+        pair_diffs = [feature - baseline for baseline, feature in zip(baseline_values, feature_values)]
+        if consistent_direction(pair_diffs, improved_positive) and (
+            mean_diff >= -EPSILON if improved_positive else mean_diff <= EPSILON
+        ):
+            return "good", "abba-paired-runs"
+        if consistent_direction(pair_diffs, not improved_positive) and (
+            mean_diff <= EPSILON if improved_positive else mean_diff >= -EPSILON
+        ):
+            return "bad", "abba-paired-runs"
+        return "neutral", "abba-paired-runs"
+
+    if abs(mean_diff) <= EPSILON:
+        return "neutral", "single-run"
+    if improved_positive:
+        return ("good", "single-run") if mean_diff > 0 else ("bad", "single-run")
+    return ("good", "single-run") if mean_diff < 0 else ("bad", "single-run")
+
+
+def compute_target_metric_summary(
+    config_path: str,
+    baseline_metric_paths: list[str],
+    feature_metric_paths: list[str],
+) -> dict:
+    with open(config_path) as f:
+        config = json.load(f)
+
+    baseline_runs = [(run_label_from_path(path), parse_target_metric_delta(path)) for path in baseline_metric_paths]
+    feature_runs = [(run_label_from_path(path), parse_target_metric_delta(path)) for path in feature_metric_paths]
+
+    metrics = []
+    for counter in config.get("counters", []):
+        query = counter["query"]
+        target = counter["target"]
+
+        baseline_values = []
+        feature_values = []
+        for run_label, run_data in baseline_runs:
+            if query not in run_data:
+                raise ValueError(f"Missing target metric '{query}' in baseline run '{run_label}'")
+            baseline_values.append({"run": run_label, "value": float(run_data[query]["delta"])})
+        for run_label, run_data in feature_runs:
+            if query not in run_data:
+                raise ValueError(f"Missing target metric '{query}' in feature run '{run_label}'")
+            feature_values.append({"run": run_label, "value": float(run_data[query]["delta"])})
+
+        baseline_series = [item["value"] for item in baseline_values]
+        feature_series = [item["value"] for item in feature_values]
+        baseline_mean = sum(baseline_series) / len(baseline_series)
+        feature_mean = sum(feature_series) / len(feature_series)
+        pct = (feature_mean - baseline_mean) / baseline_mean * 100.0 if abs(baseline_mean) > EPSILON else 0.0
+        sig, method = classify_target_metric(baseline_series, feature_series, target)
+
+        entry = {
+            "kind": "counter",
+            "name": target_metric_label(query),
+            "query": query,
+            "target": target,
+            "baseline": {"mean": baseline_mean, "runs": baseline_values},
+            "feature": {"mean": feature_mean, "runs": feature_values},
+            "change": {
+                "pct": round(pct, 4),
+                "sig": sig,
+                "method": method,
+            },
+        }
+        if len(baseline_values) > 1 and len(feature_values) > 1:
+            entry["pairs"] = [
+                {
+                    "baseline_run": baseline_item["run"],
+                    "feature_run": feature_item["run"],
+                    "baseline_value": baseline_item["value"],
+                    "feature_value": feature_item["value"],
+                    "diff": feature_item["value"] - baseline_item["value"],
+                }
+                for baseline_item, feature_item in zip(baseline_values, feature_values)
+            ]
+        metrics.append(entry)
+
+    changed = [metric for metric in metrics if metric["change"]["sig"] != "neutral"]
+    return {
+        "config": config_path,
+        "abba": len(baseline_metric_paths) > 1 and len(feature_metric_paths) > 1,
+        "metrics": metrics,
+        "changed": changed,
+        "improvements": [metric["name"] for metric in changed if metric["change"]["sig"] == "good"],
+        "regressions": [metric["name"] for metric in changed if metric["change"]["sig"] == "bad"],
+    }
 
 
 def generate_comparison_table(
@@ -464,9 +606,45 @@ def generate_wait_time_table(
     return "\n".join(lines)
 
 
+def generate_target_metric_table(target_metrics: dict | None) -> str:
+    if not target_metrics:
+        return ""
+
+    changed = target_metrics.get("changed", [])
+    if not changed:
+        return ""
+
+    lines = [
+        "### Target Prometheus Metrics",
+        "",
+        "| Metric | Target | Baseline | Feature | Change |",
+        "|--------|--------|----------|---------|--------|",
+    ]
+    for metric in changed:
+        lines.append(
+            "| `{}` | {} | {} | {} | {} |".format(
+                metric["name"],
+                metric["target"],
+                fmt_metric_value(metric["baseline"]["mean"]),
+                fmt_metric_value(metric["feature"]["mean"]),
+                target_change_str(metric["change"]["pct"], metric["target"] == "decrease"),
+            )
+        )
+
+    if target_metrics.get("abba"):
+        lines.extend(
+            [
+                "",
+                "*ABBA target-metric checks compare matching run replicas (`*-1` and `*-2`) and only report metrics whose paired deltas agree in direction.*",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def generate_markdown(
     summary: dict, comparison_table: str,
     wait_time_tables: list[str] | None = None,
+    target_metric_table: str = "",
     behind_baseline: int = 0, repo: str = "", baseline_ref: str = "", baseline_name: str = "",
     grafana_url: str | None = None,
 ) -> str:
@@ -488,6 +666,9 @@ def generate_markdown(
                 lines.append(table)
                 lines.append("")
         lines.append("</details>")
+    if target_metric_table:
+        lines.append("")
+        lines.append(target_metric_table)
     if grafana_url:
         lines.append("")
         lines.append(f"**[Grafana Dashboard]({grafana_url})**")
@@ -522,6 +703,15 @@ def main():
     parser.add_argument("--wait-time", default=None, help="Wait time interval used between blocks")
     parser.add_argument("--bal-mode", default=None, help="BAL mode (true, feature, baseline)")
     parser.add_argument("--grafana-url", default=None, help="Grafana dashboard URL for this benchmark run")
+    parser.add_argument("--target-metrics-config", default=None, help="Target metrics config path")
+    parser.add_argument(
+        "--baseline-target-metrics", nargs="+", default=None,
+        help="Baseline target metric delta JSON files",
+    )
+    parser.add_argument(
+        "--feature-target-metrics", nargs="+", default=None,
+        help="Feature target metric delta JSON files",
+    )
     args = parser.parse_args()
 
     if len(args.baseline_csv) != len(args.feature_csv):
@@ -603,6 +793,22 @@ def main():
         if table:
             wait_time_tables.append(table)
 
+    target_metric_summary = None
+    target_metric_table = ""
+    if args.target_metrics_config:
+        if not args.baseline_target_metrics or not args.feature_target_metrics:
+            print("Target metrics config requires baseline and feature target metric files", file=sys.stderr)
+            sys.exit(1)
+        if len(args.baseline_target_metrics) != len(args.feature_target_metrics):
+            print("Must provide equal number of baseline and feature target metric files", file=sys.stderr)
+            sys.exit(1)
+        target_metric_summary = compute_target_metric_summary(
+            args.target_metrics_config,
+            args.baseline_target_metrics,
+            args.feature_target_metrics,
+        )
+        target_metric_table = generate_target_metric_table(target_metric_summary)
+
     summary = {
         "blocks": paired_stats["blocks"],
         "big_blocks": args.big_blocks,
@@ -623,6 +829,8 @@ def main():
         "changes": compute_changes(baseline_stats, feature_stats, paired_stats),
         "wait_times": wait_time_data,
     }
+    if target_metric_summary:
+        summary["target_metrics"] = target_metric_summary
     with open(args.output_summary, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"Summary written to {args.output_summary}")
@@ -630,6 +838,7 @@ def main():
     markdown = generate_markdown(
         summary, comparison_table,
         wait_time_tables=wait_time_tables,
+        target_metric_table=target_metric_table,
         behind_baseline=args.behind_baseline,
         repo=args.repo,
         baseline_ref=baseline_ref,

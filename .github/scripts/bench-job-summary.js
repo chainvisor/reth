@@ -14,7 +14,7 @@
 //   await jobSummary({ core, context, chartSha, grafanaUrl, runId });
 
 const fs = require('fs');
-const { verdict, loadSamplyUrls, blocksLabel, metricRows, waitTimeRows } = require('./bench-utils');
+const { verdict, loadSamplyUrls, blocksLabel, metricRows, waitTimeRows, targetMetricRows } = require('./bench-utils');
 
 module.exports = async function ({ core, context, chartSha, grafanaUrl, runId }) {
   let summary;
@@ -30,7 +30,7 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
   const actor = process.env.BENCH_ACTOR;
   const commitUrl = `https://github.com/${repo}/commit`;
 
-  const { emoji, label } = verdict(summary.changes);
+  const { emoji, label } = verdict(summary);
   const baselineLink = `[\`${summary.baseline.name}\`](${commitUrl}/${summary.baseline.ref})`;
   const featureLink = `[\`${summary.feature.name}\`](${commitUrl}/${summary.feature.ref})`;
   const diffUrl = `https://github.com/${repo}/compare/${summary.baseline.ref}...${summary.feature.ref}`;
@@ -63,6 +63,17 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
     md += `|--------|----------|--------|\n`;
     for (const r of wtRows) {
       md += `| ${r.title} | ${r.baseline} | ${r.feature} |\n`;
+    }
+    md += '\n';
+  }
+
+  const tmRows = targetMetricRows(summary);
+  if (tmRows.length > 0) {
+    md += `### Target Prometheus Metrics\n\n`;
+    md += `| Metric | Target | Baseline | Feature | Change |\n`;
+    md += `|--------|--------|----------|---------|--------|\n`;
+    for (const r of tmRows) {
+      md += `| \`${r.title}\` | ${r.target} | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
     }
     md += '\n';
   }

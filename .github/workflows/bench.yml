@@ -1129,6 +1129,17 @@ jobs:
           SUMMARY_ARGS="$SUMMARY_ARGS --baseline-csv $BASELINE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --feature-csv $FEATURE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --gas-csv $BENCH_WORK_DIR/feature-1/total_gas.csv"
+          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+            BASELINE_TARGET_METRICS="$BENCH_WORK_DIR/baseline-1/target-metrics-delta.json"
+            FEATURE_TARGET_METRICS="$BENCH_WORK_DIR/feature-1/target-metrics-delta.json"
+            if [ "${BENCH_ABBA:-true}" = "true" ]; then
+              BASELINE_TARGET_METRICS="$BASELINE_TARGET_METRICS $BENCH_WORK_DIR/baseline-2/target-metrics-delta.json"
+              FEATURE_TARGET_METRICS="$FEATURE_TARGET_METRICS $BENCH_WORK_DIR/feature-2/target-metrics-delta.json"
+            fi
+            SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
+            SUMMARY_ARGS="$SUMMARY_ARGS --baseline-target-metrics $BASELINE_TARGET_METRICS"
+            SUMMARY_ARGS="$SUMMARY_ARGS --feature-target-metrics $FEATURE_TARGET_METRICS"
+          fi
           if [ "$BEHIND_BASELINE" -gt 0 ]; then
             SUMMARY_ARGS="$SUMMARY_ARGS --behind-baseline $BEHIND_BASELINE"
           fi

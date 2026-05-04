@@ -199,6 +199,9 @@ export BENCH_WORK_DIR
 export SCHELK_MOUNT="${SCHELK_MOUNT:-/reth-bench}"
 export BENCH_RPC_URL="${BENCH_RPC_URL:-https://ethereum.reth.rs/rpc}"
 export BENCH_METRICS_ADDR="127.0.0.1:9100"
+if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ] && [ -f "$RETH_REPO/.github/config/bench-prometheus-counters.json" ]; then
+  export BENCH_TARGET_METRICS_CONFIG="$RETH_REPO/.github/config/bench-prometheus-counters.json"
+fi
 
 # ── Step 1: Resolve refs to full SHAs ────────────────────────────────
 echo "▸ Resolving git refs..."
@@ -511,6 +514,14 @@ SUMMARY_ARGS=(
   --gas-csv "$BENCH_WORK_DIR/feature-1/total_gas.csv"
   --grafana-url "$GRAFANA_URL"
 )
+
+if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+  SUMMARY_ARGS+=(
+    --target-metrics-config "$BENCH_TARGET_METRICS_CONFIG"
+    --baseline-target-metrics "$BENCH_WORK_DIR/baseline-1/target-metrics-delta.json" "$BENCH_WORK_DIR/baseline-2/target-metrics-delta.json"
+    --feature-target-metrics "$BENCH_WORK_DIR/feature-1/target-metrics-delta.json" "$BENCH_WORK_DIR/feature-2/target-metrics-delta.json"
+  )
+fi
 
 python3 "${SCRIPTS_DIR}/bench-reth-summary.py" "${SUMMARY_ARGS[@]}"
 echo

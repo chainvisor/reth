@@ -16,6 +16,8 @@
 #               BENCH_OTLP_DISABLED (true to skip OTLP export even if endpoints are set)
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 LABEL="$1"
 BINARY="$2"
 OUTPUT_DIR="$3"
@@ -27,7 +29,34 @@ DATADIR="$SCHELK_MOUNT/$DATADIR_NAME"
 mkdir -p "$OUTPUT_DIR"
 LOG="${OUTPUT_DIR}/node.log"
 
+TARGET_METRICS_START="$OUTPUT_DIR/target-metrics-start.json"
+TARGET_METRICS_END="$OUTPUT_DIR/target-metrics-end.json"
+TARGET_METRICS_DELTA="$OUTPUT_DIR/target-metrics-delta.json"
+
 RETH_SCOPE="${RETH_SCOPE:-reth-bench.scope}"
+
+scrape_target_metrics() {
+  local output="$1"
+  if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+    return 0
+  fi
+
+  python3 "$SCRIPT_DIR/bench-target-metrics.py" scrape \
+    --metrics-url "http://${BENCH_METRICS_ADDR}/" \
+    --config "$BENCH_TARGET_METRICS_CONFIG" \
+    --output "$output"
+}
+
+record_target_metrics_delta() {
+  if [ -z "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+    return 0
+  fi
+
+  python3 "$SCRIPT_DIR/bench-target-metrics.py" diff \
+    --start "$TARGET_METRICS_START" \
+    --end "$TARGET_METRICS_END" \
+    --output "$TARGET_METRICS_DELTA"
+}
 
 cleanup() {
   kill "$TAIL_PID" 2>/dev/null || true
@@ -304,6 +333,8 @@ if [ "$BIG_BLOCKS" = "true" ]; then
     sleep 0.5  # give tracy-capture time to connect
   fi
 
+  scrape_target_metrics "$TARGET_METRICS_START"
+
   # Benchmark — skip warmup payloads so they aren't measured
   BB_SKIP=0
   if [ "$WARMUP" -gt 0 ] 2>/dev/null; then
@@ -321,6 +352,9 @@ if [ "$BIG_BLOCKS" = "true" ]; then
     --engine-rpc-url http://127.0.0.1:8551 \
     --jwt-secret "$DATADIR/jwt.hex" \
     --output "$OUTPUT_DIR" 2>&1 | sed -u "s/^/[bench] /"
+
+  scrape_target_metrics "$TARGET_METRICS_END"
+  record_target_metrics_delta
 else
   # Standard mode: warmup + new-payload-fcu
   WARMUP="${BENCH_WARMUP_BLOCKS:-50}"
@@ -344,6 +378,8 @@ else
     sleep 0.5  # give tracy-capture time to connect
   fi
 
+  scrape_target_metrics "$TARGET_METRICS_START"
+
   # Benchmark
   $BENCH_NICE "$RETH_BENCH" new-payload-fcu \
     --rpc-url "$BENCH_RPC_URL" \
@@ -352,6 +388,9 @@ else
     --advance "$BENCH_BLOCKS" \
     "${EXTRA_BENCH_ARGS[@]}" \
     --output "$OUTPUT_DIR" 2>&1 | sed -u "s/^/[bench] /"
+
+  scrape_target_metrics "$TARGET_METRICS_END"
+  record_target_metrics_delta
 fi
 
 # cleanup runs via trap
