@@ -31,6 +31,9 @@ BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 TARGET_METRIC_PERCENTILES = ("p50", "p90")
+SELECTOR_RE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
+)
 
 
 def _opt_int(row: dict, key: str) -> int | None:
@@ -92,6 +95,92 @@ def percentile(sorted_vals: list[float], pct: int) -> float:
     idx = int(len(sorted_vals) * pct / 100)
     idx = min(idx, len(sorted_vals) - 1)
     return sorted_vals[idx]
+
+
+def parse_label_string(text: str | None) -> dict[str, str]:
+    if not text:
+        return {}
+
+    labels = {}
+    parts = []
+    current = []
+    in_quotes = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            current.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            current.append(ch)
+            in_quotes = not in_quotes
+            continue
+        if ch == "," and not in_quotes:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+
+    for part in parts:
+        if not part:
+            continue
+        key, value = part.split("=", 1)
+        labels[key.strip()] = bytes(value.strip()[1:-1], "utf-8").decode("unicode_escape")
+    return labels
+
+
+def parse_target_metric_query(query: str) -> tuple[str, str, dict[str, str]]:
+    query = query.strip()
+    aggregate = "single"
+    inner = query
+    if query.startswith("sum(") and query.endswith(")"):
+        aggregate = "sum"
+        inner = query[4:-1].strip()
+
+    match = SELECTOR_RE.match(inner)
+    if not match:
+        raise ValueError(f"Unsupported target metric query: {query}")
+    return aggregate, match.group("name"), parse_label_string(match.group("labels"))
+
+
+def query_matches_sample(sample: dict, metric_name: str, label_filters: dict[str, str]) -> bool:
+    return sample["name"] == metric_name and all(
+        sample["labels"].get(key) == value for key, value in label_filters.items()
+    )
+
+
+def query_samples(samples: list[dict], query: str) -> tuple[str, list[dict]]:
+    aggregate, metric_name, label_filters = parse_target_metric_query(query)
+    matches = [
+        sample
+        for sample in samples
+        if query_matches_sample(sample, metric_name, label_filters)
+    ]
+    return aggregate, matches
+
+
+def evaluate_query(samples: list[dict], query: str, allow_missing: bool = False) -> float:
+    aggregate, matched_samples = query_samples(samples, query)
+    matches = [sample["value"] for sample in matched_samples]
+
+    if not matches:
+        if allow_missing:
+            return 0.0
+        raise ValueError(f"Query matched no samples: {query}")
+
+    if aggregate == "sum":
+        return float(sum(matches))
+    if len(matches) > 1:
+        raise ValueError(
+            f"Query matched {len(matches)} samples; use sum(...) or label filters: {query}"
+        )
+    return float(matches[0])
 
 
 def compute_stats(combined: list[dict]) -> dict:
@@ -408,19 +497,52 @@ def load_target_metric_range(path: str) -> dict:
 
 def load_target_metric_scrapes(path: str) -> list[dict]:
     scrape_path = Path(path).with_name("target-metrics-scrapes.jsonl")
-    scrapes = []
+    scrapes_by_unix_ms = {}
     with open(scrape_path) as f:
         for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                scrape = json.loads(line)
+                sample = json.loads(line)
             except json.JSONDecodeError as err:
                 raise ValueError(f"Invalid target metric scrape JSON in {scrape_path}:{line_number}: {err}") from err
-            if "timestamp_ms" not in scrape or "block_height" not in scrape or "values" not in scrape:
+            if not isinstance(sample, dict):
+                raise ValueError(f"Invalid target metric sample in {scrape_path}:{line_number}")
+            if not all(key in sample for key in ("name", "labels", "value", "offset_ms", "unix_ms")):
                 raise ValueError(f"Incomplete target metric scrape record in {scrape_path}:{line_number}")
-            scrapes.append(scrape)
+            if not isinstance(sample["name"], str) or not isinstance(sample["labels"], dict):
+                raise ValueError(f"Invalid target metric scrape record in {scrape_path}:{line_number}")
+
+            labels = dict(sorted(sample["labels"].items()))
+            normalized_sample = {
+                "name": sample["name"],
+                "labels": labels,
+                "value": float(sample["value"]),
+                "offset_ms": int(sample["offset_ms"]),
+                "unix_ms": int(sample["unix_ms"]),
+            }
+
+            scrape = scrapes_by_unix_ms.setdefault(
+                normalized_sample["unix_ms"],
+                {
+                    "timestamp_ms": normalized_sample["unix_ms"],
+                    "offset_ms": normalized_sample["offset_ms"],
+                    "samples": [],
+                },
+            )
+            if scrape["offset_ms"] != normalized_sample["offset_ms"]:
+                raise ValueError(
+                    f"Mismatched target metric sample offsets for scrape {normalized_sample['unix_ms']} in {scrape_path}"
+                )
+            scrape["samples"].append(
+                {
+                    "name": normalized_sample["name"],
+                    "labels": normalized_sample["labels"],
+                    "value": normalized_sample["value"],
+                }
+            )
+    scrapes = sorted(scrapes_by_unix_ms.values(), key=lambda scrape: int(scrape["timestamp_ms"]))
     if not scrapes:
         raise ValueError(f"No target metric scrapes found in {scrape_path}")
     return scrapes
@@ -466,6 +588,8 @@ def query_target_metric_run(path: str, config: dict) -> tuple[str, dict[str, dic
         raise ValueError(
             f"Target metric scrapes for run '{run_label}' only had {len(relevant_scrapes)} samples inside the benchmark window"
         )
+    for scrape in relevant_scrapes:
+        scrape["block_height"] = evaluate_query(scrape["samples"], TARGET_METRIC_BLOCK_HEIGHT_QUERY)
 
     counters = {}
     for counter in config.get("counters", []):
@@ -474,18 +598,15 @@ def query_target_metric_run(path: str, config: dict) -> tuple[str, dict[str, dic
         counter_increase = 0.0
         block_height_delta = 0.0
         for previous_scrape, current_scrape in zip(relevant_scrapes, relevant_scrapes[1:]):
-            previous_values = previous_scrape.get("values", {})
-            current_values = current_scrape.get("values", {})
-            if query not in previous_values or query not in current_values:
-                raise ValueError(f"Missing target metric '{query}' in scrape file for run '{run_label}'")
-
+            current_counter_value = evaluate_query(current_scrape["samples"], query, allow_missing=True)
+            previous_counter_value = evaluate_query(previous_scrape["samples"], query, allow_missing=True)
             current_block_height = float(current_scrape["block_height"])
             previous_block_height = float(previous_scrape["block_height"])
             interval_block_height_delta = current_block_height - previous_block_height
             if interval_block_height_delta <= EPSILON:
                 continue
 
-            interval_counter_delta = float(current_values[query]) - float(previous_values[query])
+            interval_counter_delta = current_counter_value - previous_counter_value
             if interval_counter_delta < -EPSILON:
                 raise ValueError(
                     f"Target metric '{query}' decreased within run '{run_label}', which is not valid for counters"

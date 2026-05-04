@@ -99,6 +99,22 @@ def parse_target_metric_query(query):
     return aggregate, match.group("name"), parse_label_string(match.group("labels"))
 
 
+def query_matches_sample(sample, metric_name, label_filters):
+    return sample["name"] == metric_name and all(
+        sample["labels"].get(key) == value for key, value in label_filters.items()
+    )
+
+
+def query_samples(samples, query):
+    aggregate, metric_name, label_filters = parse_target_metric_query(query)
+    matches = [
+        sample
+        for sample in samples
+        if query_matches_sample(sample, metric_name, label_filters)
+    ]
+    return aggregate, matches
+
+
 def parse_samples(metrics_text):
     samples = []
     for line in metrics_text.splitlines():
@@ -119,13 +135,8 @@ def parse_samples(metrics_text):
 
 
 def evaluate_query(samples, query, allow_missing=False):
-    aggregate, metric_name, label_filters = parse_target_metric_query(query)
-    matches = [
-        sample["value"]
-        for sample in samples
-        if sample["name"] == metric_name
-        and all(sample["labels"].get(key) == value for key, value in label_filters.items())
-    ]
+    aggregate, matched_samples = query_samples(samples, query)
+    matches = [sample["value"] for sample in matched_samples]
 
     if not matches:
         if allow_missing:
@@ -141,14 +152,43 @@ def evaluate_query(samples, query, allow_missing=False):
     return float(matches[0])
 
 
+def target_metric_sample_key(sample):
+    return sample["name"], tuple(sorted(sample["labels"].items()))
+
+
 def scrape_target_metrics(metrics_text, config):
     samples = parse_samples(metrics_text)
-    values = {
-        TARGET_METRIC_BLOCK_HEIGHT_QUERY: evaluate_query(samples, TARGET_METRIC_BLOCK_HEIGHT_QUERY),
-    }
-    for counter in config.get("counters", []):
-        values[counter["query"]] = evaluate_query(samples, counter["query"], allow_missing=True)
-    return values
+    queries = [TARGET_METRIC_BLOCK_HEIGHT_QUERY] + [counter["query"] for counter in config.get("counters", [])]
+    target_samples = []
+    seen = set()
+
+    for query in queries:
+        evaluate_query(samples, query, allow_missing=query != TARGET_METRIC_BLOCK_HEIGHT_QUERY)
+        _, matches = query_samples(samples, query)
+        for sample in matches:
+            key = target_metric_sample_key(sample)
+            if key in seen:
+                continue
+            seen.add(key)
+            target_samples.append(
+                {
+                    "name": sample["name"],
+                    "labels": dict(sorted(sample["labels"].items())),
+                    "value": float(sample["value"]),
+                }
+            )
+
+    return target_samples
+
+
+def compute_target_metric_offset_ms(labels, unix_ms):
+    start = labels.get("run_start_epoch")
+    if not start:
+        return 0
+    try:
+        return max(unix_ms - int(float(start) * 1000), 0)
+    except (ValueError, TypeError):
+        return 0
 
 
 class TargetMetricScraper(threading.Thread):
@@ -183,19 +223,25 @@ class TargetMetricScraper(threading.Thread):
         except (URLError, ConnectionError, OSError):
             return
 
-        values = scrape_target_metrics(metrics_text, self.config)
-        record = {
-            "benchmark_id": labels.get("benchmark_id"),
-            "benchmark_run": labels.get("benchmark_run"),
-            "timestamp_ms": time.time_ns() // 1_000_000,
-            "block_height": values.pop(TARGET_METRIC_BLOCK_HEIGHT_QUERY),
-            "values": values,
-        }
+        target_samples = scrape_target_metrics(metrics_text, self.config)
+        unix_ms = time.time_ns() // 1_000_000
+        offset_ms = compute_target_metric_offset_ms(labels, unix_ms)
+        records = [
+            {
+                "name": sample["name"],
+                "labels": sample["labels"],
+                "value": sample["value"],
+                "offset_ms": offset_ms,
+                "unix_ms": unix_ms,
+            }
+            for sample in target_samples
+        ]
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "a") as f:
-            json.dump(record, f, sort_keys=True)
-            f.write("\n")
+            for record in records:
+                json.dump(record, f)
+                f.write("\n")
 
 
 def inject_labels(metrics_bytes, label_str, label_names):
