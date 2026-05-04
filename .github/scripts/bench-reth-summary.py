@@ -491,8 +491,7 @@ def load_target_metric_range(path: str) -> dict:
         metadata = json.load(f)
     if not metadata.get("benchmark_id"):
         raise ValueError(f"Missing benchmark_id in {range_path}")
-    if not metadata.get("benchmark_run"):
-        metadata["benchmark_run"] = run_label_from_path(path)
+    metadata["benchmark_run"] = run_label_from_path(path)
     if metadata.get("duration_ms", 0) <= 0:
         raise ValueError(f"Non-positive target metric query range in {range_path}")
     return metadata

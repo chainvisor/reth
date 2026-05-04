@@ -44,7 +44,7 @@ record_target_metric_range() {
     return 0
   fi
 
-  python3 - "$TARGET_METRICS_RANGE" "$start_ms" "$end_ms" "${BENCH_ID:-}" "$LABEL" <<'PY'
+  python3 - "$TARGET_METRICS_RANGE" "$start_ms" "$end_ms" "${BENCH_ID:-}" "$(basename "$OUTPUT_DIR")" <<'PY'
 import json
 import sys
 
