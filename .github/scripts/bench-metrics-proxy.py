@@ -11,8 +11,10 @@ Returns empty 200 when reth is not running (clean Grafana gaps).
 import argparse
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -38,6 +40,28 @@ INTERNAL_LABEL_KEYS = ("run_start_epoch", "reference_epoch", "target_metrics_fil
 # local upstream scrapes so the proxy always talks directly to reth's loopback
 # metrics endpoint.
 DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
+
+
+def configure_ci_process_lifecycle():
+    """Keep the proxy alive across GitHub Actions benchmark steps.
+
+    The benchmark workflows launch this proxy in the background in one step, then
+    run the actual benchmark in later steps. Put the proxy in its own process
+    group and ignore SIGHUP so it does not inherit the shell lifecycle from the
+    setup step.
+    """
+    if os.name != "posix" or os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def read_labels(path):
@@ -518,6 +542,8 @@ def main():
     parser.add_argument("--port", type=int, default=9090,
                         help="Port to bind the proxy (default: 9090)")
     args = parser.parse_args()
+
+    configure_ci_process_lifecycle()
 
     if args.subnet:
         bind_addr = resolve_bind_address(args.subnet)
