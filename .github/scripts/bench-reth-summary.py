@@ -29,6 +29,7 @@ GIGAGAS = 1_000_000_000
 T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
+MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS = 3
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 TARGET_METRIC_COUNTER_STATS = ("p50", "p90")
 TARGET_METRIC_HISTOGRAM_PERCENTILES = (("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99"))
@@ -849,6 +850,22 @@ def summarize_target_metric_runs(run_items: list[dict], fields: tuple[str, ...])
     return summary
 
 
+def paired_run_bootstrap_ci(query: str, stat_name: str, pair_diffs: list[float]) -> float | None:
+    if len(pair_diffs) < MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS:
+        return None
+
+    rng = random.Random(f"{query}:{stat_name}:abba-run-diff")
+    boot_diffs = []
+    for _ in range(BOOTSTRAP_ITERATIONS):
+        sample = rng.choices(pair_diffs, k=len(pair_diffs))
+        boot_diffs.append(sum(sample) / len(sample))
+
+    boot_diffs.sort()
+    lo = int(BOOTSTRAP_ITERATIONS * 0.025)
+    hi = int(BOOTSTRAP_ITERATIONS * 0.975)
+    return (boot_diffs[hi] - boot_diffs[lo]) / 2
+
+
 def compute_counter_target_metric_change(
     baseline_runs: list[dict],
     feature_runs: list[dict],
@@ -859,6 +876,32 @@ def compute_counter_target_metric_change(
     baseline_value = sum(run[stat_name] for run in baseline_runs) / len(baseline_runs)
     feature_value = sum(run[stat_name] for run in feature_runs) / len(feature_runs)
     diff = feature_value - baseline_value
+
+    if len(baseline_runs) > 1 and len(feature_runs) > 1:
+        pair_diffs = [
+            feature_run[stat_name] - baseline_run[stat_name]
+            for baseline_run, feature_run in zip(baseline_runs, feature_runs)
+        ]
+        ci = paired_run_bootstrap_ci(query, stat_name, pair_diffs)
+        pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+        ci_pct = (ci / baseline_value * 100.0) if ci is not None and abs(baseline_value) > EPSILON else 0.0
+        result = {
+            "baseline": baseline_value,
+            "feature": feature_value,
+            "diff": round(diff, 6),
+            "pct": round(pct, 4),
+            "ci": round(ci, 6) if ci is not None else 0.0,
+            "ci_pct": round(ci_pct, 4),
+            "sig": significance(pct, ci_pct, lower_is_better=target == "decrease")
+            if ci is not None
+            else "neutral",
+            "method": "abba-paired-run-bootstrap",
+        }
+        if ci is None:
+            result["significance_reason"] = (
+                f"requires at least {MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS} matched ABBA run pairs"
+            )
+        return result
 
     rng = random.Random(f"{query}:{stat_name}")
     boot_diffs = []
@@ -901,6 +944,32 @@ def compute_histogram_target_metric_change(
     baseline_value = sum(run["value"] for run in baseline_runs) / len(baseline_runs)
     feature_value = sum(run["value"] for run in feature_runs) / len(feature_runs)
     diff = feature_value - baseline_value
+
+    if len(baseline_runs) > 1 and len(feature_runs) > 1:
+        pair_diffs = [
+            feature_run["value"] - baseline_run["value"]
+            for baseline_run, feature_run in zip(baseline_runs, feature_runs)
+        ]
+        ci = paired_run_bootstrap_ci(query, stat_name, pair_diffs)
+        pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+        ci_pct = (ci / baseline_value * 100.0) if ci is not None and abs(baseline_value) > EPSILON else 0.0
+        result = {
+            "baseline": baseline_value,
+            "feature": feature_value,
+            "diff": round(diff, 6),
+            "pct": round(pct, 4),
+            "ci": round(ci, 6) if ci is not None else 0.0,
+            "ci_pct": round(ci_pct, 4),
+            "sig": significance(pct, ci_pct, lower_is_better=target == "decrease")
+            if ci is not None
+            else "neutral",
+            "method": "abba-paired-run-bootstrap",
+        }
+        if ci is None:
+            result["significance_reason"] = (
+                f"requires at least {MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS} matched ABBA run pairs"
+            )
+        return result
 
     rng = random.Random(f"{query}:{stat_name}")
     boot_diffs = []
@@ -1166,6 +1235,7 @@ def compute_target_metric_summary(
             "counters": "counter delta / canonical chain-height delta between adjacent scrapes",
             "histograms": "plain mean of recorded quantile samples inside each benchmark window",
             "cardinality": "unhandled label sets become separate target metrics after stripping query filters and known labels such as quantile/run_type",
+            "abba_significance": f"paired run-diff bootstrap across matched replicas; target-metric significance requires at least {MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS} matched ABBA run pairs because scrape samples within one run are not independent experiments",
         },
         "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,

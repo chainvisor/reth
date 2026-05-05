@@ -20,5 +20,54 @@ class FmtMetricValueTests(unittest.TestCase):
         self.assertEqual(MODULE.fmt_metric_value(12.00001), "12")
 
 
+class TargetMetricSignificanceTests(unittest.TestCase):
+    def test_abba_histograms_need_three_pairs_for_significance(self) -> None:
+        baseline_runs = [
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
+            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+        ]
+        feature_runs = [
+            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+            {"value": 1.5, "_values": [1.5, 1.5, 1.5]},
+        ]
+
+        change = MODULE.compute_histogram_target_metric_change(
+            baseline_runs,
+            feature_runs,
+            "test_histogram",
+            "decrease",
+            "p50",
+        )
+
+        self.assertEqual(change["method"], "abba-paired-run-bootstrap")
+        self.assertEqual(change["sig"], "neutral")
+        self.assertIn("requires at least", change["significance_reason"])
+
+    def test_abba_histograms_report_consistent_three_pair_changes(self) -> None:
+        baseline_runs = [
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
+        ]
+        feature_runs = [
+            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+        ]
+
+        change = MODULE.compute_histogram_target_metric_change(
+            baseline_runs,
+            feature_runs,
+            "test_histogram",
+            "decrease",
+            "p50",
+        )
+
+        self.assertEqual(change["method"], "abba-paired-run-bootstrap")
+        self.assertEqual(change["sig"], "bad")
+        self.assertEqual(change["pct"], 100.0)
+        self.assertEqual(change["ci_pct"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
