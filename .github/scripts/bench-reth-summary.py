@@ -666,11 +666,9 @@ def query_histogram_target_metric_run(
             _, matched_samples = query_samples(scrape["samples"], query)
             if not matched_samples:
                 continue
-            if len(matched_samples) > 1:
-                raise ValueError(
-                    f"Query matched {len(matched_samples)} samples; use label filters: {query}"
-                )
-            sample_values.append(float(matched_samples[0]["value"]))
+            sample_values.append(
+                sum(float(sample["value"]) for sample in matched_samples) / len(matched_samples)
+            )
 
         if not sample_values:
             raise ValueError(
