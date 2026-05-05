@@ -54,9 +54,12 @@ def configure_ci_process_lifecycle():
         return
 
     try:
-        os.setpgrp()
+        os.setsid()
     except OSError:
-        pass
+        try:
+            os.setpgrp()
+        except OSError:
+            pass
 
     try:
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
