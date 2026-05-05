@@ -946,9 +946,14 @@ jobs:
             METRICS_PROXY_ARGS+=(--target-metrics-config "$BENCH_TARGET_METRICS_CONFIG")
           fi
 
-          python3 .github/scripts/bench-metrics-proxy.py "${METRICS_PROXY_ARGS[@]}" &
+          PROXY_LOG="$RUNNER_TEMP/bench-metrics-proxy.log"
+          : > "$PROXY_LOG"
+          RUNNER_TRACKING_ID='' \
+            python3 .github/scripts/bench-metrics-proxy.py "${METRICS_PROXY_ARGS[@]}" \
+            >"$PROXY_LOG" 2>&1 &
           PROXY_PID=$!
           echo "BENCH_METRICS_PROXY_PID=${PROXY_PID}" >> "$GITHUB_ENV"
+          echo "BENCH_METRICS_PROXY_LOG=${PROXY_LOG}" >> "$GITHUB_ENV"
           echo "Metrics proxy started (PID $PROXY_PID)"
 
       - name: Update status (running benchmarks)
@@ -1021,6 +1026,8 @@ jobs:
         if: "!cancelled()"
         run: |
           kill "$BENCH_METRICS_PROXY_PID" 2>/dev/null || true
+          echo "=== bench-metrics-proxy log ==="
+          tail -200 "$BENCH_METRICS_PROXY_LOG" 2>/dev/null || true
 
           LAST_RUN_DURATION=$(( $(date +%s) - BENCH_LAST_RUN_START ))
           FROM_MS=$(( BENCH_REFERENCE_EPOCH * 1000 ))
