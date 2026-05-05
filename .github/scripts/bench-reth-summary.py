@@ -30,6 +30,9 @@ T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
 MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS = 3
+TWO_PAIR_ABBA_MIN_PCT = 10.0
+TWO_PAIR_ABBA_MIN_PAIR_RATIO = 0.5
+TWO_PAIR_ABBA_HISTOGRAM_MIN_ABS_DIFF = 1e-4
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 TARGET_METRIC_COUNTER_STATS = ("p50", "p90")
 TARGET_METRIC_HISTOGRAM_PERCENTILES = (("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99"))
@@ -866,6 +869,34 @@ def paired_run_bootstrap_ci(query: str, stat_name: str, pair_diffs: list[float])
     return (boot_diffs[hi] - boot_diffs[lo]) / 2
 
 
+def two_pair_abba_consistency(
+    pair_diffs: list[float], pct: float, abs_diff: float, abs_floor: float
+) -> tuple[bool, str | None]:
+    if len(pair_diffs) != 2:
+        return False, None
+
+    if pair_diffs[0] == 0.0 or pair_diffs[1] == 0.0:
+        return False, "requires both ABBA run pairs to move away from zero"
+
+    if (pair_diffs[0] > 0) != (pair_diffs[1] > 0):
+        return False, "requires both ABBA run pairs to move in the same direction"
+
+    pair_ratio = min(abs(pair_diffs[0]), abs(pair_diffs[1])) / max(abs(pair_diffs[0]), abs(pair_diffs[1]))
+    if pair_ratio < TWO_PAIR_ABBA_MIN_PAIR_RATIO:
+        return (
+            False,
+            f"requires the smaller ABBA pair effect to be at least {TWO_PAIR_ABBA_MIN_PAIR_RATIO:.0%} of the larger one",
+        )
+
+    if abs(pct) < TWO_PAIR_ABBA_MIN_PCT:
+        return False, f"requires at least {TWO_PAIR_ABBA_MIN_PCT:.0f}% change with only 2 ABBA pairs"
+
+    if abs_diff < abs_floor:
+        return False, f"requires at least {abs_floor:g} absolute change with only 2 ABBA pairs"
+
+    return True, None
+
+
 def compute_counter_target_metric_change(
     baseline_runs: list[dict],
     feature_runs: list[dict],
@@ -882,8 +913,24 @@ def compute_counter_target_metric_change(
             feature_run[stat_name] - baseline_run[stat_name]
             for baseline_run, feature_run in zip(baseline_runs, feature_runs)
         ]
-        ci = paired_run_bootstrap_ci(query, stat_name, pair_diffs)
         pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+        if len(pair_diffs) == 2:
+            consistent, reason = two_pair_abba_consistency(pair_diffs, pct, abs(diff), 0.0)
+            result = {
+                "baseline": baseline_value,
+                "feature": feature_value,
+                "diff": round(diff, 6),
+                "pct": round(pct, 4),
+                "ci": 0.0,
+                "ci_pct": 0.0,
+                "sig": significance(pct, 0.0, lower_is_better=target == "decrease") if consistent else "neutral",
+                "method": "abba-two-pair-consistency",
+            }
+            if not consistent and reason:
+                result["significance_reason"] = reason
+            return result
+
+        ci = paired_run_bootstrap_ci(query, stat_name, pair_diffs)
         ci_pct = (ci / baseline_value * 100.0) if ci is not None and abs(baseline_value) > EPSILON else 0.0
         result = {
             "baseline": baseline_value,
@@ -950,8 +997,26 @@ def compute_histogram_target_metric_change(
             feature_run["value"] - baseline_run["value"]
             for baseline_run, feature_run in zip(baseline_runs, feature_runs)
         ]
-        ci = paired_run_bootstrap_ci(query, stat_name, pair_diffs)
         pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+        if len(pair_diffs) == 2:
+            consistent, reason = two_pair_abba_consistency(
+                pair_diffs, pct, abs(diff), TWO_PAIR_ABBA_HISTOGRAM_MIN_ABS_DIFF
+            )
+            result = {
+                "baseline": baseline_value,
+                "feature": feature_value,
+                "diff": round(diff, 6),
+                "pct": round(pct, 4),
+                "ci": 0.0,
+                "ci_pct": 0.0,
+                "sig": significance(pct, 0.0, lower_is_better=target == "decrease") if consistent else "neutral",
+                "method": "abba-two-pair-consistency",
+            }
+            if not consistent and reason:
+                result["significance_reason"] = reason
+            return result
+
+        ci = paired_run_bootstrap_ci(query, stat_name, pair_diffs)
         ci_pct = (ci / baseline_value * 100.0) if ci is not None and abs(baseline_value) > EPSILON else 0.0
         result = {
             "baseline": baseline_value,
@@ -1235,7 +1300,7 @@ def compute_target_metric_summary(
             "counters": "counter delta / canonical chain-height delta between adjacent scrapes",
             "histograms": "plain mean of recorded quantile samples inside each benchmark window",
             "cardinality": "unhandled label sets become separate target metrics after stripping query filters and known labels such as quantile/run_type",
-            "abba_significance": f"paired run-diff bootstrap across matched replicas; target-metric significance requires at least {MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS} matched ABBA run pairs because scrape samples within one run are not independent experiments",
+            "abba_significance": f"uses paired run-diff bootstrap across matched replicas for {MIN_TARGET_METRIC_ABBA_SIGNIFICANCE_PAIRS}+ ABBA pairs; with 2 ABBA pairs it only reports changes when both pairs move in the same direction, the smaller pair effect is at least {TWO_PAIR_ABBA_MIN_PAIR_RATIO:.0%} of the larger one, the change is at least {TWO_PAIR_ABBA_MIN_PCT:.0f}%, and histogram rows also exceed {TWO_PAIR_ABBA_HISTOGRAM_MIN_ABS_DIFF:g} absolute change",
         },
         "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,

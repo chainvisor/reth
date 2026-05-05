@@ -21,14 +21,14 @@ class FmtMetricValueTests(unittest.TestCase):
 
 
 class TargetMetricSignificanceTests(unittest.TestCase):
-    def test_abba_histograms_need_three_pairs_for_significance(self) -> None:
+    def test_two_pair_abba_histograms_require_consistent_large_change(self) -> None:
         baseline_runs = [
             {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
-            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
         ]
         feature_runs = [
-            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
-            {"value": 1.5, "_values": [1.5, 1.5, 1.5]},
+            {"value": 5.0, "_values": [5.0, 5.0, 5.0]},
+            {"value": 5.1, "_values": [5.1, 5.1, 5.1]},
         ]
 
         change = MODULE.compute_histogram_target_metric_change(
@@ -39,9 +39,52 @@ class TargetMetricSignificanceTests(unittest.TestCase):
             "p50",
         )
 
-        self.assertEqual(change["method"], "abba-paired-run-bootstrap")
+        self.assertEqual(change["method"], "abba-two-pair-consistency")
+        self.assertEqual(change["sig"], "bad")
+
+    def test_two_pair_abba_histograms_suppress_inconsistent_change(self) -> None:
+        baseline_runs = [
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
+            {"value": 1.0, "_values": [1.0, 1.0, 1.0]},
+        ]
+        feature_runs = [
+            {"value": 1.1, "_values": [1.1, 1.1, 1.1]},
+            {"value": 2.0, "_values": [2.0, 2.0, 2.0]},
+        ]
+
+        change = MODULE.compute_histogram_target_metric_change(
+            baseline_runs,
+            feature_runs,
+            "test_histogram",
+            "decrease",
+            "p50",
+        )
+
+        self.assertEqual(change["method"], "abba-two-pair-consistency")
         self.assertEqual(change["sig"], "neutral")
-        self.assertIn("requires at least", change["significance_reason"])
+        self.assertIn("smaller ABBA pair effect", change["significance_reason"])
+
+    def test_two_pair_abba_histograms_suppress_tiny_absolute_change(self) -> None:
+        baseline_runs = [
+            {"value": 2.0e-6, "_values": [2.0e-6, 2.0e-6, 2.0e-6]},
+            {"value": 2.0e-6, "_values": [2.0e-6, 2.0e-6, 2.0e-6]},
+        ]
+        feature_runs = [
+            {"value": 3.0e-6, "_values": [3.0e-6, 3.0e-6, 3.0e-6]},
+            {"value": 3.1e-6, "_values": [3.1e-6, 3.1e-6, 3.1e-6]},
+        ]
+
+        change = MODULE.compute_histogram_target_metric_change(
+            baseline_runs,
+            feature_runs,
+            "test_histogram",
+            "decrease",
+            "p50",
+        )
+
+        self.assertEqual(change["method"], "abba-two-pair-consistency")
+        self.assertEqual(change["sig"], "neutral")
+        self.assertIn("absolute change", change["significance_reason"])
 
     def test_abba_histograms_report_consistent_three_pair_changes(self) -> None:
         baseline_runs = [
