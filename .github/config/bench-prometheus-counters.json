@@ -16,19 +16,19 @@
     },
     {
       "query": "reth_trie_proof_task_account_worker_idle_time_seconds",
-      "target": "decrease"
+      "target": "increase"
     },
     {
       "query": "reth_trie_proof_task_storage_worker_idle_time_seconds",
-      "target": "decrease"
+      "target": "increase"
     },
     {
       "query": "reth_tree_root_sparse_trie_idle_time_seconds",
-      "target": "decrease"
+      "target": "increase"
     },
     {
       "query": "reth_tree_root_hashing_task_idle_time_seconds",
-      "target": "decrease"
+      "target": "increase"
     },
     {
       "query": "reth_database_transaction_close_duration_seconds",
