@@ -655,7 +655,6 @@ where
         );
 
         let root_time = Instant::now();
-        std::thread::sleep(Duration::from_millis(5));
         let mut maybe_state_root = None;
         let mut state_root_task_failed = false;
         #[cfg(feature = "trie-debug")]
