@@ -19,7 +19,7 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
@@ -33,6 +33,11 @@ SELECTOR_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
 )
 INTERNAL_LABEL_KEYS = ("run_start_epoch", "reference_epoch", "target_metrics_file")
+
+# The benchmark runner environment may set HTTP proxy variables. Bypass them for
+# local upstream scrapes so the proxy always talks directly to reth's loopback
+# metrics endpoint.
+DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
 def read_labels(path):
@@ -259,7 +264,7 @@ class TargetMetricScraper(threading.Thread):
             return
 
         try:
-            with urlopen(self.upstream, timeout=2) as resp:
+            with DIRECT_URL_OPENER.open(self.upstream, timeout=2) as resp:
                 metrics_text = resp.read().decode("utf-8")
         except (URLError, ConnectionError, OSError):
             return
@@ -425,7 +430,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         src = self.client_address[0]
         try:
-            resp = urlopen(self.server.upstream, timeout=2)
+            resp = DIRECT_URL_OPENER.open(self.server.upstream, timeout=2)
             metrics = resp.read()
         except (URLError, ConnectionError, OSError):
             # reth not running — return empty 200
