@@ -114,10 +114,12 @@ function targetMetricRows(summary) {
   const changed = (summary.target_metrics && summary.target_metrics.changed) || [];
   const rows = [];
   for (const metric of changed) {
-    for (const stat of ['p50', 'p90']) {
+    const displayStats = metric.display_stats || ['p50', 'p90'];
+    for (const stat of displayStats) {
       const change = metric.changes && metric.changes[stat];
       if (!change || change.sig === 'neutral') continue;
       rows.push({
+        kind: metric.kind,
         title: `${metric.name} ${stat}`,
         baseline: fmtMetricValue(change.baseline),
         feature: fmtMetricValue(change.feature),

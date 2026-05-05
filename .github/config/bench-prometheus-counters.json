@@ -8,5 +8,19 @@
       "query": "sum(reth_database_transaction_opened_total{mode=\"read-only\"})",
       "target": "decrease"
     }
+  ],
+  "histograms": [
+    {
+      "query": "reth_consensus_engine_beacon_new_payload_latency",
+      "target": "decrease"
+    },
+    {
+      "query": "reth_consensus_engine_beacon_forkchoice_updated_latency",
+      "target": "decrease"
+    },
+    {
+      "query": "reth_consensus_engine_beacon_new_payload_gas_per_second",
+      "target": "increase"
+    }
   ]
 }

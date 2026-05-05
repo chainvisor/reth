@@ -23,6 +23,7 @@ from urllib.request import urlopen
 
 
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
+HISTOGRAM_QUANTILES = (("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99"))
 SAMPLE_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+"
     r"(?P<value>[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?Inf|NaN)"
@@ -99,6 +100,39 @@ def parse_target_metric_query(query):
     return aggregate, match.group("name"), parse_label_string(match.group("labels"))
 
 
+def format_label_value(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def format_target_metric_query(metric_name, labels):
+    if not labels:
+        return metric_name
+    encoded_labels = ",".join(
+        f'{key}="{format_label_value(value)}"' for key, value in sorted(labels.items())
+    )
+    return f"{metric_name}{{{encoded_labels}}}"
+
+
+def histogram_quantile_query(query, quantile):
+    aggregate, metric_name, label_filters = parse_target_metric_query(query)
+    if aggregate != "single":
+        raise ValueError(f"Histogram target metric queries must not use sum(...): {query}")
+    if "quantile" in label_filters:
+        raise ValueError(f"Histogram target metric query must not include a quantile label: {query}")
+    label_filters = dict(label_filters)
+    label_filters["quantile"] = quantile
+    return format_target_metric_query(metric_name, label_filters)
+
+
+def configured_target_metric_queries(config):
+    queries = [TARGET_METRIC_BLOCK_HEIGHT_QUERY]
+    queries.extend(counter["query"] for counter in config.get("counters", []))
+    for histogram in config.get("histograms", []):
+        for _, quantile in HISTOGRAM_QUANTILES:
+            queries.append(histogram_quantile_query(histogram["query"], quantile))
+    return queries
+
+
 def query_matches_sample(sample, metric_name, label_filters):
     return sample["name"] == metric_name and all(
         sample["labels"].get(key) == value for key, value in label_filters.items()
@@ -158,13 +192,20 @@ def target_metric_sample_key(sample):
 
 def scrape_target_metrics(metrics_text, config):
     samples = parse_samples(metrics_text)
-    queries = [TARGET_METRIC_BLOCK_HEIGHT_QUERY] + [counter["query"] for counter in config.get("counters", [])]
+    queries = configured_target_metric_queries(config)
     target_samples = []
     seen = set()
 
     for query in queries:
-        evaluate_query(samples, query, allow_missing=query != TARGET_METRIC_BLOCK_HEIGHT_QUERY)
-        _, matches = query_samples(samples, query)
+        aggregate, matches = query_samples(samples, query)
+        if query == TARGET_METRIC_BLOCK_HEIGHT_QUERY and not matches:
+            raise ValueError(f"Query matched no samples: {query}")
+        if not matches:
+            continue
+        if aggregate != "sum" and len(matches) > 1:
+            raise ValueError(
+                f"Query matched {len(matches)} samples; use sum(...) or label filters: {query}"
+            )
         for sample in matches:
             key = target_metric_sample_key(sample)
             if key in seen:

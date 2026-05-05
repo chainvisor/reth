@@ -69,13 +69,19 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
 
   const tmRows = targetMetricRows(summary);
   if (tmRows.length > 0) {
-    md += `### Target Counter Metrics\n\n`;
-    md += `| Metric | Baseline / block | Feature / block | Change |\n`;
-    md += `|--------|------------------|-----------------|--------|\n`;
+    md += `### Target Metrics\n\n`;
+    md += `| Metric | Baseline | Feature | Change |\n`;
+    md += `|--------|----------|---------|--------|\n`;
     for (const r of tmRows) {
       md += `| \`${r.title}\` | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
     }
-    md += `\n*Values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*\n\n`;
+    if (tmRows.some(r => r.kind === 'counter')) {
+      md += `\n*Counter rows are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*\n`;
+    }
+    if (tmRows.some(r => r.kind === 'histogram')) {
+      md += `*Histogram rows are trapezoid-integrated recorded quantile series, weighted by canonical chain-height delta between adjacent scrapes and divided by total benchmark-window blocks.*\n`;
+    }
+    md += `\n`;
   }
 
   // Charts
