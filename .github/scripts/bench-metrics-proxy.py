@@ -42,6 +42,13 @@ INTERNAL_LABEL_KEYS = ("run_start_epoch", "reference_epoch", "target_metrics_fil
 DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
+def safe_print(message, *, stream=sys.stdout):
+    try:
+        print(message, file=stream, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def configure_ci_process_lifecycle():
     """Keep the proxy alive across GitHub Actions benchmark steps.
 
@@ -281,7 +288,7 @@ class TargetMetricScraper(threading.Thread):
             try:
                 self.scrape_once()
             except Exception as exc:
-                print(f"target metric scrape failed: {exc}", file=sys.stderr, flush=True)
+                safe_print(f"target metric scrape failed: {exc}", stream=sys.stderr)
             self.stop_event.wait(self.interval_s)
 
     def scrape_once(self):
@@ -479,8 +486,9 @@ class MetricsHandler(BaseHTTPRequestHandler):
         dt = time.monotonic() - t0
 
         self._send(result)
-        print(f"  scrape from {src}: {len(metrics)} -> {len(result)} bytes, "
-              f"inject {dt*1000:.1f}ms", flush=True)
+        safe_print(
+            f"  scrape from {src}: {len(metrics)} -> {len(result)} bytes, inject {dt*1000:.1f}ms"
+        )
 
     def _send(self, body):
         self.send_response(200)
@@ -509,7 +517,7 @@ def resolve_bind_address(subnet_cidr):
         )
         interfaces = json.loads(result.stdout)
     except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as exc:
-        print(f"Error: cannot enumerate interfaces: {exc}", file=sys.stderr)
+        safe_print(f"Error: cannot enumerate interfaces: {exc}", stream=sys.stderr)
         sys.exit(1)
 
     for iface in interfaces:
@@ -521,7 +529,7 @@ def resolve_bind_address(subnet_cidr):
             if addr in network:
                 return str(addr)
 
-    print(f"Error: no interface address found in subnet {subnet_cidr}", file=sys.stderr)
+    safe_print(f"Error: no interface address found in subnet {subnet_cidr}", stream=sys.stderr)
     sys.exit(1)
 
 
@@ -569,12 +577,13 @@ def main():
         )
         scraper.start()
 
-    print(f"bench-metrics-proxy listening on {bind_addr}:{args.port}")
-    print(f"  upstream: {args.upstream}")
-    print(f"  labels:   {args.labels}")
+    safe_print(f"bench-metrics-proxy listening on {bind_addr}:{args.port}")
+    safe_print(f"  upstream: {args.upstream}")
+    safe_print(f"  labels:   {args.labels}")
     if args.target_metrics_config:
-        print(f"  target metrics: {args.target_metrics_config} ({args.scrape_interval:.2f}s interval)")
-    sys.stdout.flush()
+        safe_print(
+            f"  target metrics: {args.target_metrics_config} ({args.scrape_interval:.2f}s interval)"
+        )
     try:
         server.serve_forever()
     finally:
