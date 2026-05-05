@@ -1,35 +1,11 @@
 {
   "counters": [
     {
-      "query": "reth_process_cpu_seconds_total",
-      "target": "decrease"
-    },
-    {
-      "query": "sum(reth_sync_caching_precompile_cache_hits)",
-      "target": "increase"
-    },
-    {
-      "query": "sum(reth_sync_caching_precompile_cache_misses)",
-      "target": "decrease"
-    },
-    {
       "query": "sum(reth_database_transaction_opened_total{mode=\"read-write\"})",
       "target": "decrease"
     },
     {
       "query": "sum(reth_database_transaction_opened_total{mode=\"read-only\"})",
-      "target": "decrease"
-    },
-    {
-      "query": "reth_executor_spawn_regular_blocking_tasks_total",
-      "target": "decrease"
-    },
-    {
-      "query": "reth_executor_spawn_regular_tasks_total",
-      "target": "decrease"
-    },
-    {
-      "query": "reth_executor_spawn_critical_tasks_total",
       "target": "decrease"
     }
   ]
