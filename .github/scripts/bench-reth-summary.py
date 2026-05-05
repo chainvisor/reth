@@ -597,13 +597,6 @@ def counter_target_metric_stat_value(values: list[float], stat_name: str) -> flo
     raise ValueError(f"Unsupported target metric statistic: {stat_name}")
 
 
-def weighted_average(values: list[float], weights: list[float]) -> float:
-    total_weight = sum(weights)
-    if total_weight <= EPSILON:
-        raise ValueError("Weighted target metric series had no positive block-height deltas")
-    return sum(value * weight for value, weight in zip(values, weights)) / total_weight
-
-
 def query_counter_target_metric_run(
     relevant_scrapes: list[dict],
     counter: dict,
@@ -668,43 +661,33 @@ def query_histogram_target_metric_run(
     quantiles = {}
     for stat_name, quantile in TARGET_METRIC_HISTOGRAM_PERCENTILES:
         query = histogram_quantile_query(histogram["query"], quantile)
-        interval_values = []
-        interval_weights = []
-        block_height_delta = 0.0
-        weighted_value_sum = 0.0
-        for previous_scrape, current_scrape in zip(relevant_scrapes, relevant_scrapes[1:]):
-            current_value = evaluate_query(current_scrape["samples"], query, allow_missing=True)
-            previous_value = evaluate_query(previous_scrape["samples"], query, allow_missing=True)
-            current_block_height = float(current_scrape["block_height"])
-            previous_block_height = float(previous_scrape["block_height"])
-            interval_block_height_delta = current_block_height - previous_block_height
-            if interval_block_height_delta <= EPSILON:
+        sample_values = []
+        for scrape in relevant_scrapes:
+            _, matched_samples = query_samples(scrape["samples"], query)
+            if not matched_samples:
                 continue
+            if len(matched_samples) > 1:
+                raise ValueError(
+                    f"Query matched {len(matched_samples)} samples; use label filters: {query}"
+                )
+            sample_values.append(float(matched_samples[0]["value"]))
 
-            interval_value = (previous_value + current_value) / 2.0
-            interval_values.append(interval_value)
-            interval_weights.append(interval_block_height_delta)
-            block_height_delta += interval_block_height_delta
-            weighted_value_sum += interval_value * interval_block_height_delta
-
-        if block_height_delta <= EPSILON:
+        if not sample_values:
             raise ValueError(
-                f"Histogram target metric '{query}' in run '{run_label}' had no usable block-height scrape intervals"
+                f"Histogram target metric '{query}' in run '{run_label}' had no sampled percentile values inside the benchmark window"
             )
 
         quantiles[stat_name] = {
             "query": query,
-            "value": weighted_value_sum / block_height_delta,
-            "block_height_delta": block_height_delta,
-            "intervals": len(interval_values),
+            "value": sum(sample_values) / len(sample_values),
+            "samples": len(sample_values),
             "scrapes": len(relevant_scrapes),
             "duration_ms": int(metadata["duration_ms"]),
             "range_start_ms": int(metadata["range_start_ms"]),
             "range_end_ms": int(metadata["range_end_ms"]),
             "benchmark_id": metadata["benchmark_id"],
             "benchmark_run": metadata["benchmark_run"],
-            "_values": interval_values,
-            "_weights": interval_weights,
+            "_values": sample_values,
         }
 
     return {
@@ -816,21 +799,11 @@ def compute_histogram_target_metric_change(
     for _ in range(BOOTSTRAP_ITERATIONS):
         pair_diffs = []
         for baseline_run, feature_run in zip(baseline_runs, feature_runs):
-            baseline_sample = rng.choices(
-                list(zip(baseline_run["_values"], baseline_run["_weights"])),
-                k=len(baseline_run["_values"]),
-            )
-            feature_sample = rng.choices(
-                list(zip(feature_run["_values"], feature_run["_weights"])),
-                k=len(feature_run["_values"]),
-            )
-            baseline_values = [value for value, _ in baseline_sample]
-            baseline_weights = [weight for _, weight in baseline_sample]
-            feature_values = [value for value, _ in feature_sample]
-            feature_weights = [weight for _, weight in feature_sample]
+            baseline_sample = rng.choices(baseline_run["_values"], k=len(baseline_run["_values"]))
+            feature_sample = rng.choices(feature_run["_values"], k=len(feature_run["_values"]))
             pair_diffs.append(
-                weighted_average(feature_values, feature_weights)
-                - weighted_average(baseline_values, baseline_weights)
+                (sum(feature_sample) / len(feature_sample))
+                - (sum(baseline_sample) / len(baseline_sample))
             )
         boot_diffs.append(sum(pair_diffs) / len(pair_diffs))
 
@@ -848,9 +821,9 @@ def compute_histogram_target_metric_change(
         "ci": round(ci, 6),
         "ci_pct": round(ci_pct, 4),
         "sig": significance(pct, ci_pct, lower_is_better=target == "decrease"),
-        "method": "abba-paired-weighted-interval-bootstrap"
+        "method": "abba-paired-scrape-bootstrap"
         if len(baseline_runs) > 1
-        else "single-run-weighted-interval-bootstrap",
+        else "single-run-scrape-bootstrap",
     }
 
 
@@ -1048,7 +1021,7 @@ def compute_target_metric_summary(
             "block_height_query": TARGET_METRIC_BLOCK_HEIGHT_QUERY,
             "scrape_file": "target-metrics-scrapes.jsonl",
             "counters": "counter delta / canonical chain-height delta between adjacent scrapes",
-            "histograms": "trapezoid average of recorded quantile series weighted by canonical chain-height delta between adjacent scrapes",
+            "histograms": "plain mean of recorded quantile samples inside each benchmark window",
         },
         "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,
@@ -1190,7 +1163,7 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
         )
     if any(metric["kind"] == "histogram" for metric in changed):
         lines.append(
-            "*Histogram values are trapezoid-integrated recorded quantile series, weighted by canonical chain-height delta between adjacent scrapes and divided by total benchmark-window blocks.*"
+            "*Histogram rows report the plain mean of the recorded percentile samples inside each benchmark window. Significant changes use a paired bootstrap over those percentile scrape samples.*"
         )
     if target_metrics.get("abba"):
         lines.extend(
