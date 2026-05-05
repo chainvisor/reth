@@ -77,9 +77,17 @@ def configure_ci_process_lifecycle():
 def read_labels(path):
     try:
         with open(path) as f:
-            return json.load(f)
+            labels = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+    if not isinstance(labels, dict):
+        return {}
+
+    return {
+        key: os.path.expandvars(value) if isinstance(value, str) else value
+        for key, value in labels.items()
+    }
 
 
 def read_target_metrics_config(path):
