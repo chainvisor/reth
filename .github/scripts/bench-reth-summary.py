@@ -433,7 +433,12 @@ def fmt_s(v: float) -> str:
 
 
 def fmt_metric_value(v: float) -> str:
-    if abs(v - round(v)) <= 0.00005:
+    abs_v = abs(v)
+    if abs_v == 0:
+        return "0"
+    if abs_v < 0.001:
+        return f"{v:.4g}"
+    if abs_v >= 1 and abs(v - round(v)) <= 0.00005:
         return f"{round(v):.0f}"
     return f"{v:.4f}".rstrip("0").rstrip(".")
 
