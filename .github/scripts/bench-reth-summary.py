@@ -32,6 +32,7 @@ EPSILON = 1e-9
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 TARGET_METRIC_COUNTER_STATS = ("p50", "p90")
 TARGET_METRIC_HISTOGRAM_PERCENTILES = (("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99"))
+TARGET_METRIC_IGNORED_CARDINALITY_LABELS = frozenset(("quantile", "run_type"))
 SELECTOR_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
 )
@@ -504,8 +505,69 @@ def target_metric_name(query: str) -> str:
     return query
 
 
+def target_metric_identity_key(labels: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(labels.items()))
+
+
+def target_metric_identity_labels(query: str, sample_labels: dict[str, str]) -> dict[str, str]:
+    _, _, label_filters = parse_target_metric_query(query)
+    return {
+        key: value
+        for key, value in sorted(sample_labels.items())
+        if key not in label_filters and key not in TARGET_METRIC_IGNORED_CARDINALITY_LABELS
+    }
+
+
+def target_metric_display_query(query: str, identity_labels: dict[str, str] | None = None) -> str:
+    _, metric_name, label_filters = parse_target_metric_query(query)
+    display_labels = dict(label_filters)
+    if identity_labels:
+        display_labels.update(identity_labels)
+    return re.sub(r"\s+", "", format_target_metric_query(metric_name, display_labels))
+
+
 def target_metric_label(query: str) -> str:
-    return re.sub(r"\s+", "", target_metric_name(query))
+    return target_metric_display_query(query)
+
+
+def group_query_samples_by_identity(samples: list[dict], query: str) -> tuple[str, dict]:
+    aggregate, matched_samples = query_samples(samples, query)
+    groups = {}
+    if aggregate == "sum":
+        if matched_samples:
+            groups[()] = {"identity_labels": {}, "samples": matched_samples}
+        return aggregate, groups
+
+    for sample in matched_samples:
+        identity_labels = target_metric_identity_labels(query, sample["labels"])
+        key = target_metric_identity_key(identity_labels)
+        group = groups.setdefault(key, {"identity_labels": identity_labels, "samples": []})
+        group["samples"].append(sample)
+    return aggregate, groups
+
+
+def grouped_sample_value(group: dict | None, aggregate: str, allow_missing: bool = False) -> float:
+    if not group or not group["samples"]:
+        if allow_missing:
+            return 0.0
+        raise ValueError("Target metric sample group was empty")
+
+    values = [float(sample["value"]) for sample in group["samples"]]
+    if aggregate == "sum":
+        return sum(values)
+    return sum(values) / len(values)
+
+
+def collect_metric_identities(grouped_scrapes: list[dict]) -> dict[tuple[tuple[str, str], ...], dict[str, str]]:
+    identities = {}
+    for grouped in grouped_scrapes:
+        for key, group in grouped.items():
+            identities.setdefault(key, group["identity_labels"])
+    return identities
+
+
+def format_target_metric_identity(query: str, identity_labels: dict[str, str]) -> str:
+    return target_metric_display_query(query, identity_labels)
 
 
 def load_target_metric_range(path: str) -> dict:
@@ -602,54 +664,75 @@ def query_counter_target_metric_run(
     counter: dict,
     run_label: str,
     metadata: dict,
-) -> dict:
+) -> dict[tuple[tuple[str, str], ...], dict]:
     query = counter["query"]
-    interval_values = []
-    counter_increase = 0.0
-    block_height_delta = 0.0
-    for previous_scrape, current_scrape in zip(relevant_scrapes, relevant_scrapes[1:]):
-        current_counter_value = evaluate_query(current_scrape["samples"], query, allow_missing=True)
-        previous_counter_value = evaluate_query(previous_scrape["samples"], query, allow_missing=True)
-        current_block_height = float(current_scrape["block_height"])
-        previous_block_height = float(previous_scrape["block_height"])
-        interval_block_height_delta = current_block_height - previous_block_height
-        if interval_block_height_delta <= EPSILON:
-            continue
+    aggregate, _metric_name, _label_filters = parse_target_metric_query(query)
+    grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], query)[1] for scrape in relevant_scrapes]
+    identities = collect_metric_identities(grouped_scrapes)
+    if not identities:
+        raise ValueError(f"Target metric '{query}' in run '{run_label}' had no sampled values")
 
-        interval_counter_delta = current_counter_value - previous_counter_value
-        if interval_counter_delta < -EPSILON:
+    results = {}
+    for identity_key, identity_labels in sorted(identities.items()):
+        interval_values = []
+        counter_increase = 0.0
+        block_height_delta = 0.0
+        display_query = format_target_metric_identity(query, identity_labels)
+        for previous_scrape, current_scrape, previous_groups, current_groups in zip(
+            relevant_scrapes,
+            relevant_scrapes[1:],
+            grouped_scrapes,
+            grouped_scrapes[1:],
+        ):
+            current_counter_value = grouped_sample_value(
+                current_groups.get(identity_key), aggregate, allow_missing=True
+            )
+            previous_counter_value = grouped_sample_value(
+                previous_groups.get(identity_key), aggregate, allow_missing=True
+            )
+            current_block_height = float(current_scrape["block_height"])
+            previous_block_height = float(previous_scrape["block_height"])
+            interval_block_height_delta = current_block_height - previous_block_height
+            if interval_block_height_delta <= EPSILON:
+                continue
+
+            interval_counter_delta = current_counter_value - previous_counter_value
+            if interval_counter_delta < -EPSILON:
+                raise ValueError(
+                    f"Target metric '{display_query}' decreased within run '{run_label}', which is not valid for counters"
+                )
+
+            counter_increase += interval_counter_delta
+            block_height_delta += interval_block_height_delta
+            interval_values.append(interval_counter_delta / interval_block_height_delta)
+
+        if not interval_values:
             raise ValueError(
-                f"Target metric '{query}' decreased within run '{run_label}', which is not valid for counters"
+                f"Target metric '{display_query}' in run '{run_label}' had no positive block-height scrape intervals"
             )
 
-        counter_increase += interval_counter_delta
-        block_height_delta += interval_block_height_delta
-        interval_values.append(interval_counter_delta / interval_block_height_delta)
-
-    if not interval_values:
-        raise ValueError(
-            f"Target metric '{query}' in run '{run_label}' had no positive block-height scrape intervals"
-        )
-
-    stats = compute_target_metric_series_stats(interval_values)
-    return {
-        "query": query,
-        "target": counter["target"],
-        "counter_increase": counter_increase,
-        "block_height_delta": block_height_delta,
-        "mean": stats["mean"],
-        "p50": stats["p50"],
-        "p90": stats["p90"],
-        "p99": stats["p99"],
-        "intervals": len(interval_values),
-        "scrapes": len(relevant_scrapes),
-        "duration_ms": int(metadata["duration_ms"]),
-        "range_start_ms": int(metadata["range_start_ms"]),
-        "range_end_ms": int(metadata["range_end_ms"]),
-        "benchmark_id": metadata["benchmark_id"],
-        "benchmark_run": metadata["benchmark_run"],
-        "_values": interval_values,
-    }
+        stats = compute_target_metric_series_stats(interval_values)
+        results[identity_key] = {
+            "query": query,
+            "display_query": display_query,
+            "identity_labels": identity_labels,
+            "target": counter["target"],
+            "counter_increase": counter_increase,
+            "block_height_delta": block_height_delta,
+            "mean": stats["mean"],
+            "p50": stats["p50"],
+            "p90": stats["p90"],
+            "p99": stats["p99"],
+            "intervals": len(interval_values),
+            "scrapes": len(relevant_scrapes),
+            "duration_ms": int(metadata["duration_ms"]),
+            "range_start_ms": int(metadata["range_start_ms"]),
+            "range_end_ms": int(metadata["range_end_ms"]),
+            "benchmark_id": metadata["benchmark_id"],
+            "benchmark_run": metadata["benchmark_run"],
+            "_values": interval_values,
+        }
+    return results
 
 
 def query_histogram_target_metric_run(
@@ -657,42 +740,64 @@ def query_histogram_target_metric_run(
     histogram: dict,
     run_label: str,
     metadata: dict,
-) -> dict:
-    quantiles = {}
+) -> dict[tuple[tuple[str, str], ...], dict]:
+    metrics_by_identity = {}
     for stat_name, quantile in TARGET_METRIC_HISTOGRAM_PERCENTILES:
         query = histogram_quantile_query(histogram["query"], quantile)
-        sample_values = []
-        for scrape in relevant_scrapes:
-            _, matched_samples = query_samples(scrape["samples"], query)
-            if not matched_samples:
-                continue
-            sample_values.append(
-                sum(float(sample["value"]) for sample in matched_samples) / len(matched_samples)
-            )
-
-        if not sample_values:
+        grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], query)[1] for scrape in relevant_scrapes]
+        identities = collect_metric_identities(grouped_scrapes)
+        if not identities:
             raise ValueError(
                 f"Histogram target metric '{query}' in run '{run_label}' had no sampled percentile values inside the benchmark window"
             )
 
-        quantiles[stat_name] = {
-            "query": query,
-            "value": sum(sample_values) / len(sample_values),
-            "samples": len(sample_values),
-            "scrapes": len(relevant_scrapes),
-            "duration_ms": int(metadata["duration_ms"]),
-            "range_start_ms": int(metadata["range_start_ms"]),
-            "range_end_ms": int(metadata["range_end_ms"]),
-            "benchmark_id": metadata["benchmark_id"],
-            "benchmark_run": metadata["benchmark_run"],
-            "_values": sample_values,
-        }
+        for identity_key, identity_labels in sorted(identities.items()):
+            sample_values = []
+            for grouped in grouped_scrapes:
+                group = grouped.get(identity_key)
+                if not group:
+                    continue
+                sample_values.append(grouped_sample_value(group, "single"))
 
-    return {
-        "query": histogram["query"],
-        "target": histogram["target"],
-        "quantiles": quantiles,
-    }
+            display_query = format_target_metric_identity(histogram["query"], identity_labels)
+            if not sample_values:
+                raise ValueError(
+                    f"Histogram target metric '{display_query}' in run '{run_label}' had no sampled percentile values inside the benchmark window"
+                )
+
+            metric = metrics_by_identity.setdefault(
+                identity_key,
+                {
+                    "query": histogram["query"],
+                    "display_query": display_query,
+                    "identity_labels": identity_labels,
+                    "target": histogram["target"],
+                    "quantiles": {},
+                },
+            )
+            metric["quantiles"][stat_name] = {
+                "query": query,
+                "value": sum(sample_values) / len(sample_values),
+                "samples": len(sample_values),
+                "scrapes": len(relevant_scrapes),
+                "duration_ms": int(metadata["duration_ms"]),
+                "range_start_ms": int(metadata["range_start_ms"]),
+                "range_end_ms": int(metadata["range_end_ms"]),
+                "benchmark_id": metadata["benchmark_id"],
+                "benchmark_run": metadata["benchmark_run"],
+                "_values": sample_values,
+            }
+
+    expected_stats = {stat_name for stat_name, _ in TARGET_METRIC_HISTOGRAM_PERCENTILES}
+    for metric in metrics_by_identity.values():
+        missing_stats = expected_stats - set(metric["quantiles"])
+        if missing_stats:
+            missing = ", ".join(sorted(missing_stats))
+            raise ValueError(
+                f"Histogram target metric '{metric['display_query']}' in run '{run_label}' was missing percentile samples for {missing}"
+            )
+
+    return metrics_by_identity
 
 
 def query_target_metric_run(path: str, config: dict) -> tuple[str, dict[str, dict[str, dict]]]:
@@ -840,6 +945,18 @@ def summarize_target_metric_change(changes: dict[str, dict], display_stats: tupl
     }
 
 
+def collect_query_metric_identities(
+    runs: list[tuple[str, dict[str, dict[str, dict]]]], kind: str, query: str
+) -> dict[tuple[tuple[str, str], ...], dict[str, str]]:
+    identities = {}
+    for run_label, run_data in runs:
+        if query not in run_data[kind]:
+            raise ValueError(f"Missing target metric '{query}' in run '{run_label}'")
+        for identity_key, metric in run_data[kind][query].items():
+            identities.setdefault(identity_key, metric["identity_labels"])
+    return identities
+
+
 def compute_target_metric_summary(
     config_path: str,
     baseline_csv_paths: list[str],
@@ -855,161 +972,184 @@ def compute_target_metric_summary(
     for counter in config.get("counters", []):
         query = counter["query"]
         target = counter["target"]
+        identities = collect_query_metric_identities(
+            baseline_runs + feature_runs, "counters", query
+        )
 
-        baseline_values = []
-        feature_values = []
-        baseline_runs_for_stats = []
-        feature_runs_for_stats = []
-        for run_label, run_data in baseline_runs:
-            if query not in run_data["counters"]:
-                raise ValueError(f"Missing target metric '{query}' in baseline run '{run_label}'")
-            run_metric = run_data["counters"][query]
-            baseline_runs_for_stats.append(run_metric)
-            baseline_values.append(
-                {
-                    "run": run_label,
-                    "mean": float(run_metric["mean"]),
-                    "p50": float(run_metric["p50"]),
-                    "p90": float(run_metric["p90"]),
-                    "p99": float(run_metric["p99"]),
-                    "counter_increase": float(run_metric["counter_increase"]),
-                    "block_height_delta": float(run_metric["block_height_delta"]),
-                    "intervals": int(run_metric["intervals"]),
-                    "scrapes": int(run_metric["scrapes"]),
-                    "duration_ms": int(run_metric["duration_ms"]),
-                }
-            )
-        for run_label, run_data in feature_runs:
-            if query not in run_data["counters"]:
-                raise ValueError(f"Missing target metric '{query}' in feature run '{run_label}'")
-            run_metric = run_data["counters"][query]
-            feature_runs_for_stats.append(run_metric)
-            feature_values.append(
-                {
-                    "run": run_label,
-                    "mean": float(run_metric["mean"]),
-                    "p50": float(run_metric["p50"]),
-                    "p90": float(run_metric["p90"]),
-                    "p99": float(run_metric["p99"]),
-                    "counter_increase": float(run_metric["counter_increase"]),
-                    "block_height_delta": float(run_metric["block_height_delta"]),
-                    "intervals": int(run_metric["intervals"]),
-                    "scrapes": int(run_metric["scrapes"]),
-                    "duration_ms": int(run_metric["duration_ms"]),
-                }
-            )
+        for identity_key, identity_labels in sorted(identities.items()):
+            baseline_values = []
+            feature_values = []
+            baseline_runs_for_stats = []
+            feature_runs_for_stats = []
+            display_query = format_target_metric_identity(query, identity_labels)
 
-        changes = {
-            stat_name: compute_counter_target_metric_change(
-                baseline_runs_for_stats,
-                feature_runs_for_stats,
-                query,
-                target,
-                stat_name,
-            )
-            for stat_name in TARGET_METRIC_COUNTER_STATS
-        }
-        change = summarize_target_metric_change(changes, TARGET_METRIC_COUNTER_STATS)
+            for run_label, run_data in baseline_runs:
+                if identity_key not in run_data["counters"][query]:
+                    raise ValueError(
+                        f"Missing target metric '{display_query}' in baseline run '{run_label}'"
+                    )
+                run_metric = run_data["counters"][query][identity_key]
+                baseline_runs_for_stats.append(run_metric)
+                baseline_values.append(
+                    {
+                        "run": run_label,
+                        "mean": float(run_metric["mean"]),
+                        "p50": float(run_metric["p50"]),
+                        "p90": float(run_metric["p90"]),
+                        "p99": float(run_metric["p99"]),
+                        "counter_increase": float(run_metric["counter_increase"]),
+                        "block_height_delta": float(run_metric["block_height_delta"]),
+                        "intervals": int(run_metric["intervals"]),
+                        "scrapes": int(run_metric["scrapes"]),
+                        "duration_ms": int(run_metric["duration_ms"]),
+                    }
+                )
+            for run_label, run_data in feature_runs:
+                if identity_key not in run_data["counters"][query]:
+                    raise ValueError(
+                        f"Missing target metric '{display_query}' in feature run '{run_label}'"
+                    )
+                run_metric = run_data["counters"][query][identity_key]
+                feature_runs_for_stats.append(run_metric)
+                feature_values.append(
+                    {
+                        "run": run_label,
+                        "mean": float(run_metric["mean"]),
+                        "p50": float(run_metric["p50"]),
+                        "p90": float(run_metric["p90"]),
+                        "p99": float(run_metric["p99"]),
+                        "counter_increase": float(run_metric["counter_increase"]),
+                        "block_height_delta": float(run_metric["block_height_delta"]),
+                        "intervals": int(run_metric["intervals"]),
+                        "scrapes": int(run_metric["scrapes"]),
+                        "duration_ms": int(run_metric["duration_ms"]),
+                    }
+                )
 
-        entry = {
-            "kind": "counter",
-            "name": target_metric_label(query),
-            "query": query,
-            "target": target,
-            "display_stats": list(TARGET_METRIC_COUNTER_STATS),
-            "baseline": summarize_target_metric_runs(
-                baseline_values, ("mean", "p50", "p90", "p99")
-            ),
-            "feature": summarize_target_metric_runs(
-                feature_values, ("mean", "p50", "p90", "p99")
-            ),
-            "changes": changes,
-            "change": change,
-        }
-        if len(baseline_values) > 1 and len(feature_values) > 1:
-            entry["pairs"] = [
-                {
-                    "baseline_run": baseline_item["run"],
-                    "feature_run": feature_item["run"],
-                    "baseline_mean": baseline_item["mean"],
-                    "feature_mean": feature_item["mean"],
-                    "mean_diff": feature_item["mean"] - baseline_item["mean"],
-                    "p50_diff": feature_item["p50"] - baseline_item["p50"],
-                    "p90_diff": feature_item["p90"] - baseline_item["p90"],
-                    "p99_diff": feature_item["p99"] - baseline_item["p99"],
-                }
-                for baseline_item, feature_item in zip(baseline_values, feature_values)
-            ]
-        metrics.append(entry)
+            changes = {
+                stat_name: compute_counter_target_metric_change(
+                    baseline_runs_for_stats,
+                    feature_runs_for_stats,
+                    display_query,
+                    target,
+                    stat_name,
+                )
+                for stat_name in TARGET_METRIC_COUNTER_STATS
+            }
+            change = summarize_target_metric_change(changes, TARGET_METRIC_COUNTER_STATS)
+
+            entry = {
+                "kind": "counter",
+                "name": target_metric_label(display_query),
+                "query": display_query,
+                "configured_query": query,
+                "identity_labels": identity_labels,
+                "target": target,
+                "display_stats": list(TARGET_METRIC_COUNTER_STATS),
+                "baseline": summarize_target_metric_runs(
+                    baseline_values, ("mean", "p50", "p90", "p99")
+                ),
+                "feature": summarize_target_metric_runs(
+                    feature_values, ("mean", "p50", "p90", "p99")
+                ),
+                "changes": changes,
+                "change": change,
+            }
+            if len(baseline_values) > 1 and len(feature_values) > 1:
+                entry["pairs"] = [
+                    {
+                        "baseline_run": baseline_item["run"],
+                        "feature_run": feature_item["run"],
+                        "baseline_mean": baseline_item["mean"],
+                        "feature_mean": feature_item["mean"],
+                        "mean_diff": feature_item["mean"] - baseline_item["mean"],
+                        "p50_diff": feature_item["p50"] - baseline_item["p50"],
+                        "p90_diff": feature_item["p90"] - baseline_item["p90"],
+                        "p99_diff": feature_item["p99"] - baseline_item["p99"],
+                    }
+                    for baseline_item, feature_item in zip(baseline_values, feature_values)
+                ]
+            metrics.append(entry)
 
     histogram_stats = tuple(stat_name for stat_name, _ in TARGET_METRIC_HISTOGRAM_PERCENTILES)
     for histogram in config.get("histograms", []):
         query = histogram["query"]
         target = histogram["target"]
+        identities = collect_query_metric_identities(
+            baseline_runs + feature_runs, "histograms", query
+        )
 
-        baseline_values = []
-        feature_values = []
-        baseline_runs_for_stats = {stat_name: [] for stat_name in histogram_stats}
-        feature_runs_for_stats = {stat_name: [] for stat_name in histogram_stats}
+        for identity_key, identity_labels in sorted(identities.items()):
+            baseline_values = []
+            feature_values = []
+            baseline_runs_for_stats = {stat_name: [] for stat_name in histogram_stats}
+            feature_runs_for_stats = {stat_name: [] for stat_name in histogram_stats}
+            display_query = format_target_metric_identity(query, identity_labels)
 
-        for run_label, run_data in baseline_runs:
-            if query not in run_data["histograms"]:
-                raise ValueError(f"Missing target metric '{query}' in baseline run '{run_label}'")
-            run_metric = run_data["histograms"][query]
-            run_values = {"run": run_label}
-            for stat_name in histogram_stats:
-                run_quantile = run_metric["quantiles"][stat_name]
-                baseline_runs_for_stats[stat_name].append(run_quantile)
-                run_values[stat_name] = float(run_quantile["value"])
-            baseline_values.append(run_values)
+            for run_label, run_data in baseline_runs:
+                if identity_key not in run_data["histograms"][query]:
+                    raise ValueError(
+                        f"Missing target metric '{display_query}' in baseline run '{run_label}'"
+                    )
+                run_metric = run_data["histograms"][query][identity_key]
+                run_values = {"run": run_label}
+                for stat_name in histogram_stats:
+                    run_quantile = run_metric["quantiles"][stat_name]
+                    baseline_runs_for_stats[stat_name].append(run_quantile)
+                    run_values[stat_name] = float(run_quantile["value"])
+                baseline_values.append(run_values)
 
-        for run_label, run_data in feature_runs:
-            if query not in run_data["histograms"]:
-                raise ValueError(f"Missing target metric '{query}' in feature run '{run_label}'")
-            run_metric = run_data["histograms"][query]
-            run_values = {"run": run_label}
-            for stat_name in histogram_stats:
-                run_quantile = run_metric["quantiles"][stat_name]
-                feature_runs_for_stats[stat_name].append(run_quantile)
-                run_values[stat_name] = float(run_quantile["value"])
-            feature_values.append(run_values)
+            for run_label, run_data in feature_runs:
+                if identity_key not in run_data["histograms"][query]:
+                    raise ValueError(
+                        f"Missing target metric '{display_query}' in feature run '{run_label}'"
+                    )
+                run_metric = run_data["histograms"][query][identity_key]
+                run_values = {"run": run_label}
+                for stat_name in histogram_stats:
+                    run_quantile = run_metric["quantiles"][stat_name]
+                    feature_runs_for_stats[stat_name].append(run_quantile)
+                    run_values[stat_name] = float(run_quantile["value"])
+                feature_values.append(run_values)
 
-        changes = {
-            stat_name: compute_histogram_target_metric_change(
-                baseline_runs_for_stats[stat_name],
-                feature_runs_for_stats[stat_name],
-                query,
-                target,
-                stat_name,
-            )
-            for stat_name in histogram_stats
-        }
-        change = summarize_target_metric_change(changes, histogram_stats)
+            changes = {
+                stat_name: compute_histogram_target_metric_change(
+                    baseline_runs_for_stats[stat_name],
+                    feature_runs_for_stats[stat_name],
+                    display_query,
+                    target,
+                    stat_name,
+                )
+                for stat_name in histogram_stats
+            }
+            change = summarize_target_metric_change(changes, histogram_stats)
 
-        entry = {
-            "kind": "histogram",
-            "name": target_metric_label(query),
-            "query": query,
-            "target": target,
-            "display_stats": list(histogram_stats),
-            "baseline": summarize_target_metric_runs(baseline_values, histogram_stats),
-            "feature": summarize_target_metric_runs(feature_values, histogram_stats),
-            "changes": changes,
-            "change": change,
-        }
-        if len(baseline_values) > 1 and len(feature_values) > 1:
-            entry["pairs"] = [
-                {
-                    "baseline_run": baseline_item["run"],
-                    "feature_run": feature_item["run"],
-                    **{
-                        f"{stat_name}_diff": feature_item[stat_name] - baseline_item[stat_name]
-                        for stat_name in histogram_stats
-                    },
-                }
-                for baseline_item, feature_item in zip(baseline_values, feature_values)
-            ]
-        metrics.append(entry)
+            entry = {
+                "kind": "histogram",
+                "name": target_metric_label(display_query),
+                "query": display_query,
+                "configured_query": query,
+                "identity_labels": identity_labels,
+                "target": target,
+                "display_stats": list(histogram_stats),
+                "baseline": summarize_target_metric_runs(baseline_values, histogram_stats),
+                "feature": summarize_target_metric_runs(feature_values, histogram_stats),
+                "changes": changes,
+                "change": change,
+            }
+            if len(baseline_values) > 1 and len(feature_values) > 1:
+                entry["pairs"] = [
+                    {
+                        "baseline_run": baseline_item["run"],
+                        "feature_run": feature_item["run"],
+                        **{
+                            f"{stat_name}_diff": feature_item[stat_name] - baseline_item[stat_name]
+                            for stat_name in histogram_stats
+                        },
+                    }
+                    for baseline_item, feature_item in zip(baseline_values, feature_values)
+                ]
+            metrics.append(entry)
 
     changed = [metric for metric in metrics if metric["change"]["significant_percentiles"]]
     return {
@@ -1020,6 +1160,7 @@ def compute_target_metric_summary(
             "scrape_file": "target-metrics-scrapes.jsonl",
             "counters": "counter delta / canonical chain-height delta between adjacent scrapes",
             "histograms": "plain mean of recorded quantile samples inside each benchmark window",
+            "cardinality": "unhandled label sets become separate target metrics after stripping query filters and known labels such as quantile/run_type",
         },
         "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,
@@ -1162,6 +1303,10 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     if any(metric["kind"] == "histogram" for metric in changed):
         lines.append(
             "*Histogram rows report the plain mean of the recorded percentile samples inside each benchmark window. Significant changes use a paired bootstrap over those percentile scrape samples.*"
+        )
+    if any(metric.get("identity_labels") for metric in changed):
+        lines.append(
+            "*When a configured target metric matches multiple unhandled label sets, the summary expands them into separate rows keyed by the remaining metric labels after stripping handled labels such as `quantile` and `run_type`.*"
         )
     if target_metrics.get("abba"):
         lines.extend(

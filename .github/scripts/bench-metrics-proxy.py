@@ -245,16 +245,10 @@ def scrape_target_metrics(metrics_text, config):
 
     for query in queries:
         aggregate, matches = query_samples(samples, query)
-        _, _, label_filters = parse_target_metric_query(query)
-        is_histogram_quantile_query = "quantile" in label_filters
         if query == TARGET_METRIC_BLOCK_HEIGHT_QUERY and not matches:
             raise ValueError(f"Query matched no samples: {query}")
         if not matches:
             continue
-        if aggregate != "sum" and len(matches) > 1 and not is_histogram_quantile_query:
-            raise ValueError(
-                f"Query matched {len(matches)} samples; use sum(...) or label filters: {query}"
-            )
         for sample in matches:
             key = target_metric_sample_key(sample)
             if key in seen:
