@@ -1229,12 +1229,12 @@ def compute_target_metric_summary(
                 run_metric = run_data["histograms"][query][identity_key]
                 feature_run_metrics.append((run_label, run_metric))
 
-            display_stats = histogram_stats
-            if all(
+            if not all(
                 "mean" in run_metric
                 for _run_label, run_metric in baseline_run_metrics + feature_run_metrics
             ):
-                display_stats = ("mean", *histogram_stats)
+                continue
+            display_stats = ("mean",)
 
             baseline_runs_for_stats = {stat_name: [] for stat_name in display_stats}
             feature_runs_for_stats = {stat_name: [] for stat_name in display_stats}
@@ -1302,7 +1302,7 @@ def compute_target_metric_summary(
             "block_height_query": TARGET_METRIC_BLOCK_HEIGHT_QUERY,
             "scrape_file": "target-metrics-scrapes.jsonl",
             "counters": "counter delta / canonical chain-height delta between adjacent scrapes, paired by canonical block height",
-            "histograms": "sum/count deltas for mean and recorded quantile samples for p50/p90/p99, paired by canonical block height",
+            "histograms": "sum/count deltas for mean, paired by canonical block height",
             "cardinality": "unhandled label sets become separate target metrics after stripping query filters and known labels such as quantile/run_type",
             "significance": "paired bootstrap over block-height-matched target metric observations; ABBA runs are pooled as additional paired observations",
             "min_paired_observations": TARGET_METRIC_MIN_PAIRED_OBSERVATIONS,
@@ -1447,7 +1447,7 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
         )
     if any(metric["kind"] == "histogram" for metric in changed):
         lines.append(
-            "*Histogram mean rows use `_sum`/`_count` deltas; percentile rows use recorded percentile samples. Significant changes pair observations by canonical block height and use a paired bootstrap.*"
+            "*Histogram rows use `_sum`/`_count` mean deltas. Significant changes pair observations by canonical block height and use a paired bootstrap.*"
         )
     if any(metric.get("identity_labels") for metric in changed):
         lines.append(
