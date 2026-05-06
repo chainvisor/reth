@@ -14,7 +14,7 @@
 //   await jobSummary({ core, context, chartSha, grafanaUrl, runId });
 
 const fs = require('fs');
-const { verdict, loadSamplyUrls, blocksLabel, metricRows, waitTimeRows, targetMetricRows } = require('./bench-utils');
+const { verdict, loadSamplyUrls, blocksLabel, metricRows, waitTimeRows } = require('./bench-utils');
 
 module.exports = async function ({ core, context, chartSha, grafanaUrl, runId }) {
   let summary;
@@ -30,7 +30,7 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
   const actor = process.env.BENCH_ACTOR;
   const commitUrl = `https://github.com/${repo}/commit`;
 
-  const { emoji, label } = verdict(summary);
+  const { emoji, label } = verdict(summary.changes);
   const baselineLink = `[\`${summary.baseline.name}\`](${commitUrl}/${summary.baseline.ref})`;
   const featureLink = `[\`${summary.feature.name}\`](${commitUrl}/${summary.feature.ref})`;
   const diffUrl = `https://github.com/${repo}/compare/${summary.baseline.ref}...${summary.feature.ref}`;
@@ -65,23 +65,6 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
       md += `| ${r.title} | ${r.baseline} | ${r.feature} |\n`;
     }
     md += '\n';
-  }
-
-  const tmRows = targetMetricRows(summary);
-  if (tmRows.length > 0) {
-    md += `### Target Metrics\n\n`;
-    md += `| Metric | Baseline | Feature | Change |\n`;
-    md += `|--------|----------|---------|--------|\n`;
-    for (const r of tmRows) {
-      md += `| \`${r.title}\` | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
-    }
-    if (tmRows.some(r => r.kind === 'counter')) {
-      md += `\n*Counter rows are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*\n`;
-    }
-    if (tmRows.some(r => r.kind === 'histogram')) {
-      md += `*Histogram rows are trapezoid-integrated recorded quantile series, weighted by canonical chain-height delta between adjacent scrapes and divided by total benchmark-window blocks.*\n`;
-    }
-    md += `\n`;
   }
 
   // Charts

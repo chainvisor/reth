@@ -5,7 +5,7 @@ use crate::{
     bench::{
         generate_big_block::{compute_payload_block_hash, BigBlockPayload},
         helpers::parse_duration,
-        metrics_scraper::MetricsScraper,
+        metrics_scraper::{MetricsScraper, METRICS_OUTPUT_SUFFIX},
         output::{
             write_benchmark_results, CombinedResult, NewPayloadResult, TotalGasOutput, TotalGasRow,
         },
@@ -120,10 +120,21 @@ pub struct Command {
     /// Optional Prometheus metrics endpoint to scrape after each block.
     ///
     /// When provided, reth-bench will fetch metrics from this URL after each
-    /// payload, recording per-block execution and state root durations.
-    /// Results are written to `metrics.csv` in the output directory.
+    /// payload. Results are written as JSONL records containing the block
+    /// number, scrape timestamp, and raw metrics.
     #[arg(long = "metrics-url", value_name = "URL", verbatim_doc_comment)]
     metrics_url: Option<String>,
+
+    /// Path to write per-block Prometheus metrics scrapes as JSONL.
+    ///
+    /// If omitted, `--metrics-url` writes `metrics.jsonl` inside `--output`.
+    #[arg(
+        long = "metrics-output",
+        value_name = "PATH",
+        requires = "metrics_url",
+        verbatim_doc_comment
+    )]
+    metrics_output: Option<PathBuf>,
 }
 
 /// A loaded payload ready for execution.
@@ -156,7 +167,11 @@ impl Command {
             }
         }
 
-        let mut metrics_scraper = MetricsScraper::maybe_new(self.metrics_url.clone());
+        let metrics_output = self
+            .metrics_output
+            .clone()
+            .or_else(|| self.output.as_ref().map(|path| path.join(METRICS_OUTPUT_SUFFIX)));
+        let metrics_scraper = MetricsScraper::maybe_new(self.metrics_url.clone(), metrics_output)?;
 
         // Set up authenticated engine provider
         let jwt =
@@ -373,10 +388,10 @@ impl Command {
             let progress = format!("{}/{}", i + 1, payloads.len());
             info!(target: "reth-bench", progress, %combined_result);
 
-            if let Some(scraper) = metrics_scraper.as_mut() &&
-                let Err(err) = scraper.scrape_after_block(block_number).await
+            if let Some(scraper) = metrics_scraper.as_ref() &&
+                let Err(err) = scraper.scrape_after_block().await
             {
-                tracing::warn!(target: "reth-bench", %err, block_number, "Failed to scrape metrics");
+                warn!(target: "reth-bench", %err, block_number, "Failed to scrape metrics");
             }
 
             if let Some(wait_time) = self.wait_time {
@@ -400,8 +415,8 @@ impl Command {
             write_benchmark_results(path, &gas_output_results, &combined_results)?;
         }
 
-        if let (Some(path), Some(scraper)) = (&self.output, &metrics_scraper) {
-            scraper.write_csv(path)?;
+        if let Some(scraper) = metrics_scraper {
+            scraper.finish().await?;
         }
 
         let gas_output =

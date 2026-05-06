@@ -16,8 +16,6 @@
 #               BENCH_OTLP_DISABLED (true to skip OTLP export even if endpoints are set)
 set -euxo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
 LABEL="$1"
 BINARY="$2"
 OUTPUT_DIR="$3"
@@ -28,7 +26,6 @@ fi
 DATADIR="$SCHELK_MOUNT/$DATADIR_NAME"
 mkdir -p "$OUTPUT_DIR"
 LOG="${OUTPUT_DIR}/node.log"
-
 TARGET_METRICS_RANGE="$OUTPUT_DIR/target-metrics-range.json"
 
 RETH_SCOPE="${RETH_SCOPE:-reth-bench.scope}"
@@ -344,8 +341,13 @@ if [ "$BIG_BLOCKS" = "true" ]; then
   fi
 
   TARGET_METRICS_START_MS=""
+  TARGET_METRICS_ARGS=()
   if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
     TARGET_METRICS_START_MS="$(capture_unix_time_ms)"
+    TARGET_METRICS_ARGS=(
+      --metrics-url "http://${BENCH_METRICS_ADDR}/"
+      --metrics-output "$OUTPUT_DIR/target-metrics-scrapes.jsonl"
+    )
   fi
 
   # Benchmark — skip warmup payloads so they aren't measured
@@ -364,6 +366,7 @@ if [ "$BIG_BLOCKS" = "true" ]; then
     --payload-dir "$BIG_BLOCKS_DIR/payloads" \
     --engine-rpc-url http://127.0.0.1:8551 \
     --jwt-secret "$DATADIR/jwt.hex" \
+    "${TARGET_METRICS_ARGS[@]}" \
     --output "$OUTPUT_DIR" 2>&1 | sed -u "s/^/[bench] /"
 
   if [ -n "$TARGET_METRICS_START_MS" ]; then
@@ -394,8 +397,13 @@ else
   fi
 
   TARGET_METRICS_START_MS=""
+  TARGET_METRICS_ARGS=()
   if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
     TARGET_METRICS_START_MS="$(capture_unix_time_ms)"
+    TARGET_METRICS_ARGS=(
+      --metrics-url "http://${BENCH_METRICS_ADDR}/"
+      --metrics-output "$OUTPUT_DIR/target-metrics-scrapes.jsonl"
+    )
   fi
 
   # Benchmark
@@ -405,6 +413,7 @@ else
     --jwt-secret "$DATADIR/jwt.hex" \
     --advance "$BENCH_BLOCKS" \
     "${EXTRA_BENCH_ARGS[@]}" \
+    "${TARGET_METRICS_ARGS[@]}" \
     --output "$OUTPUT_DIR" 2>&1 | sed -u "s/^/[bench] /"
 
   if [ -n "$TARGET_METRICS_START_MS" ]; then

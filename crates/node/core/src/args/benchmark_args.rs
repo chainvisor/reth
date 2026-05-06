@@ -72,13 +72,23 @@ pub struct BenchmarkArgs {
     /// Optional Prometheus metrics endpoint to scrape after each block.
     ///
     /// When provided, reth-bench will fetch metrics from this URL after each
-    /// `newPayload` / `forkchoiceUpdated` call, recording per-block execution
-    /// and state root durations. Results are written to `metrics.csv` in the
-    /// output directory.
+    /// `newPayload` / `forkchoiceUpdated` call. Results are written as JSONL
+    /// records containing the block number, scrape timestamp, and raw metrics.
     ///
     /// Example: `http://127.0.0.1:9001/metrics`
     #[arg(long = "metrics-url", value_name = "URL", verbatim_doc_comment)]
     pub metrics_url: Option<String>,
+
+    /// Path to write per-block Prometheus metrics scrapes as JSONL.
+    ///
+    /// If omitted, `--metrics-url` writes `metrics.jsonl` inside `--output`.
+    #[arg(
+        long = "metrics-output",
+        value_name = "PATH",
+        requires = "metrics_url",
+        verbatim_doc_comment
+    )]
+    pub metrics_output: Option<PathBuf>,
 
     /// Number of retries for fetching blocks from `--rpc-url` after a failure.
     ///

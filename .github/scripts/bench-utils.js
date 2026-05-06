@@ -10,10 +10,6 @@ const SIG_EMOJI = { good: '✅', bad: '❌', neutral: '⚪' };
 function fmtMs(v) { return v.toFixed(2) + 'ms'; }
 function fmtMgas(v) { return v.toFixed(2); }
 function fmtS(v) { return v.toFixed(2) + 's'; }
-function fmtMetricValue(v) {
-  if (Math.abs(v - Math.round(v)) <= 0.00005) return String(Math.round(v));
-  return v.toFixed(4).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
-}
 
 function fmtChange(ch) {
   if (!ch || (!ch.pct && !ch.ci_pct)) return '';
@@ -22,16 +18,8 @@ function fmtChange(ch) {
   return `${pctStr}${ciStr} ${SIG_EMOJI[ch.sig]}`;
 }
 
-function allChanges(summary) {
-  const primary = Object.values(summary.changes || {}).filter(v => v && typeof v === 'object' && typeof v.sig === 'string');
-  const target = ((summary.target_metrics && summary.target_metrics.changed) || [])
-    .map(metric => metric.change)
-    .filter(v => v && typeof v.sig === 'string');
-  return [...primary, ...target];
-}
-
-function verdict(summary) {
-  const vals = allChanges(summary);
+function verdict(changes) {
+  const vals = Object.values(changes);
   const hasBad = vals.some(v => v.sig === 'bad');
   const hasGood = vals.some(v => v.sig === 'good');
   if (hasBad && hasGood) return { emoji: '⚠️', label: 'Mixed Results' };
@@ -110,38 +98,15 @@ function waitTimeRows(summary) {
   return rows;
 }
 
-function targetMetricRows(summary) {
-  const changed = (summary.target_metrics && summary.target_metrics.changed) || [];
-  const rows = [];
-  for (const metric of changed) {
-    const displayStats = metric.display_stats || ['p50', 'p90'];
-    for (const stat of displayStats) {
-      const change = metric.changes && metric.changes[stat];
-      if (!change || change.sig === 'neutral') continue;
-      rows.push({
-        kind: metric.kind,
-        title: `${metric.name} ${stat}`,
-        baseline: fmtMetricValue(change.baseline),
-        feature: fmtMetricValue(change.feature),
-        change: fmtChange(change),
-      });
-    }
-  }
-  return rows;
-}
-
 module.exports = {
   SIG_EMOJI,
   fmtMs,
   fmtMgas,
   fmtS,
-  fmtMetricValue,
   fmtChange,
-  allChanges,
   verdict,
   loadSamplyUrls,
   blocksLabel,
   metricRows,
   waitTimeRows,
-  targetMetricRows,
 };

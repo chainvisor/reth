@@ -274,9 +274,6 @@ jobs:
       BENCH_SLACK: ${{ github.event_name == 'workflow_dispatch' && inputs.slack || 'always' }}
       BENCH_METRICS_ADDR: "127.0.0.1:9100"
       BENCH_TARGET_METRICS_CONFIG: .github/config/bench-prometheus-counters.json
-      BENCH_GRAFANA_URL: ${{ secrets.FETCH_GRAFANA_DASHBOARD_URL }}
-      BENCH_GRAFANA_TOKEN: ${{ secrets.FETCH_GRAFANA_DASHBOARD_TOKEN }}
-      BENCH_GRAFANA_DATASOURCE_UID: "ef57fux92e9z4e"
       BENCH_OTLP_DISABLED: "true"
       BASELINE_REF: ${{ needs.resolve-refs.outputs.baseline-ref }}
       FEATURE_REF: ${{ needs.resolve-refs.outputs.feature-ref }}
@@ -480,17 +477,11 @@ jobs:
           echo '{}' > "$LABELS_FILE"
           echo "BENCH_LABELS_FILE=${LABELS_FILE}" >> "$GITHUB_ENV"
 
-          METRICS_PROXY_ARGS=(
-            --labels "$LABELS_FILE"
-            --upstream "http://${BENCH_METRICS_ADDR}/"
-            --subnet 10.10.0.0/24
-            --port 9090
-          )
-          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
-            METRICS_PROXY_ARGS+=(--target-metrics-config "$BENCH_TARGET_METRICS_CONFIG")
-          fi
-
-          python3 .github/scripts/bench-metrics-proxy.py "${METRICS_PROXY_ARGS[@]}" &
+          python3 .github/scripts/bench-metrics-proxy.py \
+            --labels "$LABELS_FILE" \
+            --upstream "http://${BENCH_METRICS_ADDR}/" \
+            --subnet 10.10.0.0/24 \
+            --port 9090 &
           PROXY_PID=$!
           echo "BENCH_METRICS_PROXY_PID=${PROXY_PID}" >> "$GITHUB_ENV"
           echo "Metrics proxy started (PID $PROXY_PID)"
@@ -499,27 +490,24 @@ jobs:
       - name: "Run benchmark: baseline (1/2)"
         id: run-baseline-1
         run: |
-          LAST_RUN_START=$(date +%s)
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/baseline-1/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh baseline ../reth-baseline/target/profiling/reth "$BENCH_WORK_DIR/baseline-1"
 
       - name: "Run benchmark: feature (1/2)"
         id: run-feature-1
         run: |
-          LAST_RUN_START=$(date +%s)
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/feature-1/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh feature ../reth-feature/target/profiling/reth "$BENCH_WORK_DIR/feature-1"
 
       - name: "Run benchmark: feature (2/2)"
         id: run-feature-2
         run: |
-          LAST_RUN_START=$(date +%s)
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/feature-2/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh feature ../reth-feature/target/profiling/reth "$BENCH_WORK_DIR/feature-2"
 
@@ -529,7 +517,7 @@ jobs:
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"baseline-2","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/baseline-2/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"baseline-2","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh baseline ../reth-baseline/target/profiling/reth "$BENCH_WORK_DIR/baseline-2"
 
@@ -601,13 +589,13 @@ jobs:
           SUMMARY_ARGS="$SUMMARY_ARGS --baseline-csv $BASELINE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --feature-csv $FEATURE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --gas-csv $BENCH_WORK_DIR/feature-1/total_gas.csv"
-          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
-            SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
-          fi
 
           GRAFANA_URL='${{ steps.metrics.outputs.grafana-url }}'
           if [ -n "$GRAFANA_URL" ]; then
             SUMMARY_ARGS="$SUMMARY_ARGS --grafana-url $GRAFANA_URL"
+          fi
+          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+            SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
           fi
           # shellcheck disable=SC2086
           python3 .github/scripts/bench-reth-summary.py $SUMMARY_ARGS
@@ -694,7 +682,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const { verdict, metricRows, waitTimeRows, targetMetricRows, blocksLabel } = require('./.github/scripts/bench-utils');
+            const { verdict, metricRows, waitTimeRows, blocksLabel } = require('./.github/scripts/bench-utils');
 
             let summary;
             try {
@@ -706,7 +694,7 @@ jobs:
 
             const repo = `${context.repo.owner}/${context.repo.repo}`;
             const commitUrl = `https://github.com/${repo}/commit`;
-            const { emoji, label } = verdict(summary);
+            const { emoji, label } = verdict(summary.changes);
             const baselineLink = `[\`${summary.baseline.name}\`](${commitUrl}/${summary.baseline.ref})`;
             const featureLink = `[\`${summary.feature.name}\`](${commitUrl}/${summary.feature.ref})`;
             const diffUrl = `https://github.com/${repo}/compare/${summary.baseline.ref}...${summary.feature.ref}`;
@@ -735,17 +723,6 @@ jobs:
                 md += `| ${r.title} | ${r.baseline} | ${r.feature} |\n`;
               }
               md += '\n';
-            }
-
-            const tmRows = targetMetricRows(summary);
-            if (tmRows.length > 0) {
-              md += `### Target Counter Metrics\n\n`;
-              md += `| Metric | Baseline | Feature | Change |\n`;
-              md += `|--------|----------|---------|--------|\n`;
-              for (const r of tmRows) {
-                md += `| \`${r.title}\` | ${r.baseline} | ${r.feature} | ${r.change} |\n`;
-              }
-              md += `\n*Values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*\n\n`;
             }
 
             // Charts
@@ -787,7 +764,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const { verdict, fmtChange, fmtMs, metricRows, waitTimeRows, targetMetricRows, blocksLabel, allChanges } = require('./.github/scripts/bench-utils');
+            const { verdict, fmtChange, fmtMs, metricRows, waitTimeRows, blocksLabel } = require('./.github/scripts/bench-utils');
 
             const token = process.env.SLACK_BENCH_BOT_TOKEN;
             const channel = process.env.SLACK_BENCH_CHANNEL;
@@ -805,11 +782,11 @@ jobs:
             }
 
             // Filter notifications based on mode
-            const changes = allChanges(summary);
+            const changes = summary.changes || {};
             const mode = process.env.BENCH_MODE || 'nightly';
             const slackMode = process.env.BENCH_SLACK || 'always';
-            const hasRegression = changes.some(c => c.sig === 'bad');
-            const hasImprovement = changes.some(c => c.sig === 'good');
+            const hasRegression = Object.values(changes).some(c => c.sig === 'bad');
+            const hasImprovement = Object.values(changes).some(c => c.sig === 'good');
 
             // on-win mode: only notify on improvements
             if (slackMode === 'on-win' && !hasImprovement) {
@@ -833,7 +810,7 @@ jobs:
             };
 
             const repo = `${context.repo.owner}/${context.repo.repo}`;
-            const { emoji, label } = verdict(summary);
+            const { emoji, label } = verdict(changes);
             const headerEmoji = SLACK_VERDICT[emoji] || emoji;
             const commitUrl = `https://github.com/${repo}/commit`;
             const baselineLink = `<${commitUrl}/${summary.baseline.ref}|${summary.baseline.name}>`;
@@ -928,32 +905,6 @@ jobs:
                     rows: waitTableRows,
                   }],
                   text: 'Wait time breakdown',
-                  unfurl_links: false,
-                }),
-              });
-            }
-
-            const tmRows = targetMetricRows(summary);
-            if (data.ts && tmRows.length > 0) {
-              const targetTableRows = [
-                [cell('Metric'), cell('Target'), cell('Baseline'), cell('Feature'), cell('Change')],
-                ...tmRows.map(r => [cell(r.title), cell(r.target), cell(r.baseline), cell(r.feature), cell(r.change || ' ')]),
-              ];
-              await fetch('https://slack.com/api/chat.postMessage', {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${token}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  channel,
-                  thread_ts: data.ts,
-                  blocks: [{
-                    type: 'table',
-                    column_settings: [{ align: 'left' }, { align: 'left' }, { align: 'right' }, { align: 'right' }, { align: 'right' }],
-                    rows: targetTableRows,
-                  }],
-                  text: 'Target Prometheus metrics',
                   unfurl_links: false,
                 }),
               });

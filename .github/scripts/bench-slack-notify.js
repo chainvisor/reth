@@ -18,7 +18,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { fmtChange, fmtMs, verdict, loadSamplyUrls, blocksLabel, metricRows, waitTimeRows, targetMetricRows, allChanges } = require('./bench-utils');
+const { fmtChange, fmtMs, verdict, loadSamplyUrls, blocksLabel, metricRows, waitTimeRows } = require('./bench-utils');
 
 const SLACK_API = 'https://slack.com/api/chat.postMessage';
 
@@ -71,7 +71,7 @@ const SLACK_VERDICT = {
 };
 
 function buildSuccessBlocks({ summary, prNumber, actor, actorSlackId, jobUrl, repo, samplyUrls }) {
-  const { emoji, label } = verdict(summary);
+  const { emoji, label } = verdict(summary.changes);
   const headerEmoji = SLACK_VERDICT[emoji] || emoji;
 
   const prUrl = prNumber ? `https://github.com/${repo}/pull/${prNumber}` : '';
@@ -175,24 +175,6 @@ function buildSuccessBlocks({ summary, prNumber, actor, actorSlackId, jobUrl, re
     });
   }
 
-  const tmRows = targetMetricRows(summary);
-  if (tmRows.length > 0) {
-    const targetTableRows = [
-      [cell('Metric'), cell('Baseline'), cell('Feature'), cell('Change')],
-      ...tmRows.map(r => [cell(r.title), cell(r.baseline), cell(r.feature), cell(r.change || ' ')]),
-    ];
-    threadBlocks.push({
-      type: 'table',
-      column_settings: [
-        { align: 'left' },
-        { align: 'right' },
-        { align: 'right' },
-        { align: 'right' },
-      ],
-      rows: targetTableRows,
-    });
-  }
-
   return { blocks, threadBlocks };
 }
 
@@ -274,8 +256,8 @@ async function success({ core, context }) {
   const channel = process.env.SLACK_BENCH_CHANNEL;
   let postedToChannel = false;
   if (channel) {
-    const changes = allChanges(summary);
-    const hasImprovement = changes.some(c => c.sig === 'good');
+    const changes = summary.changes || {};
+    const hasImprovement = Object.values(changes).some(c => c.sig === 'good');
     if (hasImprovement) {
       await sendWithThread(channel);
       postedToChannel = true;

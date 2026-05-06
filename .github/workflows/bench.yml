@@ -557,9 +557,6 @@ jobs:
       BENCH_NODE_BIN: ${{ needs.reth-bench-ack.outputs.big-blocks == 'true' && 'reth-bb' || 'reth' }}
       BENCH_METRICS_ADDR: "127.0.0.1:9100"
       BENCH_TARGET_METRICS_CONFIG: .github/config/bench-prometheus-counters.json
-      BENCH_GRAFANA_URL: ${{ secrets.FETCH_GRAFANA_DASHBOARD_URL }}
-      BENCH_GRAFANA_TOKEN: ${{ secrets.FETCH_GRAFANA_DASHBOARD_TOKEN }}
-      BENCH_GRAFANA_DATASOURCE_UID: "ef57fux92e9z4e"
       BENCH_OTLP_TRACES_ENDPOINT: ${{ needs.reth-bench-ack.outputs.otlp != 'false' && secrets.BENCH_OTLP_TRACES_ENDPOINT || '' }}
       BENCH_OTLP_LOGS_ENDPOINT: ${{ needs.reth-bench-ack.outputs.otlp != 'false' && secrets.BENCH_OTLP_LOGS_ENDPOINT || '' }}
     steps:
@@ -936,24 +933,13 @@ jobs:
           echo '{}' > "$LABELS_FILE"
           echo "BENCH_LABELS_FILE=${LABELS_FILE}" >> "$GITHUB_ENV"
 
-          METRICS_PROXY_ARGS=(
-            --labels "$LABELS_FILE"
-            --upstream "http://${BENCH_METRICS_ADDR}/"
-            --subnet 10.10.0.0/24
-            --port 9090
-          )
-          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
-            METRICS_PROXY_ARGS+=(--target-metrics-config "$BENCH_TARGET_METRICS_CONFIG")
-          fi
-
-          PROXY_LOG="$RUNNER_TEMP/bench-metrics-proxy.log"
-          : > "$PROXY_LOG"
-          RUNNER_TRACKING_ID='' \
-            python3 .github/scripts/bench-metrics-proxy.py "${METRICS_PROXY_ARGS[@]}" \
-            >"$PROXY_LOG" 2>&1 &
+          python3 .github/scripts/bench-metrics-proxy.py \
+            --labels "$LABELS_FILE" \
+            --upstream "http://${BENCH_METRICS_ADDR}/" \
+            --subnet 10.10.0.0/24 \
+            --port 9090 &
           PROXY_PID=$!
           echo "BENCH_METRICS_PROXY_PID=${PROXY_PID}" >> "$GITHUB_ENV"
-          echo "BENCH_METRICS_PROXY_LOG=${PROXY_LOG}" >> "$GITHUB_ENV"
           echo "Metrics proxy started (PID $PROXY_PID)"
 
       - name: Update status (running benchmarks)
@@ -976,7 +962,7 @@ jobs:
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/feature-1/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh feature "../reth-feature/target/profiling/${BENCH_NODE_BIN}" "$BENCH_WORK_DIR/feature-1"
 
@@ -989,7 +975,7 @@ jobs:
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/baseline-1/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh baseline "../reth-baseline/target/profiling/${BENCH_NODE_BIN}" "$BENCH_WORK_DIR/baseline-1"
 
@@ -1003,7 +989,7 @@ jobs:
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"baseline-2","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/baseline-2/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"baseline-2","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh baseline "../reth-baseline/target/profiling/${BENCH_NODE_BIN}" "$BENCH_WORK_DIR/baseline-2"
 
@@ -1017,7 +1003,7 @@ jobs:
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
-          {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}","target_metrics_file":"${BENCH_WORK_DIR}/feature-2/target-metrics-scrapes.jsonl"}
+          {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"${LAST_RUN_START}","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
           taskset -c 0 .github/scripts/bench-reth-run.sh feature "../reth-feature/target/profiling/${BENCH_NODE_BIN}" "$BENCH_WORK_DIR/feature-2"
 
@@ -1026,8 +1012,6 @@ jobs:
         if: "!cancelled()"
         run: |
           kill "$BENCH_METRICS_PROXY_PID" 2>/dev/null || true
-          echo "=== bench-metrics-proxy log ==="
-          tail -200 "$BENCH_METRICS_PROXY_LOG" 2>/dev/null || true
 
           LAST_RUN_DURATION=$(( $(date +%s) - BENCH_LAST_RUN_START ))
           FROM_MS=$(( BENCH_REFERENCE_EPOCH * 1000 ))
@@ -1145,9 +1129,6 @@ jobs:
           SUMMARY_ARGS="$SUMMARY_ARGS --baseline-csv $BASELINE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --feature-csv $FEATURE_CSVS"
           SUMMARY_ARGS="$SUMMARY_ARGS --gas-csv $BENCH_WORK_DIR/feature-1/total_gas.csv"
-          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
-            SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
-          fi
           if [ "$BEHIND_BASELINE" -gt 0 ]; then
             SUMMARY_ARGS="$SUMMARY_ARGS --behind-baseline $BEHIND_BASELINE"
           fi
@@ -1166,6 +1147,9 @@ jobs:
           GRAFANA_URL='${{ steps.metrics.outputs.grafana-url }}'
           if [ -n "$GRAFANA_URL" ]; then
             SUMMARY_ARGS="$SUMMARY_ARGS --grafana-url $GRAFANA_URL"
+          fi
+          if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
+            SUMMARY_ARGS="$SUMMARY_ARGS --target-metrics-config $BENCH_TARGET_METRICS_CONFIG"
           fi
           # shellcheck disable=SC2086
           python3 .github/scripts/bench-reth-summary.py $SUMMARY_ARGS
