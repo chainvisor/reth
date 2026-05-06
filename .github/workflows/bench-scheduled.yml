@@ -272,7 +272,7 @@ jobs:
       BENCH_ABBA: "true"
       BENCH_COMMENT_ID: ""
       BENCH_SLACK: ${{ github.event_name == 'workflow_dispatch' && inputs.slack || 'always' }}
-      BENCH_TARGET_METRICS_CONFIG: .github/config/bench-prometheus-counters.json
+      BENCH_TARGET_METRICS_CONFIG: .github/config/bench-metrics-targets.json
       BENCH_SNAPSHOT_MANIFEST_URL: ${{ secrets.BENCH_SNAPSHOT_MANIFEST_URL }}
       BENCH_METRICS_ADDR: "127.0.0.1:9001"
       BENCH_OTLP_DISABLED: "true"
