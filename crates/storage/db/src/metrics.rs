@@ -311,7 +311,7 @@ pub(crate) struct TransactionMetrics {
 
 impl TransactionMetrics {
     pub(crate) fn record_open(&self) {
-        self.opened_total.increment(100);
+        self.opened_total.increment(1);
     }
 
     pub(crate) fn record_close(&self) {
