@@ -704,7 +704,6 @@ def compute_paired_target_metric_change(
     query: str,
     target: str,
     stat_name: str,
-    method: str,
 ) -> dict:
     pairs = paired_target_metric_observations(baseline_runs, feature_runs)
     if not pairs:
@@ -716,7 +715,7 @@ def compute_paired_target_metric_change(
     feature_value = target_metric_stat_value(feature_values, stat_name)
     diff = feature_value - baseline_value
 
-    rng = random.Random(f"{query}:{stat_name}:{method}")
+    rng = random.Random(f"{query}:{stat_name}")
     boot_diffs = []
     for _ in range(BOOTSTRAP_ITERATIONS):
         sample = rng.choices(pairs, k=len(pairs))
@@ -748,7 +747,7 @@ def compute_paired_target_metric_change(
         "ci": round(ci, 6),
         "ci_pct": round(ci_pct, 4),
         "sig": sig,
-        "method": method,
+        "method": "paired-bootstrap",
         "paired_observations": len(pairs),
     }
     if significance_reason:
@@ -1023,40 +1022,6 @@ def summarize_target_metric_runs(run_items: list[dict], fields: tuple[str, ...])
     return summary
 
 
-def compute_counter_target_metric_change(
-    baseline_runs: list[dict],
-    feature_runs: list[dict],
-    query: str,
-    target: str,
-    stat_name: str,
-) -> dict:
-    return compute_paired_target_metric_change(
-        baseline_runs,
-        feature_runs,
-        query,
-        target,
-        stat_name,
-        "paired-counter-interval-bootstrap",
-    )
-
-
-def compute_histogram_target_metric_change(
-    baseline_runs: list[dict],
-    feature_runs: list[dict],
-    query: str,
-    target: str,
-    stat_name: str,
-) -> dict:
-    return compute_paired_target_metric_change(
-        baseline_runs,
-        feature_runs,
-        query,
-        target,
-        stat_name,
-        "paired-scrape-bootstrap",
-    )
-
-
 def summarize_target_metric_change(changes: dict[str, dict], display_stats: tuple[str, ...]) -> dict:
     significant = [name for name in display_stats if changes[name]["sig"] != "neutral"]
     if not significant:
@@ -1154,7 +1119,7 @@ def compute_target_metric_summary(
                 )
 
             changes = {
-                stat_name: compute_counter_target_metric_change(
+                stat_name: compute_paired_target_metric_change(
                     baseline_runs_for_stats,
                     feature_runs_for_stats,
                     display_query,
@@ -1256,7 +1221,7 @@ def compute_target_metric_summary(
                 feature_values.append(run_values)
 
             changes = {
-                stat_name: compute_histogram_target_metric_change(
+                stat_name: compute_paired_target_metric_change(
                     baseline_runs_for_stats[stat_name],
                     feature_runs_for_stats[stat_name],
                     display_query,
@@ -1440,25 +1405,6 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     if row_count == 0:
         return ""
 
-    lines.append("")
-    if any(metric["kind"] == "counter" for metric in changed):
-        lines.append(
-            "*Counter values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes, paired by canonical block height for significance.*"
-        )
-    if any(metric["kind"] == "histogram" for metric in changed):
-        lines.append(
-            "*Histogram rows use `_sum`/`_count` mean deltas. Significant changes pair observations by canonical block height and use a paired bootstrap.*"
-        )
-    if any(metric.get("identity_labels") for metric in changed):
-        lines.append(
-            "*When a configured target metric matches multiple unhandled label sets, the summary expands them into separate rows keyed by the remaining metric labels after stripping handled labels such as `quantile` and `run_type`.*"
-        )
-    if target_metrics.get("abba"):
-        lines.extend(
-            [
-                "*ABBA target-metric checks pool block-height-matched observations from matching run replicas (`baseline-1` vs `feature-1`, `baseline-2` vs `feature-2`) rather than applying a two-pair direction heuristic.*",
-            ]
-        )
     return "\n".join(lines)
 
 
