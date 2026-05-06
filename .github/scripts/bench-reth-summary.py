@@ -31,7 +31,6 @@ BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 TARGET_METRIC_COUNTER_STATS = ("p50", "p90")
-TARGET_METRIC_HISTOGRAM_PERCENTILES = (("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99"))
 TARGET_METRIC_MIN_PAIRED_OBSERVATIONS = 30
 TARGET_METRIC_IGNORED_CARDINALITY_LABELS = frozenset(("quantile", "run_type"))
 SELECTOR_RE = re.compile(
@@ -163,17 +162,6 @@ def format_target_metric_query(metric_name: str, labels: dict[str, str]) -> str:
         f'{key}="{format_label_value(value)}"' for key, value in sorted(labels.items())
     )
     return f"{metric_name}{{{encoded_labels}}}"
-
-
-def histogram_quantile_query(query: str, quantile: str) -> str:
-    aggregate, metric_name, label_filters = parse_target_metric_query(query)
-    if aggregate != "single":
-        raise ValueError(f"Histogram target metric queries must not use sum(...): {query}")
-    if "quantile" in label_filters:
-        raise ValueError(f"Histogram target metric query must not include a quantile label: {query}")
-    label_filters = dict(label_filters)
-    label_filters["quantile"] = quantile
-    return format_target_metric_query(metric_name, label_filters)
 
 
 def histogram_counter_query(query: str, suffix: str) -> str:
@@ -747,7 +735,6 @@ def compute_paired_target_metric_change(
         "ci": round(ci, 6),
         "ci_pct": round(ci_pct, 4),
         "sig": sig,
-        "method": "paired-bootstrap",
         "paired_observations": len(pairs),
     }
     if significance_reason:
@@ -843,66 +830,14 @@ def query_histogram_target_metric_run(
     run_label: str,
     metadata: dict,
 ) -> dict[tuple[tuple[str, str], ...], dict]:
-    metrics_by_identity = {}
-    for stat_name, quantile in TARGET_METRIC_HISTOGRAM_PERCENTILES:
-        query = histogram_quantile_query(histogram["query"], quantile)
-        grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], query)[1] for scrape in relevant_scrapes]
-        identities = collect_metric_identities(grouped_scrapes)
-        if not identities:
-            raise ValueError(
-                f"Histogram target metric '{query}' in run '{run_label}' had no sampled percentile values inside the benchmark window"
-            )
-
-        for identity_key, identity_labels in sorted(identities.items()):
-            sample_observations = []
-            for scrape, grouped in zip(relevant_scrapes, grouped_scrapes):
-                group = grouped.get(identity_key)
-                if not group:
-                    continue
-                sample_observations.append(
-                    {
-                        "block_height": float(scrape["block_height"]),
-                        "value": grouped_sample_value(group, "single"),
-                    }
-                )
-
-            display_query = format_target_metric_identity(histogram["query"], identity_labels)
-            if not sample_observations:
-                raise ValueError(
-                    f"Histogram target metric '{display_query}' in run '{run_label}' had no sampled percentile values inside the benchmark window"
-                )
-            sample_values = [observation["value"] for observation in sample_observations]
-
-            metric = metrics_by_identity.setdefault(
-                identity_key,
-                {
-                    "query": histogram["query"],
-                    "display_query": display_query,
-                    "identity_labels": identity_labels,
-                    "target": histogram["target"],
-                    "quantiles": {},
-                },
-            )
-            metric["quantiles"][stat_name] = {
-                "query": query,
-                "value": sum(sample_values) / len(sample_values),
-                "samples": len(sample_values),
-                "scrapes": len(relevant_scrapes),
-                "duration_ms": int(metadata["duration_ms"]),
-                "range_start_ms": int(metadata["range_start_ms"]),
-                "range_end_ms": int(metadata["range_end_ms"]),
-                "benchmark_id": metadata["benchmark_id"],
-                "benchmark_run": metadata["benchmark_run"],
-                "_values": sample_values,
-                "_observations": sample_observations,
-            }
-
     sum_query = histogram_counter_query(histogram["query"], "sum")
     count_query = histogram_counter_query(histogram["query"], "count")
     sum_grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], sum_query)[1] for scrape in relevant_scrapes]
     count_grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], count_query)[1] for scrape in relevant_scrapes]
     mean_identities = collect_metric_identities(sum_grouped_scrapes)
     mean_identities.update(collect_metric_identities(count_grouped_scrapes))
+
+    metrics_by_identity = {}
     for identity_key, identity_labels in sorted(mean_identities.items()):
         mean_observations = []
         display_query = format_target_metric_identity(histogram["query"], identity_labels)
@@ -942,38 +877,25 @@ def query_histogram_target_metric_run(
             continue
 
         stats = target_metric_observation_stats(mean_observations)
-        metric = metrics_by_identity.setdefault(
-            identity_key,
-            {
-                "query": histogram["query"],
-                "display_query": display_query,
-                "identity_labels": identity_labels,
-                "target": histogram["target"],
-                "quantiles": {},
+        metrics_by_identity[identity_key] = {
+            "query": histogram["query"],
+            "display_query": display_query,
+            "identity_labels": identity_labels,
+            "target": histogram["target"],
+            "mean": {
+                "query": f"{sum_query} / {count_query}",
+                "value": stats["mean"],
+                "samples": len(mean_observations),
+                "scrapes": len(relevant_scrapes),
+                "duration_ms": int(metadata["duration_ms"]),
+                "range_start_ms": int(metadata["range_start_ms"]),
+                "range_end_ms": int(metadata["range_end_ms"]),
+                "benchmark_id": metadata["benchmark_id"],
+                "benchmark_run": metadata["benchmark_run"],
+                "_values": [observation["value"] for observation in mean_observations],
+                "_observations": mean_observations,
             },
-        )
-        metric["mean"] = {
-            "query": f"{sum_query} / {count_query}",
-            "value": stats["mean"],
-            "samples": len(mean_observations),
-            "scrapes": len(relevant_scrapes),
-            "duration_ms": int(metadata["duration_ms"]),
-            "range_start_ms": int(metadata["range_start_ms"]),
-            "range_end_ms": int(metadata["range_end_ms"]),
-            "benchmark_id": metadata["benchmark_id"],
-            "benchmark_run": metadata["benchmark_run"],
-            "_values": [observation["value"] for observation in mean_observations],
-            "_observations": mean_observations,
         }
-
-    expected_stats = {stat_name for stat_name, _ in TARGET_METRIC_HISTOGRAM_PERCENTILES}
-    for metric in metrics_by_identity.values():
-        missing_stats = expected_stats - set(metric["quantiles"])
-        if missing_stats:
-            missing = ", ".join(sorted(missing_stats))
-            raise ValueError(
-                f"Histogram target metric '{metric['display_query']}' in run '{run_label}' was missing percentile samples for {missing}"
-            )
 
     return metrics_by_identity
 
@@ -1032,8 +954,7 @@ def summarize_target_metric_change(changes: dict[str, dict], display_stats: tupl
         sig = "good"
     return {
         "sig": sig,
-        "method": changes[display_stats[0]]["method"],
-        "significant_percentiles": significant,
+        "significant_stats": significant,
     }
 
 
@@ -1163,7 +1084,6 @@ def compute_target_metric_summary(
                 ]
             metrics.append(entry)
 
-    histogram_stats = tuple(stat_name for stat_name, _ in TARGET_METRIC_HISTOGRAM_PERCENTILES)
     for histogram in config.get("histograms", []):
         query = histogram["query"]
         target = histogram["target"]
@@ -1177,28 +1097,20 @@ def compute_target_metric_summary(
             display_query = format_target_metric_identity(query, identity_labels)
             baseline_run_metrics = []
             feature_run_metrics = []
+            if not all(
+                identity_key in run_data["histograms"][query]
+                for _run_label, run_data in baseline_runs + feature_runs
+            ):
+                continue
 
             for run_label, run_data in baseline_runs:
-                if identity_key not in run_data["histograms"][query]:
-                    raise ValueError(
-                        f"Missing target metric '{display_query}' in baseline run '{run_label}'"
-                    )
                 run_metric = run_data["histograms"][query][identity_key]
                 baseline_run_metrics.append((run_label, run_metric))
 
             for run_label, run_data in feature_runs:
-                if identity_key not in run_data["histograms"][query]:
-                    raise ValueError(
-                        f"Missing target metric '{display_query}' in feature run '{run_label}'"
-                    )
                 run_metric = run_data["histograms"][query][identity_key]
                 feature_run_metrics.append((run_label, run_metric))
 
-            if not all(
-                "mean" in run_metric
-                for _run_label, run_metric in baseline_run_metrics + feature_run_metrics
-            ):
-                continue
             display_stats = ("mean",)
 
             baseline_runs_for_stats = {stat_name: [] for stat_name in display_stats}
@@ -1207,7 +1119,7 @@ def compute_target_metric_summary(
             for run_label, run_metric in baseline_run_metrics:
                 run_values = {"run": run_label}
                 for stat_name in display_stats:
-                    run_stat = run_metric["mean"] if stat_name == "mean" else run_metric["quantiles"][stat_name]
+                    run_stat = run_metric[stat_name]
                     baseline_runs_for_stats[stat_name].append(run_stat)
                     run_values[stat_name] = float(run_stat["value"])
                 baseline_values.append(run_values)
@@ -1215,7 +1127,7 @@ def compute_target_metric_summary(
             for run_label, run_metric in feature_run_metrics:
                 run_values = {"run": run_label}
                 for stat_name in display_stats:
-                    run_stat = run_metric["mean"] if stat_name == "mean" else run_metric["quantiles"][stat_name]
+                    run_stat = run_metric[stat_name]
                     feature_runs_for_stats[stat_name].append(run_stat)
                     run_values[stat_name] = float(run_stat["value"])
                 feature_values.append(run_values)
@@ -1259,20 +1171,9 @@ def compute_target_metric_summary(
                 ]
             metrics.append(entry)
 
-    changed = [metric for metric in metrics if metric["change"]["significant_percentiles"]]
+    changed = [metric for metric in metrics if metric["change"]["significant_stats"]]
     return {
         "config": config_path,
-        "source": "reth-bench-metrics-scrape-files",
-        "normalization": {
-            "block_height_query": TARGET_METRIC_BLOCK_HEIGHT_QUERY,
-            "scrape_file": "target-metrics-scrapes.jsonl",
-            "counters": "counter delta / canonical chain-height delta between adjacent scrapes, paired by canonical block height",
-            "histograms": "sum/count deltas for mean, paired by canonical block height",
-            "cardinality": "unhandled label sets become separate target metrics after stripping query filters and known labels such as quantile/run_type",
-            "significance": "paired bootstrap over block-height-matched target metric observations; ABBA runs are pooled as additional paired observations",
-            "min_paired_observations": TARGET_METRIC_MIN_PAIRED_OBSERVATIONS,
-        },
-        "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,
         "changed": changed,
         "improvements": [metric["name"] for metric in changed if metric["change"]["sig"] == "good"],
