@@ -29,12 +29,10 @@ GIGAGAS = 1_000_000_000
 T_CRITICAL = 1.96  # two-tailed 95% confidence
 BOOTSTRAP_ITERATIONS = 10_000
 EPSILON = 1e-9
-TWO_PAIR_ABBA_MIN_PCT = 10.0
-TWO_PAIR_ABBA_MIN_PAIR_RATIO = 0.5
-TWO_PAIR_ABBA_HISTOGRAM_MIN_ABS_DIFF = 1e-4
 TARGET_METRIC_BLOCK_HEIGHT_QUERY = "reth_blockchain_tree_canonical_chain_height"
 TARGET_METRIC_COUNTER_STATS = ("p50", "p90")
 TARGET_METRIC_HISTOGRAM_PERCENTILES = (("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99"))
+TARGET_METRIC_MIN_PAIRED_OBSERVATIONS = 30
 TARGET_METRIC_IGNORED_CARDINALITY_LABELS = frozenset(("quantile", "run_type"))
 SELECTOR_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?$"
@@ -176,6 +174,13 @@ def histogram_quantile_query(query: str, quantile: str) -> str:
     label_filters = dict(label_filters)
     label_filters["quantile"] = quantile
     return format_target_metric_query(metric_name, label_filters)
+
+
+def histogram_counter_query(query: str, suffix: str) -> str:
+    aggregate, metric_name, label_filters = parse_target_metric_query(query)
+    if aggregate != "single":
+        raise ValueError(f"Histogram target metric queries must not use sum(...): {query}")
+    return format_target_metric_query(f"{metric_name}_{suffix}", label_filters)
 
 
 def query_matches_sample(sample: dict, metric_name: str, label_filters: dict[str, str]) -> bool:
@@ -667,6 +672,90 @@ def counter_target_metric_stat_value(values: list[float], stat_name: str) -> flo
     raise ValueError(f"Unsupported target metric statistic: {stat_name}")
 
 
+def target_metric_observation_stats(observations: list[dict]) -> dict[str, float]:
+    return compute_target_metric_series_stats([observation["value"] for observation in observations])
+
+
+def target_metric_stat_value(values: list[float], stat_name: str) -> float:
+    return counter_target_metric_stat_value(values, stat_name)
+
+
+def paired_target_metric_observations(
+    baseline_runs: list[dict], feature_runs: list[dict]
+) -> list[tuple[float, float]]:
+    pairs = []
+    for baseline_run, feature_run in zip(baseline_runs, feature_runs):
+        baseline_by_block = {
+            observation["block_height"]: observation["value"]
+            for observation in baseline_run["_observations"]
+        }
+        feature_by_block = {
+            observation["block_height"]: observation["value"]
+            for observation in feature_run["_observations"]
+        }
+        for block_height in sorted(set(baseline_by_block) & set(feature_by_block)):
+            pairs.append((baseline_by_block[block_height], feature_by_block[block_height]))
+    return pairs
+
+
+def compute_paired_target_metric_change(
+    baseline_runs: list[dict],
+    feature_runs: list[dict],
+    query: str,
+    target: str,
+    stat_name: str,
+    method: str,
+) -> dict:
+    pairs = paired_target_metric_observations(baseline_runs, feature_runs)
+    if not pairs:
+        raise ValueError(f"Target metric '{query}' had no paired observations for {stat_name}")
+
+    baseline_values = [baseline for baseline, _feature in pairs]
+    feature_values = [feature for _baseline, feature in pairs]
+    baseline_value = target_metric_stat_value(baseline_values, stat_name)
+    feature_value = target_metric_stat_value(feature_values, stat_name)
+    diff = feature_value - baseline_value
+
+    rng = random.Random(f"{query}:{stat_name}:{method}")
+    boot_diffs = []
+    for _ in range(BOOTSTRAP_ITERATIONS):
+        sample = rng.choices(pairs, k=len(pairs))
+        baseline_sample = [baseline for baseline, _feature in sample]
+        feature_sample = [feature for _baseline, feature in sample]
+        boot_diffs.append(
+            target_metric_stat_value(feature_sample, stat_name)
+            - target_metric_stat_value(baseline_sample, stat_name)
+        )
+
+    boot_diffs.sort()
+    lo = int(BOOTSTRAP_ITERATIONS * 0.025)
+    hi = int(BOOTSTRAP_ITERATIONS * 0.975)
+    ci = (boot_diffs[hi] - boot_diffs[lo]) / 2
+    pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+    ci_pct = (ci / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
+    sig = significance(pct, ci_pct, lower_is_better=target == "decrease")
+    significance_reason = None
+    if len(pairs) < TARGET_METRIC_MIN_PAIRED_OBSERVATIONS:
+        sig = "neutral"
+        significance_reason = (
+            f"requires at least {TARGET_METRIC_MIN_PAIRED_OBSERVATIONS} paired observations"
+        )
+    result = {
+        "baseline": baseline_value,
+        "feature": feature_value,
+        "diff": round(diff, 6),
+        "pct": round(pct, 4),
+        "ci": round(ci, 6),
+        "ci_pct": round(ci_pct, 4),
+        "sig": sig,
+        "method": method,
+        "paired_observations": len(pairs),
+    }
+    if significance_reason:
+        result["significance_reason"] = significance_reason
+    return result
+
+
 def query_counter_target_metric_run(
     relevant_scrapes: list[dict],
     counter: dict,
@@ -682,7 +771,7 @@ def query_counter_target_metric_run(
 
     results = {}
     for identity_key, identity_labels in sorted(identities.items()):
-        interval_values = []
+        interval_observations = []
         counter_increase = 0.0
         block_height_delta = 0.0
         display_query = format_target_metric_identity(query, identity_labels)
@@ -712,14 +801,19 @@ def query_counter_target_metric_run(
 
             counter_increase += interval_counter_delta
             block_height_delta += interval_block_height_delta
-            interval_values.append(interval_counter_delta / interval_block_height_delta)
+            interval_observations.append(
+                {
+                    "block_height": current_block_height,
+                    "value": interval_counter_delta / interval_block_height_delta,
+                }
+            )
 
-        if not interval_values:
+        if not interval_observations:
             raise ValueError(
                 f"Target metric '{display_query}' in run '{run_label}' had no positive block-height scrape intervals"
             )
 
-        stats = compute_target_metric_series_stats(interval_values)
+        stats = target_metric_observation_stats(interval_observations)
         results[identity_key] = {
             "query": query,
             "display_query": display_query,
@@ -731,14 +825,15 @@ def query_counter_target_metric_run(
             "p50": stats["p50"],
             "p90": stats["p90"],
             "p99": stats["p99"],
-            "intervals": len(interval_values),
+            "intervals": len(interval_observations),
             "scrapes": len(relevant_scrapes),
             "duration_ms": int(metadata["duration_ms"]),
             "range_start_ms": int(metadata["range_start_ms"]),
             "range_end_ms": int(metadata["range_end_ms"]),
             "benchmark_id": metadata["benchmark_id"],
             "benchmark_run": metadata["benchmark_run"],
-            "_values": interval_values,
+            "_values": [observation["value"] for observation in interval_observations],
+            "_observations": interval_observations,
         }
     return results
 
@@ -760,18 +855,24 @@ def query_histogram_target_metric_run(
             )
 
         for identity_key, identity_labels in sorted(identities.items()):
-            sample_values = []
-            for grouped in grouped_scrapes:
+            sample_observations = []
+            for scrape, grouped in zip(relevant_scrapes, grouped_scrapes):
                 group = grouped.get(identity_key)
                 if not group:
                     continue
-                sample_values.append(grouped_sample_value(group, "single"))
+                sample_observations.append(
+                    {
+                        "block_height": float(scrape["block_height"]),
+                        "value": grouped_sample_value(group, "single"),
+                    }
+                )
 
             display_query = format_target_metric_identity(histogram["query"], identity_labels)
-            if not sample_values:
+            if not sample_observations:
                 raise ValueError(
                     f"Histogram target metric '{display_query}' in run '{run_label}' had no sampled percentile values inside the benchmark window"
                 )
+            sample_values = [observation["value"] for observation in sample_observations]
 
             metric = metrics_by_identity.setdefault(
                 identity_key,
@@ -794,7 +895,77 @@ def query_histogram_target_metric_run(
                 "benchmark_id": metadata["benchmark_id"],
                 "benchmark_run": metadata["benchmark_run"],
                 "_values": sample_values,
+                "_observations": sample_observations,
             }
+
+    sum_query = histogram_counter_query(histogram["query"], "sum")
+    count_query = histogram_counter_query(histogram["query"], "count")
+    sum_grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], sum_query)[1] for scrape in relevant_scrapes]
+    count_grouped_scrapes = [group_query_samples_by_identity(scrape["samples"], count_query)[1] for scrape in relevant_scrapes]
+    mean_identities = collect_metric_identities(sum_grouped_scrapes)
+    mean_identities.update(collect_metric_identities(count_grouped_scrapes))
+    for identity_key, identity_labels in sorted(mean_identities.items()):
+        mean_observations = []
+        display_query = format_target_metric_identity(histogram["query"], identity_labels)
+        for previous_scrape, current_scrape, previous_sum_groups, current_sum_groups, previous_count_groups, current_count_groups in zip(
+            relevant_scrapes,
+            relevant_scrapes[1:],
+            sum_grouped_scrapes,
+            sum_grouped_scrapes[1:],
+            count_grouped_scrapes,
+            count_grouped_scrapes[1:],
+        ):
+            current_sum = grouped_sample_value(current_sum_groups.get(identity_key), "single", allow_missing=True)
+            previous_sum = grouped_sample_value(previous_sum_groups.get(identity_key), "single", allow_missing=True)
+            current_count = grouped_sample_value(current_count_groups.get(identity_key), "single", allow_missing=True)
+            previous_count = grouped_sample_value(previous_count_groups.get(identity_key), "single", allow_missing=True)
+            current_block_height = float(current_scrape["block_height"])
+            previous_block_height = float(previous_scrape["block_height"])
+            if current_block_height - previous_block_height <= EPSILON:
+                continue
+
+            sum_delta = current_sum - previous_sum
+            count_delta = current_count - previous_count
+            if sum_delta < -EPSILON or count_delta < -EPSILON:
+                raise ValueError(
+                    f"Histogram target metric '{display_query}' sum/count decreased within run '{run_label}'"
+                )
+            if count_delta <= EPSILON:
+                continue
+            mean_observations.append(
+                {
+                    "block_height": current_block_height,
+                    "value": sum_delta / count_delta,
+                }
+            )
+
+        if not mean_observations:
+            continue
+
+        stats = target_metric_observation_stats(mean_observations)
+        metric = metrics_by_identity.setdefault(
+            identity_key,
+            {
+                "query": histogram["query"],
+                "display_query": display_query,
+                "identity_labels": identity_labels,
+                "target": histogram["target"],
+                "quantiles": {},
+            },
+        )
+        metric["mean"] = {
+            "query": f"{sum_query} / {count_query}",
+            "value": stats["mean"],
+            "samples": len(mean_observations),
+            "scrapes": len(relevant_scrapes),
+            "duration_ms": int(metadata["duration_ms"]),
+            "range_start_ms": int(metadata["range_start_ms"]),
+            "range_end_ms": int(metadata["range_end_ms"]),
+            "benchmark_id": metadata["benchmark_id"],
+            "benchmark_run": metadata["benchmark_run"],
+            "_values": [observation["value"] for observation in mean_observations],
+            "_observations": mean_observations,
+        }
 
     expected_stats = {stat_name for stat_name, _ in TARGET_METRIC_HISTOGRAM_PERCENTILES}
     for metric in metrics_by_identity.values():
@@ -852,34 +1023,6 @@ def summarize_target_metric_runs(run_items: list[dict], fields: tuple[str, ...])
     return summary
 
 
-def two_pair_abba_consistency(
-    pair_diffs: list[float], pct: float, abs_diff: float, abs_floor: float
-) -> tuple[bool, str | None]:
-    if len(pair_diffs) != 2:
-        return False, "requires exactly 2 matched ABBA run pairs"
-
-    if pair_diffs[0] == 0.0 or pair_diffs[1] == 0.0:
-        return False, "requires both ABBA run pairs to move away from zero"
-
-    if (pair_diffs[0] > 0) != (pair_diffs[1] > 0):
-        return False, "requires both ABBA run pairs to move in the same direction"
-
-    pair_ratio = min(abs(pair_diffs[0]), abs(pair_diffs[1])) / max(abs(pair_diffs[0]), abs(pair_diffs[1]))
-    if pair_ratio < TWO_PAIR_ABBA_MIN_PAIR_RATIO:
-        return (
-            False,
-            f"requires the smaller ABBA pair effect to be at least {TWO_PAIR_ABBA_MIN_PAIR_RATIO:.0%} of the larger one",
-        )
-
-    if abs(pct) < TWO_PAIR_ABBA_MIN_PCT:
-        return False, f"requires at least {TWO_PAIR_ABBA_MIN_PCT:.0f}% change with only 2 ABBA pairs"
-
-    if abs_diff < abs_floor:
-        return False, f"requires at least {abs_floor:g} absolute change with only 2 ABBA pairs"
-
-    return True, None
-
-
 def compute_counter_target_metric_change(
     baseline_runs: list[dict],
     feature_runs: list[dict],
@@ -887,60 +1030,14 @@ def compute_counter_target_metric_change(
     target: str,
     stat_name: str,
 ) -> dict:
-    baseline_value = sum(run[stat_name] for run in baseline_runs) / len(baseline_runs)
-    feature_value = sum(run[stat_name] for run in feature_runs) / len(feature_runs)
-    diff = feature_value - baseline_value
-
-    if len(baseline_runs) > 1 and len(feature_runs) > 1:
-        pair_diffs = [
-            feature_run[stat_name] - baseline_run[stat_name]
-            for baseline_run, feature_run in zip(baseline_runs, feature_runs)
-        ]
-        pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
-        consistent, reason = two_pair_abba_consistency(pair_diffs, pct, abs(diff), 0.0)
-        result = {
-            "baseline": baseline_value,
-            "feature": feature_value,
-            "diff": round(diff, 6),
-            "pct": round(pct, 4),
-            "ci": 0.0,
-            "ci_pct": 0.0,
-            "sig": significance(pct, 0.0, lower_is_better=target == "decrease") if consistent else "neutral",
-            "method": "abba-two-pair-consistency",
-        }
-        if not consistent and reason:
-            result["significance_reason"] = reason
-        return result
-
-    rng = random.Random(f"{query}:{stat_name}")
-    boot_diffs = []
-    for _ in range(BOOTSTRAP_ITERATIONS):
-        pair_diffs = []
-        for baseline_run, feature_run in zip(baseline_runs, feature_runs):
-            baseline_sample = rng.choices(baseline_run["_values"], k=len(baseline_run["_values"]))
-            feature_sample = rng.choices(feature_run["_values"], k=len(feature_run["_values"]))
-            pair_diffs.append(
-                counter_target_metric_stat_value(feature_sample, stat_name)
-                - counter_target_metric_stat_value(baseline_sample, stat_name)
-            )
-        boot_diffs.append(sum(pair_diffs) / len(pair_diffs))
-
-    boot_diffs.sort()
-    lo = int(BOOTSTRAP_ITERATIONS * 0.025)
-    hi = int(BOOTSTRAP_ITERATIONS * 0.975)
-    ci = (boot_diffs[hi] - boot_diffs[lo]) / 2
-    pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
-    ci_pct = (ci / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
-    return {
-        "baseline": baseline_value,
-        "feature": feature_value,
-        "diff": round(diff, 6),
-        "pct": round(pct, 4),
-        "ci": round(ci, 6),
-        "ci_pct": round(ci_pct, 4),
-        "sig": significance(pct, ci_pct, lower_is_better=target == "decrease"),
-        "method": "abba-paired-interval-bootstrap" if len(baseline_runs) > 1 else "single-run-interval-bootstrap",
-    }
+    return compute_paired_target_metric_change(
+        baseline_runs,
+        feature_runs,
+        query,
+        target,
+        stat_name,
+        "paired-counter-interval-bootstrap",
+    )
 
 
 def compute_histogram_target_metric_change(
@@ -950,64 +1047,14 @@ def compute_histogram_target_metric_change(
     target: str,
     stat_name: str,
 ) -> dict:
-    baseline_value = sum(run["value"] for run in baseline_runs) / len(baseline_runs)
-    feature_value = sum(run["value"] for run in feature_runs) / len(feature_runs)
-    diff = feature_value - baseline_value
-
-    if len(baseline_runs) > 1 and len(feature_runs) > 1:
-        pair_diffs = [
-            feature_run["value"] - baseline_run["value"]
-            for baseline_run, feature_run in zip(baseline_runs, feature_runs)
-        ]
-        pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
-        consistent, reason = two_pair_abba_consistency(
-            pair_diffs, pct, abs(diff), TWO_PAIR_ABBA_HISTOGRAM_MIN_ABS_DIFF
-        )
-        result = {
-            "baseline": baseline_value,
-            "feature": feature_value,
-            "diff": round(diff, 6),
-            "pct": round(pct, 4),
-            "ci": 0.0,
-            "ci_pct": 0.0,
-            "sig": significance(pct, 0.0, lower_is_better=target == "decrease") if consistent else "neutral",
-            "method": "abba-two-pair-consistency",
-        }
-        if not consistent and reason:
-            result["significance_reason"] = reason
-        return result
-
-    rng = random.Random(f"{query}:{stat_name}")
-    boot_diffs = []
-    for _ in range(BOOTSTRAP_ITERATIONS):
-        pair_diffs = []
-        for baseline_run, feature_run in zip(baseline_runs, feature_runs):
-            baseline_sample = rng.choices(baseline_run["_values"], k=len(baseline_run["_values"]))
-            feature_sample = rng.choices(feature_run["_values"], k=len(feature_run["_values"]))
-            pair_diffs.append(
-                (sum(feature_sample) / len(feature_sample))
-                - (sum(baseline_sample) / len(baseline_sample))
-            )
-        boot_diffs.append(sum(pair_diffs) / len(pair_diffs))
-
-    boot_diffs.sort()
-    lo = int(BOOTSTRAP_ITERATIONS * 0.025)
-    hi = int(BOOTSTRAP_ITERATIONS * 0.975)
-    ci = (boot_diffs[hi] - boot_diffs[lo]) / 2
-    pct = (diff / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
-    ci_pct = (ci / baseline_value * 100.0) if abs(baseline_value) > EPSILON else 0.0
-    return {
-        "baseline": baseline_value,
-        "feature": feature_value,
-        "diff": round(diff, 6),
-        "pct": round(pct, 4),
-        "ci": round(ci, 6),
-        "ci_pct": round(ci_pct, 4),
-        "sig": significance(pct, ci_pct, lower_is_better=target == "decrease"),
-        "method": "abba-paired-scrape-bootstrap"
-        if len(baseline_runs) > 1
-        else "single-run-scrape-bootstrap",
-    }
+    return compute_paired_target_metric_change(
+        baseline_runs,
+        feature_runs,
+        query,
+        target,
+        stat_name,
+        "paired-scrape-bootstrap",
+    )
 
 
 def summarize_target_metric_change(changes: dict[str, dict], display_stats: tuple[str, ...]) -> dict:
@@ -1162,9 +1209,9 @@ def compute_target_metric_summary(
         for identity_key, identity_labels in sorted(identities.items()):
             baseline_values = []
             feature_values = []
-            baseline_runs_for_stats = {stat_name: [] for stat_name in histogram_stats}
-            feature_runs_for_stats = {stat_name: [] for stat_name in histogram_stats}
             display_query = format_target_metric_identity(query, identity_labels)
+            baseline_run_metrics = []
+            feature_run_metrics = []
 
             for run_label, run_data in baseline_runs:
                 if identity_key not in run_data["histograms"][query]:
@@ -1172,12 +1219,7 @@ def compute_target_metric_summary(
                         f"Missing target metric '{display_query}' in baseline run '{run_label}'"
                     )
                 run_metric = run_data["histograms"][query][identity_key]
-                run_values = {"run": run_label}
-                for stat_name in histogram_stats:
-                    run_quantile = run_metric["quantiles"][stat_name]
-                    baseline_runs_for_stats[stat_name].append(run_quantile)
-                    run_values[stat_name] = float(run_quantile["value"])
-                baseline_values.append(run_values)
+                baseline_run_metrics.append((run_label, run_metric))
 
             for run_label, run_data in feature_runs:
                 if identity_key not in run_data["histograms"][query]:
@@ -1185,11 +1227,32 @@ def compute_target_metric_summary(
                         f"Missing target metric '{display_query}' in feature run '{run_label}'"
                     )
                 run_metric = run_data["histograms"][query][identity_key]
+                feature_run_metrics.append((run_label, run_metric))
+
+            display_stats = histogram_stats
+            if all(
+                "mean" in run_metric
+                for _run_label, run_metric in baseline_run_metrics + feature_run_metrics
+            ):
+                display_stats = ("mean", *histogram_stats)
+
+            baseline_runs_for_stats = {stat_name: [] for stat_name in display_stats}
+            feature_runs_for_stats = {stat_name: [] for stat_name in display_stats}
+
+            for run_label, run_metric in baseline_run_metrics:
                 run_values = {"run": run_label}
-                for stat_name in histogram_stats:
-                    run_quantile = run_metric["quantiles"][stat_name]
-                    feature_runs_for_stats[stat_name].append(run_quantile)
-                    run_values[stat_name] = float(run_quantile["value"])
+                for stat_name in display_stats:
+                    run_stat = run_metric["mean"] if stat_name == "mean" else run_metric["quantiles"][stat_name]
+                    baseline_runs_for_stats[stat_name].append(run_stat)
+                    run_values[stat_name] = float(run_stat["value"])
+                baseline_values.append(run_values)
+
+            for run_label, run_metric in feature_run_metrics:
+                run_values = {"run": run_label}
+                for stat_name in display_stats:
+                    run_stat = run_metric["mean"] if stat_name == "mean" else run_metric["quantiles"][stat_name]
+                    feature_runs_for_stats[stat_name].append(run_stat)
+                    run_values[stat_name] = float(run_stat["value"])
                 feature_values.append(run_values)
 
             changes = {
@@ -1200,9 +1263,9 @@ def compute_target_metric_summary(
                     target,
                     stat_name,
                 )
-                for stat_name in histogram_stats
+                for stat_name in display_stats
             }
-            change = summarize_target_metric_change(changes, histogram_stats)
+            change = summarize_target_metric_change(changes, display_stats)
 
             entry = {
                 "kind": "histogram",
@@ -1211,9 +1274,9 @@ def compute_target_metric_summary(
                 "configured_query": query,
                 "identity_labels": identity_labels,
                 "target": target,
-                "display_stats": list(histogram_stats),
-                "baseline": summarize_target_metric_runs(baseline_values, histogram_stats),
-                "feature": summarize_target_metric_runs(feature_values, histogram_stats),
+                "display_stats": list(display_stats),
+                "baseline": summarize_target_metric_runs(baseline_values, display_stats),
+                "feature": summarize_target_metric_runs(feature_values, display_stats),
                 "changes": changes,
                 "change": change,
             }
@@ -1224,7 +1287,7 @@ def compute_target_metric_summary(
                         "feature_run": feature_item["run"],
                         **{
                             f"{stat_name}_diff": feature_item[stat_name] - baseline_item[stat_name]
-                            for stat_name in histogram_stats
+                            for stat_name in display_stats
                         },
                     }
                     for baseline_item, feature_item in zip(baseline_values, feature_values)
@@ -1238,10 +1301,11 @@ def compute_target_metric_summary(
         "normalization": {
             "block_height_query": TARGET_METRIC_BLOCK_HEIGHT_QUERY,
             "scrape_file": "target-metrics-scrapes.jsonl",
-            "counters": "counter delta / canonical chain-height delta between adjacent scrapes",
-            "histograms": "plain mean of recorded quantile samples inside each benchmark window",
+            "counters": "counter delta / canonical chain-height delta between adjacent scrapes, paired by canonical block height",
+            "histograms": "sum/count deltas for mean and recorded quantile samples for p50/p90/p99, paired by canonical block height",
             "cardinality": "unhandled label sets become separate target metrics after stripping query filters and known labels such as quantile/run_type",
-            "abba_significance": f"with 2 ABBA pairs it only reports changes when both pairs move in the same direction, the smaller pair effect is at least {TWO_PAIR_ABBA_MIN_PAIR_RATIO:.0%} of the larger one, the change is at least {TWO_PAIR_ABBA_MIN_PCT:.0f}%, and histogram rows also exceed {TWO_PAIR_ABBA_HISTOGRAM_MIN_ABS_DIFF:g} absolute change",
+            "significance": "paired bootstrap over block-height-matched target metric observations; ABBA runs are pooled as additional paired observations",
+            "min_paired_observations": TARGET_METRIC_MIN_PAIRED_OBSERVATIONS,
         },
         "abba": len(baseline_csv_paths) > 1 and len(feature_csv_paths) > 1,
         "metrics": metrics,
@@ -1379,11 +1443,11 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     lines.append("")
     if any(metric["kind"] == "counter" for metric in changed):
         lines.append(
-            "*Counter values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes inside each benchmark window.*"
+            "*Counter values are adjacent counter deltas divided by the canonical chain-height delta between adjacent scrapes, paired by canonical block height for significance.*"
         )
     if any(metric["kind"] == "histogram" for metric in changed):
         lines.append(
-            "*Histogram rows report the plain mean of the recorded percentile samples inside each benchmark window. Significant changes use a paired bootstrap over those percentile scrape samples.*"
+            "*Histogram mean rows use `_sum`/`_count` deltas; percentile rows use recorded percentile samples. Significant changes pair observations by canonical block height and use a paired bootstrap.*"
         )
     if any(metric.get("identity_labels") for metric in changed):
         lines.append(
@@ -1392,7 +1456,7 @@ def generate_target_metric_table(target_metrics: dict | None) -> str:
     if target_metrics.get("abba"):
         lines.extend(
             [
-                "*ABBA target-metric checks require both matching run replicas (`baseline-1` vs `feature-1`, `baseline-2` vs `feature-2`) to move consistently before reporting significant percentile changes.*",
+                "*ABBA target-metric checks pool block-height-matched observations from matching run replicas (`baseline-1` vs `feature-1`, `baseline-2` vs `feature-2`) rather than applying a two-pair direction heuristic.*",
             ]
         )
     return "\n".join(lines)
