@@ -473,7 +473,7 @@ jobs:
           echo "BENCH_ID=${BENCH_ID}" >> "$GITHUB_ENV"
           echo "BENCH_REFERENCE_EPOCH=${BENCH_REFERENCE_EPOCH}" >> "$GITHUB_ENV"
 
-          LABELS_FILE="/tmp/bench-metrics-labels.json"
+          LABELS_FILE="$BENCH_WORK_DIR/bench-metrics-labels.json"
           echo '{}' > "$LABELS_FILE"
           echo "BENCH_LABELS_FILE=${LABELS_FILE}" >> "$GITHUB_ENV"
 
