@@ -499,13 +499,6 @@ def compute_changes(
     return changes
 
 
-def target_metric_name(query: str) -> str:
-    query = query.strip()
-    if query.startswith("sum(") and query.endswith(")"):
-        query = query[4:-1].strip()
-    return query
-
-
 def target_metric_identity_key(labels: dict[str, str]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(labels.items()))
 
@@ -525,10 +518,6 @@ def target_metric_display_query(query: str, identity_labels: dict[str, str] | No
     if identity_labels:
         display_labels.update(identity_labels)
     return re.sub(r"\s+", "", format_target_metric_query(metric_name, display_labels))
-
-
-def target_metric_label(query: str) -> str:
-    return target_metric_display_query(query)
 
 
 def group_query_samples_by_identity(samples: list[dict], query: str) -> tuple[str, dict]:
@@ -602,35 +591,24 @@ def load_target_metric_scrapes(path: str) -> list[dict]:
             if not isinstance(sample["name"], str) or not isinstance(sample["labels"], dict):
                 raise ValueError(f"Invalid target metric scrape record in {scrape_path}:{line_number}")
 
-            labels = dict(sorted(sample["labels"].items()))
-            normalized_sample = {
-                "name": sample["name"],
-                "labels": labels,
-                "value": float(sample["value"]),
-                "offset_ms": int(sample["offset_ms"]),
-                "unix_ms": int(sample["unix_ms"]),
-            }
+            unix_ms = int(sample["unix_ms"])
+            offset_ms = int(sample["offset_ms"])
 
-            scrape = scrapes_by_unix_ms.setdefault(
-                normalized_sample["unix_ms"],
-                {
-                    "timestamp_ms": normalized_sample["unix_ms"],
-                    "offset_ms": normalized_sample["offset_ms"],
-                    "samples": [],
-                },
-            )
-            if scrape["offset_ms"] != normalized_sample["offset_ms"]:
+            scrape = scrapes_by_unix_ms.setdefault(unix_ms, {"unix_ms": unix_ms, "_offset_ms": offset_ms, "samples": []})
+            if scrape["_offset_ms"] != offset_ms:
                 raise ValueError(
-                    f"Mismatched target metric sample offsets for scrape {normalized_sample['unix_ms']} in {scrape_path}"
+                    f"Mismatched target metric sample offsets for scrape {unix_ms} in {scrape_path}"
                 )
             scrape["samples"].append(
                 {
-                    "name": normalized_sample["name"],
-                    "labels": normalized_sample["labels"],
-                    "value": normalized_sample["value"],
+                    "name": sample["name"],
+                    "labels": dict(sorted(sample["labels"].items())),
+                    "value": float(sample["value"]),
                 }
             )
-    scrapes = sorted(scrapes_by_unix_ms.values(), key=lambda scrape: int(scrape["timestamp_ms"]))
+    scrapes = sorted(scrapes_by_unix_ms.values(), key=lambda scrape: int(scrape["unix_ms"]))
+    for scrape in scrapes:
+        del scrape["_offset_ms"]
     if not scrapes:
         raise ValueError(f"No target metric scrapes found in {scrape_path}")
     return scrapes
@@ -658,14 +636,6 @@ def counter_target_metric_stat_value(values: list[float], stat_name: str) -> flo
     if stat_name == "p99":
         return percentile(sorted(values), 99)
     raise ValueError(f"Unsupported target metric statistic: {stat_name}")
-
-
-def target_metric_observation_stats(observations: list[dict]) -> dict[str, float]:
-    return compute_target_metric_series_stats([observation["value"] for observation in observations])
-
-
-def target_metric_stat_value(values: list[float], stat_name: str) -> float:
-    return counter_target_metric_stat_value(values, stat_name)
 
 
 def paired_target_metric_observations(
@@ -699,8 +669,8 @@ def compute_paired_target_metric_change(
 
     baseline_values = [baseline for baseline, _feature in pairs]
     feature_values = [feature for _baseline, feature in pairs]
-    baseline_value = target_metric_stat_value(baseline_values, stat_name)
-    feature_value = target_metric_stat_value(feature_values, stat_name)
+    baseline_value = counter_target_metric_stat_value(baseline_values, stat_name)
+    feature_value = counter_target_metric_stat_value(feature_values, stat_name)
     diff = feature_value - baseline_value
 
     rng = random.Random(f"{query}:{stat_name}")
@@ -710,8 +680,8 @@ def compute_paired_target_metric_change(
         baseline_sample = [baseline for baseline, _feature in sample]
         feature_sample = [feature for _baseline, feature in sample]
         boot_diffs.append(
-            target_metric_stat_value(feature_sample, stat_name)
-            - target_metric_stat_value(baseline_sample, stat_name)
+            counter_target_metric_stat_value(feature_sample, stat_name)
+            - counter_target_metric_stat_value(baseline_sample, stat_name)
         )
 
     boot_diffs.sort()
@@ -799,7 +769,9 @@ def query_counter_target_metric_run(
                 f"Target metric '{display_query}' in run '{run_label}' had no positive block-height scrape intervals"
             )
 
-        stats = target_metric_observation_stats(interval_observations)
+        stats = compute_target_metric_series_stats(
+            [observation["value"] for observation in interval_observations]
+        )
         results[identity_key] = {
             "query": query,
             "display_query": display_query,
@@ -876,7 +848,9 @@ def query_histogram_target_metric_run(
         if not mean_observations:
             continue
 
-        stats = target_metric_observation_stats(mean_observations)
+        stats = compute_target_metric_series_stats(
+            [observation["value"] for observation in mean_observations]
+        )
         metrics_by_identity[identity_key] = {
             "query": histogram["query"],
             "display_query": display_query,
@@ -909,9 +883,8 @@ def query_target_metric_run(path: str, config: dict) -> tuple[str, dict[str, dic
     relevant_scrapes = [
         scrape
         for scrape in scrapes
-        if range_start_ms <= int(scrape["timestamp_ms"]) <= range_end_ms
+        if range_start_ms <= int(scrape["unix_ms"]) <= range_end_ms
     ]
-    relevant_scrapes.sort(key=lambda scrape: int(scrape["timestamp_ms"]))
     if len(relevant_scrapes) < 2:
         raise ValueError(
             f"Target metric scrapes for run '{run_label}' only had {len(relevant_scrapes)} samples inside the benchmark window"
@@ -970,6 +943,81 @@ def collect_query_metric_identities(
     return identities
 
 
+def target_metric_pair_rows(
+    baseline_values: list[dict],
+    feature_values: list[dict],
+    pair_stats: tuple[str, ...],
+    include_mean_values: bool,
+) -> list[dict] | None:
+    if len(baseline_values) <= 1 or len(feature_values) <= 1:
+        return None
+
+    rows = []
+    for baseline_item, feature_item in zip(baseline_values, feature_values):
+        row = {
+            "baseline_run": baseline_item["run"],
+            "feature_run": feature_item["run"],
+        }
+        if include_mean_values:
+            row["baseline_mean"] = baseline_item["mean"]
+            row["feature_mean"] = feature_item["mean"]
+        row.update(
+            {
+                f"{stat_name}_diff": feature_item[stat_name] - baseline_item[stat_name]
+                for stat_name in pair_stats
+            }
+        )
+        rows.append(row)
+    return rows
+
+
+def build_target_metric_entry(
+    kind: str,
+    configured_query: str,
+    display_query: str,
+    identity_labels: dict[str, str],
+    target: str,
+    display_stats: tuple[str, ...],
+    summary_fields: tuple[str, ...],
+    baseline_values: list[dict],
+    feature_values: list[dict],
+    baseline_runs_by_stat: dict[str, list[dict]],
+    feature_runs_by_stat: dict[str, list[dict]],
+    pair_stats: tuple[str, ...],
+    include_pair_mean_values: bool = False,
+) -> dict:
+    changes = {
+        stat_name: compute_paired_target_metric_change(
+            baseline_runs_by_stat[stat_name],
+            feature_runs_by_stat[stat_name],
+            display_query,
+            target,
+            stat_name,
+        )
+        for stat_name in display_stats
+    }
+    entry = {
+        "kind": kind,
+        "name": display_query,
+        "query": display_query,
+        "configured_query": configured_query,
+        "identity_labels": identity_labels,
+        "target": target,
+        "display_stats": list(display_stats),
+        "baseline": summarize_target_metric_runs(baseline_values, summary_fields),
+        "feature": summarize_target_metric_runs(feature_values, summary_fields),
+        "changes": changes,
+        "change": summarize_target_metric_change(changes, display_stats),
+    }
+
+    pairs = target_metric_pair_rows(
+        baseline_values, feature_values, pair_stats, include_pair_mean_values
+    )
+    if pairs:
+        entry["pairs"] = pairs
+    return entry
+
+
 def compute_target_metric_summary(
     config_path: str,
     baseline_csv_paths: list[str],
@@ -985,6 +1033,8 @@ def compute_target_metric_summary(
     for counter in config.get("counters", []):
         query = counter["query"]
         target = counter["target"]
+        display_stats = TARGET_METRIC_COUNTER_STATS
+        summary_fields = ("mean", "p50", "p90", "p99")
         identities = collect_query_metric_identities(
             baseline_runs + feature_runs, "counters", query
         )
@@ -1039,54 +1089,32 @@ def compute_target_metric_summary(
                     }
                 )
 
-            changes = {
-                stat_name: compute_paired_target_metric_change(
-                    baseline_runs_for_stats,
-                    feature_runs_for_stats,
-                    display_query,
-                    target,
-                    stat_name,
+            metrics.append(
+                build_target_metric_entry(
+                    kind="counter",
+                    configured_query=query,
+                    display_query=display_query,
+                    identity_labels=identity_labels,
+                    target=target,
+                    display_stats=display_stats,
+                    summary_fields=summary_fields,
+                    baseline_values=baseline_values,
+                    feature_values=feature_values,
+                    baseline_runs_by_stat={
+                        stat_name: baseline_runs_for_stats for stat_name in display_stats
+                    },
+                    feature_runs_by_stat={
+                        stat_name: feature_runs_for_stats for stat_name in display_stats
+                    },
+                    pair_stats=summary_fields,
+                    include_pair_mean_values=True,
                 )
-                for stat_name in TARGET_METRIC_COUNTER_STATS
-            }
-            change = summarize_target_metric_change(changes, TARGET_METRIC_COUNTER_STATS)
-
-            entry = {
-                "kind": "counter",
-                "name": target_metric_label(display_query),
-                "query": display_query,
-                "configured_query": query,
-                "identity_labels": identity_labels,
-                "target": target,
-                "display_stats": list(TARGET_METRIC_COUNTER_STATS),
-                "baseline": summarize_target_metric_runs(
-                    baseline_values, ("mean", "p50", "p90", "p99")
-                ),
-                "feature": summarize_target_metric_runs(
-                    feature_values, ("mean", "p50", "p90", "p99")
-                ),
-                "changes": changes,
-                "change": change,
-            }
-            if len(baseline_values) > 1 and len(feature_values) > 1:
-                entry["pairs"] = [
-                    {
-                        "baseline_run": baseline_item["run"],
-                        "feature_run": feature_item["run"],
-                        "baseline_mean": baseline_item["mean"],
-                        "feature_mean": feature_item["mean"],
-                        "mean_diff": feature_item["mean"] - baseline_item["mean"],
-                        "p50_diff": feature_item["p50"] - baseline_item["p50"],
-                        "p90_diff": feature_item["p90"] - baseline_item["p90"],
-                        "p99_diff": feature_item["p99"] - baseline_item["p99"],
-                    }
-                    for baseline_item, feature_item in zip(baseline_values, feature_values)
-                ]
-            metrics.append(entry)
+            )
 
     for histogram in config.get("histograms", []):
         query = histogram["query"]
         target = histogram["target"]
+        display_stats = ("mean",)
         identities = collect_query_metric_identities(
             baseline_runs + feature_runs, "histograms", query
         )
@@ -1111,8 +1139,6 @@ def compute_target_metric_summary(
                 run_metric = run_data["histograms"][query][identity_key]
                 feature_run_metrics.append((run_label, run_metric))
 
-            display_stats = ("mean",)
-
             baseline_runs_for_stats = {stat_name: [] for stat_name in display_stats}
             feature_runs_for_stats = {stat_name: [] for stat_name in display_stats}
 
@@ -1132,44 +1158,22 @@ def compute_target_metric_summary(
                     run_values[stat_name] = float(run_stat["value"])
                 feature_values.append(run_values)
 
-            changes = {
-                stat_name: compute_paired_target_metric_change(
-                    baseline_runs_for_stats[stat_name],
-                    feature_runs_for_stats[stat_name],
-                    display_query,
-                    target,
-                    stat_name,
+            metrics.append(
+                build_target_metric_entry(
+                    kind="histogram",
+                    configured_query=query,
+                    display_query=display_query,
+                    identity_labels=identity_labels,
+                    target=target,
+                    display_stats=display_stats,
+                    summary_fields=display_stats,
+                    baseline_values=baseline_values,
+                    feature_values=feature_values,
+                    baseline_runs_by_stat=baseline_runs_for_stats,
+                    feature_runs_by_stat=feature_runs_for_stats,
+                    pair_stats=display_stats,
                 )
-                for stat_name in display_stats
-            }
-            change = summarize_target_metric_change(changes, display_stats)
-
-            entry = {
-                "kind": "histogram",
-                "name": target_metric_label(display_query),
-                "query": display_query,
-                "configured_query": query,
-                "identity_labels": identity_labels,
-                "target": target,
-                "display_stats": list(display_stats),
-                "baseline": summarize_target_metric_runs(baseline_values, display_stats),
-                "feature": summarize_target_metric_runs(feature_values, display_stats),
-                "changes": changes,
-                "change": change,
-            }
-            if len(baseline_values) > 1 and len(feature_values) > 1:
-                entry["pairs"] = [
-                    {
-                        "baseline_run": baseline_item["run"],
-                        "feature_run": feature_item["run"],
-                        **{
-                            f"{stat_name}_diff": feature_item[stat_name] - baseline_item[stat_name]
-                            for stat_name in display_stats
-                        },
-                    }
-                    for baseline_item, feature_item in zip(baseline_values, feature_values)
-                ]
-            metrics.append(entry)
+            )
 
     changed = [metric for metric in metrics if metric["change"]["significant_stats"]]
     return {

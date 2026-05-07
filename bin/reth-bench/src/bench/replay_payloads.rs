@@ -5,7 +5,7 @@ use crate::{
     bench::{
         generate_big_block::{compute_payload_block_hash, BigBlockPayload},
         helpers::parse_duration,
-        metrics_scraper::{MetricsScraper, DEFAULT_SCRAPE_INTERVAL_MS, METRICS_OUTPUT_SUFFIX},
+        metrics_scraper::MetricsScraper,
         output::{
             write_benchmark_results, CombinedResult, NewPayloadResult, TotalGasOutput, TotalGasRow,
         },
@@ -26,7 +26,7 @@ use eyre::Context;
 use reth_cli_runner::CliContext;
 use reth_engine_primitives::BigBlockData;
 use reth_node_api::EngineApiMessageVersion;
-use reth_node_core::args::WaitForPersistence;
+use reth_node_core::args::{WaitForPersistence, DEFAULT_METRICS_SCRAPE_INTERVAL_MS};
 use reth_rpc_api::RethNewPayloadInput;
 use std::{
     path::PathBuf,
@@ -142,7 +142,7 @@ pub struct Command {
     #[arg(
         long = "scrape-interval-ms",
         value_name = "MILLISECONDS",
-        default_value_t = DEFAULT_SCRAPE_INTERVAL_MS,
+        default_value_t = DEFAULT_METRICS_SCRAPE_INTERVAL_MS,
         requires = "metrics_url",
         verbatim_doc_comment
     )]
@@ -179,14 +179,11 @@ impl Command {
             }
         }
 
-        let metrics_output = self
-            .metrics_output
-            .clone()
-            .or_else(|| self.output.as_ref().map(|path| path.join(METRICS_OUTPUT_SUFFIX)));
-        let metrics_scraper = MetricsScraper::maybe_new(
+        let metrics_scraper = MetricsScraper::maybe_new_with_output_dir(
             self.metrics_url.clone(),
-            metrics_output,
-            Duration::from_millis(self.scrape_interval_ms),
+            self.metrics_output.clone(),
+            self.output.as_deref(),
+            self.scrape_interval_ms,
         )?;
 
         // Set up authenticated engine provider

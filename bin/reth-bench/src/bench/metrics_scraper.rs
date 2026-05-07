@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -21,9 +21,6 @@ use tracing::{info, warn};
 
 /// Suffix for the metrics JSONL output file.
 pub(crate) const METRICS_OUTPUT_SUFFIX: &str = "metrics.jsonl";
-
-/// Default metrics scrape interval in milliseconds, matching txgen.
-pub(crate) const DEFAULT_SCRAPE_INTERVAL_MS: u64 = 500;
 
 /// A single scraped Prometheus metric sample.
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +57,19 @@ pub(crate) struct MetricsScraper {
 }
 
 impl MetricsScraper {
+    /// Creates a new scraper, deriving the output path from `output_dir` when no explicit metrics
+    /// output was provided.
+    pub(crate) fn maybe_new_with_output_dir(
+        url: Option<String>,
+        metrics_output: Option<PathBuf>,
+        output_dir: Option<&Path>,
+        scrape_interval_ms: u64,
+    ) -> eyre::Result<Option<Self>> {
+        let output_path =
+            metrics_output.or_else(|| output_dir.map(|path| path.join(METRICS_OUTPUT_SUFFIX)));
+        Self::maybe_new(url, output_path, Duration::from_millis(scrape_interval_ms))
+    }
+
     /// Creates a new scraper if a URL is provided.
     pub(crate) fn maybe_new(
         url: Option<String>,

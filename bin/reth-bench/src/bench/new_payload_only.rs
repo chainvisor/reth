@@ -4,7 +4,7 @@ use crate::{
     bench::{
         context::BenchContext,
         helpers::fetch_block_access_list,
-        metrics_scraper::{MetricsScraper, METRICS_OUTPUT_SUFFIX},
+        metrics_scraper::MetricsScraper,
         output::{
             NewPayloadResult, TotalGasOutput, TotalGasRow, GAS_OUTPUT_SUFFIX,
             NEW_PAYLOAD_OUTPUT_SUFFIX,
@@ -59,13 +59,11 @@ impl Command {
 
         let total_blocks = benchmark_mode.total_blocks();
 
-        let metrics_output = self.benchmark.metrics_output.clone().or_else(|| {
-            self.benchmark.output.as_ref().map(|path| path.join(METRICS_OUTPUT_SUFFIX))
-        });
-        let metrics_scraper = MetricsScraper::maybe_new(
+        let metrics_scraper = MetricsScraper::maybe_new_with_output_dir(
             self.benchmark.metrics_url.clone(),
-            metrics_output,
-            Duration::from_millis(self.benchmark.scrape_interval_ms),
+            self.benchmark.metrics_output.clone(),
+            self.benchmark.output.as_deref(),
+            self.benchmark.scrape_interval_ms,
         )?;
 
         if use_reth_namespace {

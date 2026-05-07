@@ -86,7 +86,7 @@ module.exports = async function ({ core, context, chartSha, grafanaUrl, runId })
     for (const metric of changedTargetMetrics) {
       for (const statName of metric.display_stats || []) {
         const change = metric.changes?.[statName];
-        if (!change) continue;
+        if (!change || change.sig === 'neutral') continue;
         md += `| \`${metric.name} ${statName}\` | ${fmtMetricValue(change.baseline)} | ${fmtMetricValue(change.feature)} | ${fmtChange(change)} |\n`;
       }
     }
