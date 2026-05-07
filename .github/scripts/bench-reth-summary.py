@@ -1194,6 +1194,8 @@ def generate_comparison_table(
     warmup_blocks: str | None = None,
     wait_time: str | None = None,
     bal_mode: str | None = None,
+    driver: str | None = None,
+    driver_reason: str | None = None,
 ) -> str:
     """Generate a markdown comparison table between baseline and feature."""
     n = paired["blocks"]
@@ -1240,6 +1242,11 @@ def generate_comparison_table(
         "",
     ]
     meta_parts = [f"{n} {'big blocks' if big_blocks else 'blocks'}"]
+    if driver:
+        driver_label = driver
+        if driver_reason:
+            driver_label += f" (fallback: {driver_reason})"
+        meta_parts.append(f"driver: {driver_label}")
     if warmup_blocks:
         meta_parts.append(f"{warmup_blocks} warmup")
     if wait_time:
@@ -1370,6 +1377,8 @@ def main():
     parser.add_argument("--warmup-blocks", default=None, help="Number of warmup blocks")
     parser.add_argument("--wait-time", default=None, help="Wait time interval used between blocks")
     parser.add_argument("--bal-mode", default=None, help="BAL mode (true, feature, baseline)")
+    parser.add_argument("--driver", default=None, help="Benchmark driver used for this run")
+    parser.add_argument("--driver-reason", default=None, help="Why the benchmark fell back to this driver")
     parser.add_argument("--grafana-url", default=None, help="Grafana dashboard URL for this benchmark run")
     parser.add_argument("--target-metrics-config", default=None, help="Target metrics config path")
     args = parser.parse_args()
@@ -1425,6 +1434,8 @@ def main():
         warmup_blocks=args.warmup_blocks,
         wait_time=args.wait_time,
         bal_mode=bal_mode,
+        driver=args.driver,
+        driver_reason=args.driver_reason,
     )
     print(f"Generated comparison ({paired_stats['n']} paired blocks, "
           f"mean diff {paired_stats['mean_diff_ms']:+.3f}ms ± {paired_stats['ci_ms']:.3f}ms)")
@@ -1465,6 +1476,8 @@ def main():
 
     summary = {
         "blocks": paired_stats["blocks"],
+        "driver": args.driver,
+        "driver_reason": args.driver_reason,
         "big_blocks": args.big_blocks,
         "warmup_blocks": args.warmup_blocks,
         "wait_time": args.wait_time,
