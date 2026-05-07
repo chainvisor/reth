@@ -38,14 +38,18 @@
 //! [`FullConsensus::validate_block_post_execution`]: reth_consensus::FullConsensus::validate_block_post_execution
 //! [`SealedBlock`]: reth_primitives_traits::SealedBlock
 
-use crate::tree::{
-    error::{InsertBlockError, InsertBlockErrorKind, InsertPayloadError},
-    instrumented_state::{InstrumentedStateProvider, StateProviderStats},
-    multiproof::{StateRootComputeOutcome, StateRootHandle},
-    payload_processor::PayloadProcessor,
-    precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
-    CacheWaitDurations, CachedStateProvider, EngineApiMetrics, EngineApiTreeState, ExecutionEnv,
-    PayloadHandle, StateProviderBuilder, StateProviderDatabase, TreeConfig, WaitForCaches,
+use crate::{
+    persistence::{RemoveBlocksHook, SaveBlocksHook},
+    tree::{
+        error::{InsertBlockError, InsertBlockErrorKind, InsertPayloadError},
+        instrumented_state::{InstrumentedStateProvider, StateProviderStats},
+        multiproof::{StateRootComputeOutcome, StateRootHandle},
+        payload_processor::PayloadProcessor,
+        precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
+        CacheWaitDurations, CachedStateProvider, EngineApiMetrics, EngineApiTreeState,
+        ExecutionEnv, PayloadHandle, StateProviderBuilder, StateProviderDatabase, TreeConfig,
+        WaitForCaches,
+    },
 };
 use alloy_consensus::transaction::{Either, TxHashRef};
 use alloy_eip7928::{
@@ -110,6 +114,20 @@ pub type ValidationOutcome<N, E = InsertPayloadError<BlockTy<N>>> =
 
 /// Handle to a [`HashedPostState`] computed on a background thread.
 type LazyHashedPostState = reth_tasks::LazyHandle<HashedPostState>;
+
+/// Adapter for replacing state provider behavior in custom chain validators.
+type StateProviderTransform = Arc<dyn Fn(StateProviderBox) -> StateProviderBox + Send + Sync>;
+
+fn apply_state_provider_transform(
+    transform: Option<&StateProviderTransform>,
+    provider: StateProviderBox,
+) -> StateProviderBox {
+    if let Some(transform) = transform {
+        transform(provider)
+    } else {
+        provider
+    }
+}
 
 /// Result type for block validation with optional timing stats.
 type InsertPayloadResult<N> = Result<
@@ -201,6 +219,15 @@ where
     changeset_cache: ChangesetCache,
     /// Task runtime for spawning parallel work.
     runtime: reth_tasks::Runtime,
+    /// Optional adapter used by custom chains to replace state-root computation.
+    #[debug(skip)]
+    state_provider_transform: Option<StateProviderTransform>,
+    /// Optional hook invoked before canonical block persistence is committed.
+    #[debug(skip)]
+    save_blocks_hook: Option<SaveBlocksHook<Evm::Primitives>>,
+    /// Optional hook invoked after canonical unwind persistence is committed.
+    #[debug(skip)]
+    remove_blocks_hook: Option<RemoveBlocksHook>,
 }
 
 impl<N, P, Evm, V> BasicEngineValidator<P, Evm, V>
@@ -256,7 +283,34 @@ where
             validator,
             changeset_cache,
             runtime,
+            state_provider_transform: None,
+            save_blocks_hook: None,
+            remove_blocks_hook: None,
         }
+    }
+
+    /// Sets a state-provider adapter and forces serial state-root computation through it.
+    pub fn with_state_provider_transform(
+        mut self,
+        transform: impl Fn(StateProviderBox) -> StateProviderBox + Send + Sync + 'static,
+    ) -> Self {
+        self.state_provider_transform = Some(Arc::new(transform));
+        self
+    }
+
+    fn transform_state_provider(&self, provider: StateProviderBox) -> StateProviderBox {
+        apply_state_provider_transform(self.state_provider_transform.as_ref(), provider)
+    }
+
+    /// Sets persistence hooks for a custom durable state store.
+    pub fn with_persistence_hooks(
+        mut self,
+        save_blocks_hook: Option<SaveBlocksHook<N>>,
+        remove_blocks_hook: Option<RemoveBlocksHook>,
+    ) -> Self {
+        self.save_blocks_hook = save_blocks_hook;
+        self.remove_blocks_hook = remove_blocks_hook;
+        self
     }
 
     /// Converts a [`BlockOrPayload`] to a recovered block.
@@ -775,7 +829,7 @@ where
             let (root, updates) = ensure_ok_post_block!(
                 provider_builder
                     .build()
-                    .and_then(|provider| Self::compute_state_root_serial(provider, &hashed_state)),
+                    .and_then(|provider| self.compute_state_root_serial(provider, &hashed_state)),
                 block
             );
 
@@ -1122,9 +1176,11 @@ where
     /// trie updates for this block directly via
     /// [`reth_provider::StateRootProvider::state_root_with_updates`].
     fn compute_state_root_serial(
+        &self,
         state_provider: StateProviderBox,
         hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
+        let state_provider = self.transform_state_provider(state_provider);
         state_provider.state_root_with_updates(hashed_state.get().clone())
     }
 
@@ -1176,9 +1232,14 @@ where
                     std::sync::mpsc::channel::<ProviderResult<(B256, TrieUpdates)>>();
 
                 let seq_hashed_state = hashed_state.clone();
+                let state_provider_transform = self.state_provider_transform.clone();
                 self.payload_processor.executor().spawn_blocking_named("serial-root", move || {
                     let result = state_provider_builder.build().and_then(|provider| {
-                        Self::compute_state_root_serial(provider, &seq_hashed_state)
+                        let provider = apply_state_provider_transform(
+                            state_provider_transform.as_ref(),
+                            provider,
+                        );
+                        provider.state_root_with_updates(seq_hashed_state.get().clone())
                     });
                     let _ = seq_tx.send(result);
                 });
@@ -1253,7 +1314,7 @@ where
 
         match state_provider_builder
             .build()
-            .and_then(|provider| Self::compute_state_root_serial(provider, hashed_state))
+            .and_then(|provider| self.compute_state_root_serial(provider, hashed_state))
         {
             Ok((serial_root, serial_trie_updates)) => {
                 debug!(
@@ -1530,8 +1591,8 @@ where
     ///
     /// Note: Use state root task only if prefix sets are empty, otherwise proof generation is
     /// too expensive because it requires walking all paths in every proof.
-    const fn plan_state_root_computation(&self) -> StateRootStrategy {
-        if self.config.state_root_fallback() {
+    fn plan_state_root_computation(&self) -> StateRootStrategy {
+        if self.state_provider_transform.is_some() || self.config.state_root_fallback() {
             StateRootStrategy::Synchronous
         } else if self.config.use_state_root_task() {
             StateRootStrategy::StateRootTask
@@ -1952,6 +2013,16 @@ pub trait EngineValidator<
         parent_state_root: B256,
         state: &EngineApiTreeState<N>,
     ) -> Option<StateRootHandle>;
+
+    /// Hook invoked before a canonical block save is committed to the built-in stores.
+    fn persistence_save_blocks_hook(&self) -> Option<SaveBlocksHook<N>> {
+        None
+    }
+
+    /// Hook invoked after a canonical unwind is committed to the built-in stores.
+    fn persistence_remove_blocks_hook(&self) -> Option<RemoveBlocksHook> {
+        None
+    }
 }
 
 impl<N, Types, P, Evm, V> EngineValidator<Types> for BasicEngineValidator<P, Evm, V>
@@ -2062,6 +2133,14 @@ where
             false,
             &self.config,
         ))
+    }
+
+    fn persistence_save_blocks_hook(&self) -> Option<SaveBlocksHook<N>> {
+        self.save_blocks_hook.clone()
+    }
+
+    fn persistence_remove_blocks_hook(&self) -> Option<RemoveBlocksHook> {
+        self.remove_blocks_hook.clone()
     }
 }
 
