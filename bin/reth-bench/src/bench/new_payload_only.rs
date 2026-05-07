@@ -62,8 +62,11 @@ impl Command {
         let metrics_output = self.benchmark.metrics_output.clone().or_else(|| {
             self.benchmark.output.as_ref().map(|path| path.join(METRICS_OUTPUT_SUFFIX))
         });
-        let metrics_scraper =
-            MetricsScraper::maybe_new(self.benchmark.metrics_url.clone(), metrics_output)?;
+        let metrics_scraper = MetricsScraper::maybe_new(
+            self.benchmark.metrics_url.clone(),
+            metrics_output,
+            Duration::from_millis(self.benchmark.scrape_interval_ms),
+        )?;
 
         if use_reth_namespace {
             info!("Using reth_newPayload endpoint");
@@ -183,12 +186,6 @@ impl Command {
             let row =
                 TotalGasRow { block_number, transaction_count, gas_used, time: current_duration };
             results.push((row, new_payload_result));
-
-            if let Some(scraper) = metrics_scraper.as_ref() &&
-                let Err(err) = scraper.scrape_after_block().await
-            {
-                tracing::warn!(target: "reth-bench", %err, block_number, "Failed to scrape metrics");
-            }
         }
 
         // Check if the spawned task encountered an error

@@ -5,7 +5,7 @@ use crate::{
     bench::{
         generate_big_block::{compute_payload_block_hash, BigBlockPayload},
         helpers::parse_duration,
-        metrics_scraper::{MetricsScraper, METRICS_OUTPUT_SUFFIX},
+        metrics_scraper::{MetricsScraper, DEFAULT_SCRAPE_INTERVAL_MS, METRICS_OUTPUT_SUFFIX},
         output::{
             write_benchmark_results, CombinedResult, NewPayloadResult, TotalGasOutput, TotalGasRow,
         },
@@ -117,15 +117,15 @@ pub struct Command {
     #[arg(long, default_value = "false", verbatim_doc_comment, requires = "reth_new_payload")]
     no_wait_for_caches: bool,
 
-    /// Optional Prometheus metrics endpoint to scrape after each block.
+    /// Optional Prometheus metrics endpoint to scrape on a fixed interval.
     ///
-    /// When provided, reth-bench will fetch metrics from this URL after each
-    /// payload. Results are written as JSONL records containing the block
-    /// number, scrape timestamp, and raw metrics.
+    /// When provided, reth-bench will periodically fetch metrics from this URL.
+    /// Results are written as JSONL records containing the metric name, labels,
+    /// value, offset timestamp, and Unix timestamp.
     #[arg(long = "metrics-url", value_name = "URL", verbatim_doc_comment)]
     metrics_url: Option<String>,
 
-    /// Path to write per-block Prometheus metrics scrapes as JSONL.
+    /// Path to write interval-based Prometheus metrics scrapes as JSONL.
     ///
     /// If omitted, `--metrics-url` writes `metrics.jsonl` inside `--output`.
     #[arg(
@@ -135,6 +135,18 @@ pub struct Command {
         verbatim_doc_comment
     )]
     metrics_output: Option<PathBuf>,
+
+    /// Prometheus metrics scrape interval in milliseconds.
+    ///
+    /// Matches txgen's default interval.
+    #[arg(
+        long = "scrape-interval-ms",
+        value_name = "MILLISECONDS",
+        default_value_t = DEFAULT_SCRAPE_INTERVAL_MS,
+        requires = "metrics_url",
+        verbatim_doc_comment
+    )]
+    scrape_interval_ms: u64,
 }
 
 /// A loaded payload ready for execution.
@@ -171,7 +183,11 @@ impl Command {
             .metrics_output
             .clone()
             .or_else(|| self.output.as_ref().map(|path| path.join(METRICS_OUTPUT_SUFFIX)));
-        let metrics_scraper = MetricsScraper::maybe_new(self.metrics_url.clone(), metrics_output)?;
+        let metrics_scraper = MetricsScraper::maybe_new(
+            self.metrics_url.clone(),
+            metrics_output,
+            Duration::from_millis(self.scrape_interval_ms),
+        )?;
 
         // Set up authenticated engine provider
         let jwt =
@@ -387,12 +403,6 @@ impl Command {
             let current_duration = total_benchmark_duration.elapsed();
             let progress = format!("{}/{}", i + 1, payloads.len());
             info!(target: "reth-bench", progress, %combined_result);
-
-            if let Some(scraper) = metrics_scraper.as_ref() &&
-                let Err(err) = scraper.scrape_after_block().await
-            {
-                warn!(target: "reth-bench", %err, block_number, "Failed to scrape metrics");
-            }
 
             if let Some(wait_time) = self.wait_time {
                 let remaining = wait_time.saturating_sub(start.elapsed());

@@ -10,7 +10,8 @@
 # Optional env: BENCH_WORK_DIR, BENCH_WAIT_TIME, BENCH_BASELINE_ARGS,
 #               BENCH_FEATURE_ARGS, BENCH_OTLP_TRACES_ENDPOINT,
 #               BENCH_OTLP_LOGS_ENDPOINT, BENCH_OTLP_DISABLED,
-#               BENCH_TRACY, BENCH_TRACY_FILTER, BENCH_TRACY_SAMPLING_HZ
+#               BENCH_TRACY, BENCH_TRACY_FILTER, BENCH_TRACY_SAMPLING_HZ,
+#               BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS (default 500)
 set -euxo pipefail
 
 LABEL="$1"
@@ -22,6 +23,7 @@ LOG="${OUTPUT_DIR}/node.log"
 TARGET_METRICS_RANGE="$OUTPUT_DIR/target-metrics-range.json"
 
 RETH_SCOPE="${RETH_SCOPE:-reth-bench.scope}"
+BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS="${BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS:-500}"
 
 capture_unix_time_ms() {
   python3 -c 'import time; print(time.time_ns() // 1_000_000)'
@@ -323,6 +325,7 @@ if [ -n "${BENCH_TARGET_METRICS_CONFIG:-}" ]; then
   TARGET_METRICS_START_MS="$(capture_unix_time_ms)"
   TXGEN_METRICS_ARGS=(
     --metrics-url "http://${BENCH_METRICS_ADDR}/"
+    --scrape-interval-ms "$BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS"
   )
 fi
 

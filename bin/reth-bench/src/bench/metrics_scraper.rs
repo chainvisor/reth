@@ -1,6 +1,6 @@
 //! Prometheus metrics scraper for reth-bench.
 //!
-//! Scrapes a node's Prometheus metrics endpoint after each block.
+//! Scrapes a node's Prometheus metrics endpoint on a fixed interval.
 
 use eyre::Context;
 use reqwest::Client;
@@ -10,11 +10,20 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{fs::File, io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
-use tracing::info;
+use tokio::{
+    fs::File,
+    io::AsyncWriteExt,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{interval, MissedTickBehavior},
+};
+use tracing::{info, warn};
 
 /// Suffix for the metrics JSONL output file.
 pub(crate) const METRICS_OUTPUT_SUFFIX: &str = "metrics.jsonl";
+
+/// Default metrics scrape interval in milliseconds, matching txgen.
+pub(crate) const DEFAULT_SCRAPE_INTERVAL_MS: u64 = 500;
 
 /// A single scraped Prometheus metric sample.
 #[derive(Debug, Clone, Serialize)]
@@ -42,16 +51,10 @@ pub(crate) struct MetricsScrape {
     pub(crate) unix_ms: u64,
 }
 
-/// Scrapes a Prometheus metrics endpoint after each block and writes JSONL records.
+/// Scrapes a Prometheus metrics endpoint on a fixed interval and writes JSONL records.
 pub(crate) struct MetricsScraper {
-    /// The full URL of the Prometheus metrics endpoint.
-    url: String,
-    /// Reusable HTTP client.
-    client: Client,
-    /// Sends raw scrapes to the background parser/writer task.
-    sender: mpsc::Sender<MetricsScrape>,
-    /// Monotonic start time for computing sample offsets.
-    started_at: Instant,
+    /// Background scraper task.
+    scraper_task: JoinHandle<()>,
     /// Background writer task.
     writer_task: JoinHandle<eyre::Result<()>>,
 }
@@ -61,10 +64,15 @@ impl MetricsScraper {
     pub(crate) fn maybe_new(
         url: Option<String>,
         output_path: Option<PathBuf>,
+        scrape_interval: Duration,
     ) -> eyre::Result<Option<Self>> {
         match (url, output_path) {
             (Some(url), Some(output_path)) => {
-                info!(target: "reth-bench", %url, path = %output_path.display(), "Prometheus metrics scraping enabled");
+                if scrape_interval.is_zero() {
+                    eyre::bail!("metrics scrape interval must be greater than zero")
+                }
+
+                info!(target: "reth-bench", %url, path = %output_path.display(), scrape_interval_ms = scrape_interval.as_millis(), "Prometheus metrics scraping enabled");
                 let client = Client::builder()
                     .timeout(Duration::from_secs(5))
                     .build()
@@ -87,7 +95,27 @@ impl MetricsScraper {
                     Ok(())
                 });
 
-                Ok(Some(Self { url, client, sender, started_at: Instant::now(), writer_task }))
+                let scraper_task = tokio::spawn(async move {
+                    let started_at = Instant::now();
+                    let mut ticker = interval(scrape_interval);
+                    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                    loop {
+                        ticker.tick().await;
+                        match scrape_once(&client, &url, started_at).await {
+                            Ok(scrape) => {
+                                if sender.send(scrape).await.is_err() {
+                                    return
+                                }
+                            }
+                            Err(err) => {
+                                warn!(target: "reth-bench", %err, "Failed to scrape metrics");
+                            }
+                        }
+                    }
+                });
+
+                Ok(Some(Self { scraper_task, writer_task }))
             }
             (Some(_), None) => eyre::bail!(
                 "--metrics-url requires --metrics-output or --output to choose a JSONL output path"
@@ -96,40 +124,44 @@ impl MetricsScraper {
         }
     }
 
-    /// Scrapes the metrics endpoint and queues samples for writing.
-    pub(crate) async fn scrape_after_block(&self) -> eyre::Result<()> {
-        let text = self
-            .client
-            .get(&self.url)
-            .send()
-            .await
-            .wrap_err("failed to fetch metrics endpoint")?
-            .error_for_status()
-            .wrap_err("metrics endpoint returned error status")?
-            .text()
-            .await
-            .wrap_err("failed to read metrics response body")?;
-
-        let unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .wrap_err("system time is before unix epoch")?
-            .as_millis() as u64;
-        let offset_ms = self.started_at.elapsed().as_millis() as u64;
-
-        let scrape = MetricsScrape { text, offset_ms, unix_ms };
-        self.sender.send(scrape).await.wrap_err("failed to queue metrics scrape for writing")?;
-
-        Ok(())
-    }
-
     /// Waits for the writer task to finish.
     pub(crate) async fn finish(self) -> eyre::Result<()> {
-        let Self { sender, writer_task, .. } = self;
+        let Self { scraper_task, writer_task } = self;
 
-        drop(sender);
+        scraper_task.abort();
+        if let Err(err) = scraper_task.await &&
+            !err.is_cancelled()
+        {
+            return Err(err).wrap_err("metrics scraper task failed")
+        }
         writer_task.await.wrap_err("metrics writer task failed")??;
         Ok(())
     }
+}
+
+async fn scrape_once(
+    client: &Client,
+    url: &str,
+    started_at: Instant,
+) -> eyre::Result<MetricsScrape> {
+    let text = client
+        .get(url)
+        .send()
+        .await
+        .wrap_err("failed to fetch metrics endpoint")?
+        .error_for_status()
+        .wrap_err("metrics endpoint returned error status")?
+        .text()
+        .await
+        .wrap_err("failed to read metrics response body")?;
+
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .wrap_err("system time is before unix epoch")?
+        .as_millis() as u64;
+    let offset_ms = started_at.elapsed().as_millis() as u64;
+
+    Ok(MetricsScrape { text, offset_ms, unix_ms })
 }
 
 fn parse_samples(text: &str, offset_ms: u64, unix_ms: u64) -> Vec<MetricsSample> {

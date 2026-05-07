@@ -3,6 +3,8 @@
 use clap::Args;
 use std::{path::PathBuf, str::FromStr};
 
+const DEFAULT_METRICS_SCRAPE_INTERVAL_MS: u64 = 500;
+
 /// Parameters for benchmark configuration
 #[derive(Debug, Args, PartialEq, Eq, Default, Clone)]
 #[command(next_help_heading = "Benchmark")]
@@ -69,17 +71,17 @@ pub struct BenchmarkArgs {
     #[arg(long, short, value_name = "BENCHMARK_OUTPUT", verbatim_doc_comment)]
     pub output: Option<PathBuf>,
 
-    /// Optional Prometheus metrics endpoint to scrape after each block.
+    /// Optional Prometheus metrics endpoint to scrape on a fixed interval.
     ///
-    /// When provided, reth-bench will fetch metrics from this URL after each
-    /// `newPayload` / `forkchoiceUpdated` call. Results are written as JSONL
-    /// records containing the block number, scrape timestamp, and raw metrics.
+    /// When provided, reth-bench will periodically fetch metrics from this URL.
+    /// Results are written as JSONL records containing the metric name, labels,
+    /// value, offset timestamp, and Unix timestamp.
     ///
     /// Example: `http://127.0.0.1:9001/metrics`
     #[arg(long = "metrics-url", value_name = "URL", verbatim_doc_comment)]
     pub metrics_url: Option<String>,
 
-    /// Path to write per-block Prometheus metrics scrapes as JSONL.
+    /// Path to write interval-based Prometheus metrics scrapes as JSONL.
     ///
     /// If omitted, `--metrics-url` writes `metrics.jsonl` inside `--output`.
     #[arg(
@@ -89,6 +91,18 @@ pub struct BenchmarkArgs {
         verbatim_doc_comment
     )]
     pub metrics_output: Option<PathBuf>,
+
+    /// Prometheus metrics scrape interval in milliseconds.
+    ///
+    /// Matches txgen's default interval.
+    #[arg(
+        long = "scrape-interval-ms",
+        value_name = "MILLISECONDS",
+        default_value_t = DEFAULT_METRICS_SCRAPE_INTERVAL_MS,
+        requires = "metrics_url",
+        verbatim_doc_comment
+    )]
+    pub scrape_interval_ms: u64,
 
     /// Number of retries for fetching blocks from `--rpc-url` after a failure.
     ///
