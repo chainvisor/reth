@@ -339,7 +339,8 @@ $BENCH_NICE "$TXGEN_BENCH" send-blocks \
 if [ -n "$TARGET_METRICS_START_MS" ]; then
   TARGET_METRICS_END_MS="$(capture_unix_time_ms)"
   record_target_metric_range "$TARGET_METRICS_START_MS" "$TARGET_METRICS_END_MS"
-  jq -c '.samples[]' "$OUTPUT_DIR/report.json" > "$OUTPUT_DIR/target-metrics-scrapes.jsonl"
+  jq -c '.samples[] | select(.name | startswith("txgen_") | not)' \
+    "$OUTPUT_DIR/report.json" > "$OUTPUT_DIR/target-metrics-scrapes.jsonl"
 fi
 
 python3 .github/scripts/bench-txgen-report-to-reth-csv.py "$OUTPUT_DIR/report.json" "$OUTPUT_DIR"
