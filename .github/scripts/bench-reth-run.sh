@@ -14,7 +14,7 @@
 #               BENCH_OTLP_TRACES_ENDPOINT (OTLP HTTP endpoint for traces, e.g. https://host/insert/opentelemetry/v1/traces)
 #               BENCH_OTLP_LOGS_ENDPOINT (OTLP HTTP endpoint for logs, e.g. https://host/insert/opentelemetry/v1/logs)
 #               BENCH_OTLP_DISABLED (true to skip OTLP export even if endpoints are set)
-#               BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS (default 500, matches txgen)
+#               BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS (default 200, matches txgen)
 set -euxo pipefail
 
 LABEL="$1"
@@ -30,7 +30,7 @@ LOG="${OUTPUT_DIR}/node.log"
 TARGET_METRICS_RANGE="$OUTPUT_DIR/target-metrics-range.json"
 
 RETH_SCOPE="${RETH_SCOPE:-reth-bench.scope}"
-BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS="${BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS:-500}"
+BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS="${BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS:-200}"
 
 capture_unix_time_ms() {
   python3 -c 'import time; print(time.time_ns() // 1_000_000)'

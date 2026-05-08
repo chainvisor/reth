@@ -3,8 +3,8 @@
 use clap::Args;
 use std::{path::PathBuf, str::FromStr};
 
-/// Default Prometheus metrics scrape interval in milliseconds, matching txgen.
-pub const DEFAULT_METRICS_SCRAPE_INTERVAL_MS: u64 = 500;
+/// Default Prometheus metrics scrape interval in milliseconds.
+pub const DEFAULT_METRICS_SCRAPE_INTERVAL_MS: u64 = 200;
 
 /// Parameters for benchmark configuration
 #[derive(Debug, Args, PartialEq, Eq, Default, Clone)]
@@ -95,7 +95,7 @@ pub struct BenchmarkArgs {
 
     /// Prometheus metrics scrape interval in milliseconds.
     ///
-    /// Matches txgen's default interval.
+    /// Matches the GitHub benchmark workflow default interval.
     #[arg(
         long = "scrape-interval-ms",
         value_name = "MILLISECONDS",
