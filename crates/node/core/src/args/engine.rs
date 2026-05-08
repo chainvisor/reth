@@ -459,6 +459,30 @@ pub struct EngineArgs {
     )]
     pub share_sparse_trie_with_payload_builder: bool,
 
+    /// chainvisor: force engine::tree to NEVER trigger the stages-based
+    /// pipeline backfill, regardless of how far behind canonical head the
+    /// local tip is. Every payload flows through the at-tip
+    /// `on_new_payload` path.
+    ///
+    /// Intended ONLY for chainvisor live readers, whose MDBX state is
+    /// populated by a trusted upstream writer's snapshots. The default
+    /// reth pipeline (Headers → Bodies → Execution → MerkleExecute → ...)
+    /// is the wrong path for them: cold-cache state-read amplification
+    /// makes Execution / MerkleExecute run at ~700 K gas/s vs the
+    /// 50+ Mgas/s a real-disk reth achieves, so the reader can never
+    /// catch up to chain tip. Forcing the at-tip path applies one block
+    /// at a time via `engine_newPayload` from the consensus client, which
+    /// stays well under the 12 s slot budget on warm cache.
+    ///
+    /// Equivalent to setting `TreeConfig::min_blocks_for_pipeline_run` to
+    /// `u64::MAX`.
+    ///
+    /// Do NOT use on a node that synced from genesis via P2P — there's
+    /// no other catchup path, and the engine API can't backfill arbitrary
+    /// historical blocks from the consensus client.
+    #[arg(long = "engine.reader-force-at-tip", default_value_t = false)]
+    pub reader_force_at_tip: bool,
+
     /// Add random jitter before each proof computation (trie-debug only).
     /// Each proof worker sleeps for a random duration up to this value before
     /// starting work. Useful for stress-testing timing-sensitive proof logic.
@@ -539,6 +563,7 @@ impl Default for EngineArgs {
                 .map(|s| humantime::parse_duration(s).expect("valid default duration")),
             share_execution_cache_with_payload_builder,
             share_sparse_trie_with_payload_builder,
+            reader_force_at_tip: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -588,7 +613,13 @@ impl EngineArgs {
             )
             .with_share_sparse_trie_with_payload_builder(
                 self.share_sparse_trie_with_payload_builder,
-            );
+            )
+            .with_min_blocks_for_pipeline_run(if self.reader_force_at_tip {
+                u64::MAX
+            } else {
+                // EPOCH_SLOTS = 32 (alloy-eips default; mirrors stock reth).
+                alloy_eips::merge::EPOCH_SLOTS
+            });
         #[cfg(feature = "trie-debug")]
         let config = config.with_proof_jitter(self.proof_jitter);
         config
@@ -649,6 +680,7 @@ mod tests {
             state_root_task_timeout: Some(Duration::from_secs(2)),
             share_execution_cache_with_payload_builder: false,
             share_sparse_trie_with_payload_builder: false,
+            reader_force_at_tip: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         };
