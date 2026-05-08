@@ -95,7 +95,7 @@ pub struct BenchmarkArgs {
 
     /// Prometheus metrics scrape interval in milliseconds.
     ///
-    /// Matches the GitHub benchmark workflow default interval.
+    /// Matches the `GitHub` benchmark workflow default interval.
     #[arg(
         long = "scrape-interval-ms",
         value_name = "MILLISECONDS",
@@ -281,6 +281,7 @@ mod tests {
         let default_args = BenchmarkArgs {
             engine_rpc_url: "http://localhost:8551".to_string(),
             local_rpc_url: "http://localhost:8545".to_string(),
+            scrape_interval_ms: DEFAULT_METRICS_SCRAPE_INTERVAL_MS,
             ..Default::default()
         };
         let args = CommandParser::<BenchmarkArgs>::parse_from(["reth-bench"]).args;
