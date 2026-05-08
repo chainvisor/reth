@@ -665,7 +665,17 @@ def compute_paired_target_metric_change(
 ) -> dict:
     pairs = paired_target_metric_observations(baseline_runs, feature_runs)
     if not pairs:
-        raise ValueError(f"Target metric '{query}' had no paired observations for {stat_name}")
+        return {
+            "baseline": None,
+            "feature": None,
+            "diff": 0.0,
+            "pct": 0.0,
+            "ci": 0.0,
+            "ci_pct": 0.0,
+            "sig": "neutral",
+            "paired_observations": 0,
+            "significance_reason": "requires paired observations",
+        }
 
     baseline_values = [baseline for baseline, _feature in pairs]
     feature_values = [feature for _baseline, feature in pairs]
