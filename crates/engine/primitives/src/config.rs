@@ -195,6 +195,21 @@ pub struct TreeConfig {
     /// When set, BAL storage slots are not read into the execution cache. BAL hashed-state
     /// streaming for parallel state-root computation is controlled separately.
     disable_bal_batch_io: bool,
+    /// Distance (in blocks) from the canonical tip to a forkchoice / payload
+    /// target above which the engine triggers a stages-based **pipeline
+    /// backfill** instead of applying the payload incrementally.
+    ///
+    /// Default is `EPOCH_SLOTS` (= 32), which matches stock reth: any gap
+    /// larger than 32 blocks routes through Headers → Bodies → Execution
+    /// → MerkleExecute → ... pipeline stages.
+    ///
+    /// chainvisor live readers set this to `u64::MAX` via
+    /// `--engine.reader-force-at-tip`, forcing every payload to flow
+    /// through the at-tip `on_new_payload` path regardless of the gap.
+    /// Their MDBX state is populated by a trusted upstream writer; the
+    /// pipeline's cold-cache state-read amplification (~700 K gas/s in
+    /// production) is the wrong path for them.
+    min_blocks_for_pipeline_run: u64,
     /// Maximum random jitter applied before each proof computation (trie-debug only).
     /// When set, each proof worker sleeps for a random duration up to this value
     /// before starting a proof calculation.
@@ -242,6 +257,7 @@ impl Default for TreeConfig {
             disable_bal_parallel_execution: true,
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
+            min_blocks_for_pipeline_run: EPOCH_SLOTS,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -319,6 +335,7 @@ impl TreeConfig {
             disable_bal_parallel_execution: true,
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
+            min_blocks_for_pipeline_run: EPOCH_SLOTS,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -327,6 +344,25 @@ impl TreeConfig {
     /// Return the persistence threshold.
     pub const fn persistence_threshold(&self) -> u64 {
         self.persistence_threshold
+    }
+
+    /// Return the configured threshold (in blocks) at which the engine
+    /// triggers a stages-based pipeline backfill instead of applying
+    /// payloads incrementally.
+    ///
+    /// `u64::MAX` disables pipeline backfill entirely (chainvisor live
+    /// reader mode).
+    pub const fn min_blocks_for_pipeline_run(&self) -> u64 {
+        self.min_blocks_for_pipeline_run
+    }
+
+    /// Override the pipeline-backfill trigger threshold.
+    ///
+    /// Default is `EPOCH_SLOTS` (= 32). Set to `u64::MAX` to disable
+    /// pipeline backfill entirely.
+    pub const fn with_min_blocks_for_pipeline_run(mut self, v: u64) -> Self {
+        self.min_blocks_for_pipeline_run = v;
+        self
     }
 
     /// Return the memory block buffer target.
