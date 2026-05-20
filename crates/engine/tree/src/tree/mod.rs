@@ -2743,9 +2743,15 @@ where
     /// threshold.
     ///
     /// If the `local_tip` is greater than the `block`, then this will return false.
+    ///
+    /// The threshold is `TreeConfig::min_blocks_for_pipeline_run()` (default
+    /// `MIN_BLOCKS_FOR_PIPELINE_RUN` = `EPOCH_SLOTS` = 32). Setting it to
+    /// `u64::MAX` (chainvisor live readers via `--engine.reader-force-at-tip`)
+    /// disables pipeline backfill entirely — every payload flows through
+    /// the at-tip `on_new_payload` path.
     #[inline]
-    const fn exceeds_backfill_run_threshold(&self, local_tip: u64, block: u64) -> bool {
-        block > local_tip && block - local_tip > MIN_BLOCKS_FOR_PIPELINE_RUN
+    fn exceeds_backfill_run_threshold(&self, local_tip: u64, block: u64) -> bool {
+        block > local_tip && block - local_tip > self.config.min_blocks_for_pipeline_run()
     }
 
     /// Returns how far the local tip is from the given block. If the local tip is at the same
