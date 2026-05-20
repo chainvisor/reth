@@ -6169,11 +6169,11 @@ MDBX_NOTHROW_PURE_FUNCTION static inline bool is_modifable(const MDBX_txn *txn, 
 
 MDBX_INTERNAL int __must_check_result page_check(const MDBX_cursor *const mc, const page_t *const mp);
 
-MDBX_INTERNAL __noinline pgr_t page_get_any(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
+MDBX_INTERNAL pgr_t page_get_any(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
 
-MDBX_INTERNAL __noinline pgr_t page_get_three(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
+MDBX_INTERNAL pgr_t page_get_three(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
 
-MDBX_INTERNAL __noinline pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
+MDBX_INTERNAL pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
 
 static inline int __must_check_result page_get(const MDBX_cursor *mc, const pgno_t pgno, page_t **mp,
                                                const txnid_t front) {
@@ -31629,15 +31629,15 @@ static __always_inline pgr_t page_get_inline(const uint16_t ILL, const MDBX_curs
   return r;
 }
 
-__noinline pgr_t page_get_any(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
+pgr_t page_get_any(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
   return page_get_inline(P_ILL_BITS, mc, pgno, front);
 }
 
-__noinline pgr_t page_get_three(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
+__hot pgr_t page_get_three(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
   return page_get_inline(P_ILL_BITS | P_LARGE, mc, pgno, front);
 }
 
-__noinline pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
+pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
   return page_get_inline(P_ILL_BITS | P_BRANCH | P_LEAF | P_DUPFIX, mc, pgno, front);
 }
 /// \copyright SPDX-License-Identifier: Apache-2.0

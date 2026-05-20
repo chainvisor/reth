@@ -378,12 +378,73 @@ impl DataReader {
         Ok(Self { data_file, data_mmap, offset_file, offset_size, offset_mmap })
     }
 
-    /// Returns the offset for the requested data index
-    pub fn offset(&self, index: usize) -> Result<u64, NippyJarError> {
+    /// Returns the offset for the requested data index as a raw
+    /// `u64`. Sentinel `u64::MAX` signals the error condition that
+    /// [`Self::offset`] would have surfaced as
+    /// `Err(NippyJarError::OffsetOutOfBounds)` — out-of-range
+    /// index into the offsets-file mmap. Real data offsets are
+    /// bounded by the data-file size (≤ ~10 GB per file on
+    /// HyperEVM, ~10⁻⁸ of `u64::MAX`), so the sentinel never
+    /// collides with a real value.
+    ///
+    /// **This exists for chainvisor's uretprobe ergonomics.**
+    /// chainvisor (the LVM-thin LV manager that runs reth-hl as
+    /// a guest) places a uretprobe on this symbol to capture
+    /// every NippyJar data read — including reads served by the
+    /// kernel mmap page-cache, which are invisible to block-layer
+    /// tools like blktrace. The uretprobe reads the return
+    /// register `%rax` via the kernel's `$retval` fetch-arg.
+    /// That works cleanly when the function returns a `u64` (fits
+    /// in one register), but BREAKS for `Result<u64,
+    /// NippyJarError>` — `NippyJarError` carries a
+    /// `Custom(String)` variant that pushes the enum past 16
+    /// bytes, triggering Rust's sret calling convention on
+    /// x86_64 SysV. With sret the caller passes a stack pointer
+    /// in `%rdi` for the return slot; on return `%rax` contains
+    /// that SAME pointer, not the unwrapped `u64`. chainvisor's
+    /// production HyperEVM writer (2026-05-19) measured 100 %
+    /// `nippyjar_no_file` translate failures on the `offset()`
+    /// uretprobe because every captured "offset" was a stack
+    /// address in the gigabyte range — past any data file's size.
+    ///
+    /// This wrapper sidesteps sret by returning a plain `u64`.
+    /// chainvisor's matcher anchors on `DataReader::offset_u64::`
+    /// (with trailing `::` to disambiguate from
+    /// `offset_at`/`offsets_count`/`offset_size`).
+    ///
+    /// **`#[inline(never)]` is load-bearing** — without it the
+    /// Rust compiler inlines this body into [`Self::offset`] (and
+    /// transitively into every `NippyJarCursor::read_value`
+    /// call site), erasing the symbol and breaking the probe
+    /// install. The performance cost is sub-percent: one
+    /// multiplication + a small mmap touch, dwarfed by what
+    /// the caller does with the returned offset.
+    #[inline(never)]
+    pub fn offset_u64(&self, index: usize) -> u64 {
         // + 1 represents the offset_len u8 which is in the beginning of the file
         let from = index * self.offset_size as usize + 1;
+        let offset_end = from.saturating_add(self.offset_size as usize);
+        if offset_end > self.offset_mmap.len() {
+            return u64::MAX;
+        }
+        let mut buffer: [u8; 8] = [0; 8];
+        buffer[..self.offset_size as usize].copy_from_slice(&self.offset_mmap[from..offset_end]);
+        u64::from_le_bytes(buffer)
+    }
 
-        self.offset_at(from)
+    /// Returns the offset for the requested data index. Thin
+    /// `Result`-flavored wrapper over [`Self::offset_u64`] so the
+    /// hot path (cursor reads) keeps its established error-
+    /// propagation shape while the uprobe-friendly helper exists
+    /// for chainvisor to attach to.
+    #[inline(never)]
+    pub fn offset(&self, index: usize) -> Result<u64, NippyJarError> {
+        let raw = self.offset_u64(index);
+        if raw == u64::MAX {
+            Err(NippyJarError::OffsetOutOfBounds { index })
+        } else {
+            Ok(raw)
+        }
     }
 
     /// Returns the offset for the requested data index starting from the end
