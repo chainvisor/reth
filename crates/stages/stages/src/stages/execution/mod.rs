@@ -331,6 +331,8 @@ where
 
         let mut blocks = Vec::new();
         let mut results = Vec::new();
+        let mut hit_batch_boundary = false;
+
         for block_number in start_block..=max_block {
             // Fetch the block
             let fetch_block_start = Instant::now();
@@ -398,6 +400,7 @@ where
                 cumulative_gas,
                 batch_start.elapsed(),
             ) {
+                hit_batch_boundary = block_number < max_block;
                 break
             }
         }
@@ -507,7 +510,11 @@ where
             "Execution time"
         );
 
-        let done = stage_progress == max_block;
+        // Stage thresholds are freshness boundaries, not only database-commit
+        // boundaries. Returning `done` here lets downstream stages seal this
+        // bounded range before execution continues toward a higher header target.
+        let done =
+            execution_batch_releases_pipeline(hit_batch_boundary, stage_progress, max_block);
         Ok(ExecOutput {
             checkpoint: StageCheckpoint::new(stage_progress)
                 .with_execution_stage_checkpoint(stage_checkpoint),
@@ -601,6 +608,14 @@ where
 
         Ok(())
     }
+}
+
+fn execution_batch_releases_pipeline(
+    hit_batch_boundary: bool,
+    stage_progress: BlockNumber,
+    max_block: BlockNumber,
+) -> bool {
+    hit_batch_boundary || stage_progress == max_block
 }
 
 fn reject_cancun_boundary_unwind<Provider>(
@@ -926,6 +941,13 @@ mod tests {
                 total
             }
         }) if total == block.gas_used);
+    }
+
+    #[test]
+    fn execution_batch_boundary_releases_pipeline_before_header_target() {
+        assert!(execution_batch_releases_pipeline(true, 25163064, 25164468));
+        assert!(execution_batch_releases_pipeline(false, 25164468, 25164468));
+        assert!(!execution_batch_releases_pipeline(false, 25163064, 25164468));
     }
 
     #[tokio::test]
