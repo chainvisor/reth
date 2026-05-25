@@ -496,6 +496,10 @@ where
     /// This is the case when persistence is already running and the gap between the canonical tip
     /// and the last persisted block has reached the configured threshold.
     const fn should_backpressure(&self) -> bool {
+        if self.config.persistence_disabled() {
+            return false
+        }
+
         self.persistence_state.in_progress() &&
             self.persistence_gap() >= self.config.persistence_backpressure_threshold()
     }
@@ -1386,6 +1390,10 @@ where
     /// This checks if we need to remove blocks (disk reorg) or save new blocks to disk.
     /// Persistence completion is handled separately via the `wait_for_event` method.
     fn advance_persistence(&mut self) -> Result<(), AdvancePersistenceError> {
+        if self.config.persistence_disabled() {
+            return Ok(())
+        }
+
         if !self.persistence_state.in_progress() {
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
@@ -1415,6 +1423,14 @@ where
 
     /// Persists all remaining blocks until none are left.
     fn persist_until_complete(&mut self) -> Result<(), AdvancePersistenceError> {
+        if self.config.persistence_disabled() {
+            debug!(
+                target: "engine::tree",
+                "skipping termination persistence because engine persistence is disabled"
+            );
+            return Ok(())
+        }
+
         loop {
             // Wait for any in-progress persistence to complete (blocking)
             if let Some((rx, start_time, action)) = self.persistence_state.rx.take() {
@@ -2019,6 +2035,10 @@ where
     /// block is greater than or equal to the persistence threshold,
     /// backfill is not running, and no payload is currently being built.
     pub const fn should_persist(&self) -> bool {
+        if self.config.persistence_disabled() {
+            return false
+        }
+
         if self.building_payload {
             return false
         }

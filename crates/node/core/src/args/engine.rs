@@ -314,6 +314,15 @@ pub struct EngineArgs {
     #[arg(long = "engine.persistence-backpressure-threshold", default_value_t = DefaultEngineValues::get_global().persistence_backpressure_threshold)]
     pub persistence_backpressure_threshold: u64,
 
+    /// Fully disable engine-tree disk persistence.
+    ///
+    /// Engine API payloads are still validated and kept in memory, but the engine tree will not
+    /// save canonical blocks, remove blocks, apply backpressure for persistence, or flush blocks
+    /// on shutdown. This is intended for chainvisor Backfill mode, where staged sync owns durable
+    /// table writes and Engine API payloads are transient until the process restarts in Live mode.
+    #[arg(long = "engine.disable-persistence", default_value_t = false)]
+    pub persistence_disabled: bool,
+
     /// Configure the target number of blocks to keep in memory.
     #[arg(long = "engine.memory-block-buffer-target", default_value_t = DefaultEngineValues::get_global().memory_block_buffer_target)]
     pub memory_block_buffer_target: u64,
@@ -603,6 +612,7 @@ impl Default for EngineArgs {
         Self {
             persistence_threshold,
             persistence_backpressure_threshold,
+            persistence_disabled: false,
             memory_block_buffer_target,
             invalid_header_hit_eviction_threshold,
             legacy_state_root_task_enabled,
@@ -663,6 +673,7 @@ impl EngineArgs {
         let config = TreeConfig::default()
             .with_persistence_threshold(self.persistence_threshold)
             .with_persistence_backpressure_threshold(self.persistence_backpressure_threshold)
+            .with_persistence_disabled(self.persistence_disabled)
             .with_memory_block_buffer_target(self.memory_block_buffer_target)
             .with_invalid_header_hit_eviction_threshold(self.invalid_header_hit_eviction_threshold)
             .with_legacy_state_root(self.legacy_state_root_task_enabled)
@@ -732,6 +743,7 @@ mod tests {
         let args = EngineArgs {
             persistence_threshold: 100,
             persistence_backpressure_threshold: 101,
+            persistence_disabled: true,
             memory_block_buffer_target: 50,
             invalid_header_hit_eviction_threshold: 7,
             legacy_state_root_task_enabled: true,
@@ -777,6 +789,7 @@ mod tests {
             "100",
             "--engine.persistence-backpressure-threshold",
             "101",
+            "--engine.disable-persistence",
             "--engine.memory-block-buffer-target",
             "50",
             "--engine.invalid-header-cache-hit-eviction-threshold",
@@ -818,6 +831,7 @@ mod tests {
         .args;
 
         assert_eq!(parsed_args, args);
+        assert!(parsed_args.tree_config().persistence_disabled());
     }
 
     #[test]

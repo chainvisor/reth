@@ -765,6 +765,28 @@ fn test_backpressure_waits_for_persistence_before_reading_incoming() {
     assert_eq!(test_harness.tree.incoming.len(), 0);
 }
 
+#[test]
+fn test_disabled_persistence_does_not_emit_save_blocks_or_backpressure() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(1..4).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    test_harness.tree.config = test_harness
+        .tree
+        .config
+        .with_persistence_threshold(0)
+        .with_persistence_backpressure_threshold(1)
+        .with_persistence_disabled(true);
+
+    assert!(!test_harness.tree.should_persist());
+    test_harness.tree.advance_persistence().unwrap();
+    assert_eq!(test_harness.tree.persistence_state.current_action(), None);
+    assert!(test_harness.action_rx.try_recv().is_err());
+
+    let (_persist_tx, persist_rx) = crossbeam_channel::bounded(1);
+    let persisted = blocks.last().unwrap().recovered_block().num_hash();
+    test_harness.tree.persistence_state.start_save(persisted, persist_rx);
+    assert!(!test_harness.tree.should_backpressure());
+}
+
 #[tokio::test]
 async fn test_tree_state_on_new_head_reorg() {
     reth_tracing::init_test_tracing();
@@ -2129,6 +2151,50 @@ mod forkchoice_updated_tests {
 
         // Ensure we persisted right to the tip
         assert_eq!(last_persisted_number, canonical_tip);
+    }
+
+    /// Test that disabling engine persistence skips the shutdown flush.
+    #[test]
+    fn test_engine_termination_skips_flush_when_persistence_disabled() {
+        let chain_spec = MAINNET.clone();
+        let mut test_block_builder = TestBlockBuilder::eth().with_chain_spec((*chain_spec).clone());
+        let blocks: Vec<_> = test_block_builder.get_executed_blocks(1..11).collect();
+        let mut test_harness = TestHarness::new(chain_spec).with_blocks(blocks);
+        test_harness.tree.config = test_harness
+            .tree
+            .config
+            .with_persistence_threshold(0)
+            .with_persistence_backpressure_threshold(1)
+            .with_persistence_disabled(true);
+
+        let (terminate_tx, mut terminate_rx) = oneshot::channel();
+        let to_tree_tx = test_harness.to_tree_tx.clone();
+        let action_rx = test_harness.action_rx;
+
+        spawn_os_thread("engine", || test_harness.tree.run());
+
+        to_tree_tx
+            .send(FromEngine::Event(FromOrchestrator::Terminate { tx: terminate_tx }))
+            .unwrap();
+
+        let mut terminated = false;
+        for _ in 0..100 {
+            if terminate_rx.try_recv().is_ok() {
+                terminated = true;
+                break;
+            }
+
+            if let Ok(PersistenceAction::SaveBlocks(saved_blocks, _)) =
+                action_rx.recv_timeout(Duration::from_millis(10))
+            {
+                panic!(
+                    "disabled persistence unexpectedly tried to save {} blocks",
+                    saved_blocks.len()
+                );
+            }
+        }
+
+        assert!(terminated, "termination did not complete");
     }
 }
 

@@ -93,6 +93,8 @@ pub struct TreeConfig {
     /// Maximum number of blocks to be kept only in memory without triggering
     /// persistence.
     persistence_threshold: u64,
+    /// Whether engine-tree disk persistence is fully disabled.
+    persistence_disabled: bool,
     /// How close to the canonical head we persist blocks. Represents the ideal
     /// number of most recent blocks to keep in memory for quick access and reorgs.
     ///
@@ -225,6 +227,7 @@ impl Default for TreeConfig {
         );
         Self {
             persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD,
+            persistence_disabled: false,
             memory_block_buffer_target: DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
             persistence_backpressure_threshold: DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD,
             block_buffer_limit: DEFAULT_BLOCK_BUFFER_LIMIT,
@@ -303,6 +306,7 @@ impl TreeConfig {
         );
         Self {
             persistence_threshold,
+            persistence_disabled: false,
             memory_block_buffer_target,
             persistence_backpressure_threshold,
             block_buffer_limit,
@@ -344,6 +348,11 @@ impl TreeConfig {
     /// Return the persistence threshold.
     pub const fn persistence_threshold(&self) -> u64 {
         self.persistence_threshold
+    }
+
+    /// Return whether engine-tree disk persistence is fully disabled.
+    pub const fn persistence_disabled(&self) -> bool {
+        self.persistence_disabled
     }
 
     /// Return the configured threshold (in blocks) at which the engine
@@ -483,6 +492,12 @@ impl TreeConfig {
             self.persistence_threshold,
             self.persistence_backpressure_threshold,
         );
+        self
+    }
+
+    /// Setter for fully disabling engine-tree disk persistence.
+    pub const fn with_persistence_disabled(mut self, persistence_disabled: bool) -> Self {
+        self.persistence_disabled = persistence_disabled;
         self
     }
 
