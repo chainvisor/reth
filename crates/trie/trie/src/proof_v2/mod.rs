@@ -1072,9 +1072,19 @@ where
             );
 
             // If the branch_path != cached_path it means the branch_stack is either empty, or the
-            // top branch is the parent of this cached branch. Either way we push a branch
+            // top branch is the parent of this cached branch. The `is_empty()` clause additionally
+            // covers the initial-state case where both paths are equal (both empty, e.g. fresh
+            // calculator with a root-level cached branch). Either way we push a branch
             // corresponding to the cached one onto the stack, so we can begin constructing it.
-            if self.branch_path != cached_path {
+            //
+            // Chainvisor patch (port of upstream PR #24501 — closed without merge): the upstream
+            // reth assumes the datadir is produced only by reth itself, so it can never resume
+            // with a root-level cached branch. For a chainvisor reader, the writer's reth produces
+            // the datadir and the reader's reth starts with a FRESH ProofCalculator (empty
+            // branch_stack) against that persistent state — which IS the panic-triggering
+            // scenario. Without this clause, the `.last().expect(...)` below panics on the very
+            // first cached branch encountered if it's at the root.
+            if self.branch_path != cached_path || self.branch_stack.is_empty() {
                 self.push_cached_branch(targets, cached_path, &cached_branch)?;
             }
 
