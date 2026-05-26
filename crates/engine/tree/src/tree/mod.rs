@@ -771,8 +771,17 @@ where
             TreeOutcome::new(self.try_buffer_payload(payload)?)
         };
 
+        let committed_linear_extension = if outcome.outcome.is_valid() {
+            self.try_commit_force_at_tip_linear_extension(block_hash)?
+        } else {
+            false
+        };
+
         // if the block is valid and it is the current sync target head, make it canonical
-        if outcome.outcome.is_valid() && self.is_sync_target_head(block_hash) {
+        if outcome.outcome.is_valid()
+            && !committed_linear_extension
+            && self.is_sync_target_head(block_hash)
+        {
             // Only create the canonical event if this block isn't already the canonical head
             if self.state.tree_state.canonical_block_hash() != block_hash {
                 outcome = outcome.with_event(TreeEvent::TreeAction(TreeAction::MakeCanonical {
@@ -950,6 +959,38 @@ where
         old_chain.reverse();
 
         Ok(Some(NewCanonicalChain::Reorg { new: new_chain, old: old_chain }))
+    }
+
+    /// In force-at-tip mode, commit direct linear extensions as soon as they are validated.
+    ///
+    /// A catching-up reader may receive a sparse forkchoice update for the final sync head while
+    /// `newPayload` streams the intermediate head chain. Those intermediate payloads are already
+    /// validated and directly extend the current canonical head, so waiting for a per-block FCU
+    /// keeps provider/RPC state pinned to the mounted snapshot and prevents persistence from
+    /// advancing.
+    fn try_commit_force_at_tip_linear_extension(
+        &mut self,
+        block_hash: B256,
+    ) -> ProviderResult<bool> {
+        if !self.config.pipeline_backfill_disabled()
+            || self.state.tree_state.canonical_block_hash() == block_hash
+        {
+            return Ok(false)
+        }
+
+        let Some(NewCanonicalChain::Commit { new }) = self.on_new_head(block_hash)? else {
+            return Ok(false)
+        };
+
+        let tip = new.last().map(|block| block.recovered_block().num_hash());
+        debug!(
+            target: "engine::tree",
+            ?tip,
+            block_count = new.len(),
+            "force-at-tip: committing validated linear extension"
+        );
+        self.on_canonical_chain_update(NewCanonicalChain::Commit { new });
+        Ok(true)
     }
 
     /// Updates the latest block state to the specified canonical ancestor.
@@ -1615,6 +1656,8 @@ where
                         self.emit_event(EngineApiEvent::BeaconConsensus(
                             ConsensusEngineEvent::CanonicalBlockAdded(block, now.elapsed()),
                         ));
+                        let _committed =
+                            self.try_commit_force_at_tip_linear_extension(block_num_hash.hash)?;
                     }
                     EngineApiRequest::Beacon(request) => {
                         match request {

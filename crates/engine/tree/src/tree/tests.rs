@@ -819,6 +819,40 @@ async fn test_force_at_tip_persists_with_stale_backfill_state() {
 }
 
 #[test]
+fn test_force_at_tip_direct_insert_advances_canonical_head_for_persistence() {
+    let tree_config = TreeConfig::default()
+        .with_min_blocks_for_pipeline_run(u64::MAX)
+        .with_memory_block_buffer_target(0)
+        .with_persistence_threshold(0);
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(vec![blocks[0].clone()]);
+    test_harness.tree.config = tree_config;
+    test_harness.tree.persistence_state.last_persisted_block =
+        blocks[0].recovered_block().num_hash();
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlock(
+            blocks[1].clone(),
+        )))
+        .unwrap();
+
+    assert_eq!(
+        test_harness.tree.state.tree_state.canonical_block_number(),
+        blocks[1].recovered_block().number
+    );
+    assert!(test_harness.tree.should_persist());
+
+    test_harness.tree.advance_persistence().unwrap();
+    let received_action =
+        test_harness.action_rx.recv().expect("failed to receive save blocks action");
+    let PersistenceAction::SaveBlocks(saved_blocks, _) = received_action else {
+        panic!("unexpected action received {received_action:?}");
+    };
+    assert_eq!(saved_blocks, vec![blocks[1].clone()]);
+}
+
+#[test]
 fn test_force_at_tip_drops_backfill_actions() {
     let mut test_harness = TestHarness::new(MAINNET.clone());
     test_harness.tree.config = test_harness
