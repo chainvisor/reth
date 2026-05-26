@@ -6,7 +6,9 @@ use crate::{
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
 };
 use alloy_consensus::BlockHeader;
-use alloy_eips::{eip1898::BlockWithParent, merge::EPOCH_SLOTS, BlockNumHash, NumHash};
+use alloy_eips::{eip1898::BlockWithParent, BlockNumHash, NumHash};
+#[cfg(test)]
+use alloy_eips::merge::EPOCH_SLOTS;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
@@ -86,6 +88,7 @@ pub mod state;
 /// E.g.: Local head `block.number` is 100 and the forkchoice head `block.number` is 133 (more than
 /// an epoch has slots), then this exceeds the threshold at which the pipeline should be used to
 /// backfill this gap.
+#[cfg(test)]
 pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 
 /// The minimum number of blocks to retain in the changeset cache after eviction.
@@ -504,6 +507,11 @@ where
             self.persistence_gap() >= self.config.persistence_backpressure_threshold()
     }
 
+    /// Returns true when stages pipeline state is allowed to block Engine API processing.
+    const fn pipeline_busy(&self) -> bool {
+        !self.config.pipeline_backfill_disabled() && !self.backfill_sync_state.is_idle()
+    }
+
     /// Run the engine API handler.
     ///
     /// This will block the current thread and process incoming messages.
@@ -757,7 +765,7 @@ where
         // record pre-execution phase duration
         self.metrics.block_validation.record_payload_validation(start.elapsed().as_secs_f64());
 
-        let mut outcome = if self.backfill_sync_state.is_idle() {
+        let mut outcome = if !self.pipeline_busy() {
             self.try_insert_payload(payload)?.into_outcome()
         } else {
             TreeOutcome::new(self.try_buffer_payload(payload)?)
@@ -1174,7 +1182,7 @@ where
             return Ok(Some(OnForkChoiceUpdated::with_invalid(status)));
         }
 
-        if !self.backfill_sync_state.is_idle() {
+        if self.pipeline_busy() {
             // We can only process new forkchoice updates if the pipeline is idle, since it requires
             // exclusive access to the database
             trace!(target: "engine::tree", "Pipeline is syncing, skipping forkchoice update");
@@ -1548,10 +1556,28 @@ where
         match msg {
             FromEngine::Event(event) => match event {
                 FromOrchestrator::BackfillSyncStarted => {
+                    if self.config.pipeline_backfill_disabled() {
+                        debug!(
+                            target: "engine::tree",
+                            "ignoring pipeline backfill start because pipeline backfill is disabled"
+                        );
+                        self.backfill_sync_state = BackfillSyncState::Idle;
+                        return Ok(ops::ControlFlow::Continue(()));
+                    }
+
                     debug!(target: "engine::tree", "received backfill sync started event");
                     self.backfill_sync_state = BackfillSyncState::Active;
                 }
                 FromOrchestrator::BackfillSyncFinished(ctrl) => {
+                    if self.config.pipeline_backfill_disabled() {
+                        debug!(
+                            target: "engine::tree",
+                            "ignoring pipeline backfill finish because pipeline backfill is disabled"
+                        );
+                        self.backfill_sync_state = BackfillSyncState::Idle;
+                        return Ok(ops::ControlFlow::Continue(()));
+                    }
+
                     self.on_backfill_sync_finished(ctrl)?;
                 }
                 FromOrchestrator::Terminate { tx } => {
@@ -2008,6 +2034,15 @@ where
         let event = event.into();
 
         if event.is_backfill_action() {
+            if self.config.pipeline_backfill_disabled() {
+                debug!(
+                    target: "engine::tree",
+                    ?event,
+                    "dropping pipeline backfill action because pipeline backfill is disabled"
+                );
+                return;
+            }
+
             debug_assert_eq!(
                 self.backfill_sync_state,
                 BackfillSyncState::Idle,
@@ -2043,7 +2078,7 @@ where
             return false
         }
 
-        if !self.backfill_sync_state.is_idle() {
+        if self.pipeline_busy() {
             // can't persist if backfill is running
             return false
         }
@@ -2816,7 +2851,7 @@ where
             return Ok(None)
         }
 
-        if !self.backfill_sync_state.is_idle() {
+        if self.pipeline_busy() {
             return Ok(None)
         }
 

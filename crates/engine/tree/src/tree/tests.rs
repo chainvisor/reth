@@ -788,6 +788,55 @@ fn test_disabled_persistence_does_not_emit_save_blocks_or_backpressure() {
 }
 
 #[tokio::test]
+async fn test_force_at_tip_persists_with_stale_backfill_state() {
+    let tree_config = TreeConfig::default()
+        .with_min_blocks_for_pipeline_run(u64::MAX)
+        .with_persistence_threshold(0);
+    let blocks: Vec<_> = TestBlockBuilder::eth()
+        .get_executed_blocks(1..tree_config.persistence_threshold() + 2)
+        .collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone())
+        .with_blocks(blocks.clone())
+        .with_backfill_state(BackfillSyncState::Active);
+    test_harness.tree.config = tree_config;
+
+    assert!(test_harness.tree.should_persist());
+
+    std::thread::Builder::new()
+        .name("Engine Task".to_string())
+        .spawn(|| test_harness.tree.run())
+        .unwrap();
+
+    test_harness.to_tree_tx.send(FromEngine::DownloadedBlocks(vec![])).unwrap();
+
+    let received_action =
+        test_harness.action_rx.recv().expect("failed to receive save blocks action");
+    let PersistenceAction::SaveBlocks(saved_blocks, _) = received_action else {
+        panic!("unexpected action received {received_action:?}");
+    };
+    assert_eq!(saved_blocks.len(), blocks.len());
+    assert_eq!(saved_blocks, blocks);
+}
+
+#[test]
+fn test_force_at_tip_drops_backfill_actions() {
+    let mut test_harness = TestHarness::new(MAINNET.clone());
+    test_harness.tree.config = test_harness
+        .tree
+        .config
+        .with_min_blocks_for_pipeline_run(u64::MAX);
+
+    test_harness
+        .tree
+        .emit_event(EngineApiEvent::BackfillAction(BackfillAction::Start(
+            B256::random().into(),
+        )));
+
+    assert_eq!(test_harness.tree.backfill_sync_state, BackfillSyncState::Idle);
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn test_tree_state_on_new_head_reorg() {
     reth_tracing::init_test_tracing();
     let chain_spec = MAINNET.clone();

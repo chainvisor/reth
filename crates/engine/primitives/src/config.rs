@@ -365,6 +365,11 @@ impl TreeConfig {
         self.min_blocks_for_pipeline_run
     }
 
+    /// Return whether stages pipeline backfill is fully disabled.
+    pub const fn pipeline_backfill_disabled(&self) -> bool {
+        self.min_blocks_for_pipeline_run == u64::MAX
+    }
+
     /// Override the pipeline-backfill trigger threshold.
     ///
     /// Default is `EPOCH_SLOTS` (= 32). Set to `u64::MAX` to disable
