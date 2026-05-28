@@ -2875,6 +2875,17 @@ where
         }
         trace!(target: "engine::tree", "appended downloaded block");
         self.try_connect_buffered_blocks(block_num_hash)?;
+
+        // chainvisor: in force-at-tip mode, a moving forkchoice target means the
+        // sync_target_head check above rarely fires during a catch-up — lighthouse keeps
+        // advancing the head while reth is still backfilling its ancestors. Without
+        // this call the canonical chain never advances past the snapshot block, so
+        // `eth_blockNumber` / `latest_block` stays pinned even though hundreds of
+        // blocks are being executed in-memory. Try to commit each newly-downloaded
+        // block as a linear extension of the current canonical head; if it isn't a
+        // direct extension yet (parents still missing), this is a no-op.
+        let _committed = self.try_commit_force_at_tip_linear_extension(block_num_hash.hash)?;
+
         Ok(None)
     }
 
