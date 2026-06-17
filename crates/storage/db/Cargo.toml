@@ -35,6 +35,7 @@ quanta = { workspace = true, optional = true }
 
 # misc
 page_size = { workspace = true, optional = true }
+rayon.workspace = true
 thiserror.workspace = true
 tempfile = { workspace = true, optional = true }
 derive_more.workspace = true
