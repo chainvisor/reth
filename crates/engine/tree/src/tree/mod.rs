@@ -765,6 +765,22 @@ where
         // record pre-execution phase duration
         self.metrics.block_validation.record_payload_validation(start.elapsed().as_secs_f64());
 
+        // ── TRUSTING-READER ADOPT (reader-force-at-tip) ──────────────────
+        // If the trusted upstream writer has already committed this block to
+        // the on-disk provider (the chainvisor base-advance moved the mounted
+        // device's canonical chain to >= this block), ADOPT the writer's
+        // already-computed post-state instead of re-executing it: a cache-
+        // speed incremental head-advance, not a cold ~30 s/block re-exec.
+        // Integrity: the on-disk block hash equals the payload's (same block,
+        // hence same state_root); the base-advance guarantees the on-disk
+        // state is the writer's committed post-state (deterministic replica).
+        // A miss ⇒ not yet committed ⇒ fall through to normal at-tip exec.
+        if self.config.pipeline_backfill_disabled() {
+            if let Some(status) = self.try_adopt_committed_payload(&payload)? {
+                return Ok(TreeOutcome::new(status));
+            }
+        }
+
         let mut outcome = if !self.pipeline_busy() {
             self.try_insert_payload(payload)?.into_outcome()
         } else {
@@ -991,6 +1007,72 @@ where
         );
         self.on_canonical_chain_update(NewCanonicalChain::Commit { new });
         Ok(true)
+    }
+
+    /// Attempts to ADOPT a block the trusted upstream writer has already
+    /// committed to the on-disk provider (reader-force-at-tip / trusting
+    /// reader), advancing the canonical head WITHOUT re-executing it.
+    ///
+    /// The chainvisor reader advances the mounted block device's base in
+    /// place (manifest-advance-no-restart) as the writer commits epochs, so a
+    /// block the CL feeds us may ALREADY be on-disk carrying the writer's
+    /// computed post-state. Re-executing it (the default at-tip path) is then
+    /// pure waste at reader S3-read speed. Instead we reuse the existing
+    /// forward on-disk head-advance ([`Self::update_latest_block_to_canonical_ancestor`]
+    /// → `handle_chain_advance_or_same_height` → `ensure_block_in_memory` →
+    /// `canonical_block_by_hash`), which loads the block + execution output
+    /// from the provider and computes only the INCREMENTAL trie from the
+    /// writer's stored changeset — no EVM, no full state-root recompute.
+    ///
+    /// Returns `Some(Valid)` on adopt; `None` if the block is not yet on-disk
+    /// (caller falls through to normal execution — the warm, in-flight tip
+    /// blocks the writer hasn't committed yet).
+    ///
+    /// Integrity: the on-disk block hash equals the payload's (same block,
+    /// hence same `state_root`); the base-advance's byte-identical-COW
+    /// invariant guarantees the on-disk state IS the writer's committed
+    /// post-state (deterministic replica). Trust is justified, not assumed:
+    /// same binary, same data, same hash.
+    fn try_adopt_committed_payload(
+        &mut self,
+        payload: &T::ExecutionData,
+    ) -> ProviderResult<Option<PayloadStatus>> {
+        let num_hash = payload.num_hash();
+        // Idempotent: already our canonical head.
+        if self.state.tree_state.canonical_block_hash() == num_hash.hash {
+            return Ok(Some(PayloadStatus::new(
+                PayloadStatusEnum::Valid,
+                Some(num_hash.hash),
+            )));
+        }
+        // Linear-only: adopt iff this block extends OUR current canonical head
+        // by one. The CL feeds blocks in order so the parent is our prior
+        // head; a non-linear candidate falls through to the normal path,
+        // keeping `update_chain`'s in-memory parent lookup satisfied.
+        if payload.parent_hash() != self.state.tree_state.canonical_block_hash() {
+            return Ok(None);
+        }
+        // Is the block already on-disk? (the writer committed it via base-advance)
+        let Some(header) = self.provider.sealed_header_by_hash(num_hash.hash)? else {
+            return Ok(None);
+        };
+        // Advance the canonical head to the on-disk block (incremental trie
+        // from the writer's changeset; no EVM).
+        self.update_latest_block_to_canonical_ancestor(&header)?;
+        // Reflect that this block is externally persisted (the writer wrote
+        // it): stops our persistence task from re-appending it to static_files
+        // and lets reth evict it from memory (re-read from disk on demand).
+        self.persistence_state.last_persisted_block = num_hash;
+        debug!(
+            target: "engine::tree",
+            number = num_hash.number,
+            hash = ?num_hash.hash,
+            "force-at-tip: ADOPTED writer-committed block (no execution)"
+        );
+        Ok(Some(PayloadStatus::new(
+            PayloadStatusEnum::Valid,
+            Some(num_hash.hash),
+        )))
     }
 
     /// Updates the latest block state to the specified canonical ancestor.
