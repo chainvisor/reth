@@ -139,6 +139,11 @@ pub struct TreeConfig {
     reserved_cpu_cores: usize,
     /// Whether to disable the precompile cache
     precompile_cache_disabled: bool,
+    /// Trusting-reader: return SYNCING for a linear-but-not-yet-committed tip
+    /// block (wait for the writer to commit it, then ADOPT) instead of
+    /// EXECUTING it. Avoids cold-faulting the uncommitted tip's `older` state
+    /// at reader S3-read speed (the sawtooth). Gated; default off.
+    reader_wait_for_commit: bool,
     /// Whether to use state root fallback for testing
     state_root_fallback: bool,
     /// Whether to always process payload attributes and begin a payload build process
@@ -244,6 +249,7 @@ impl Default for TreeConfig {
             multiproof_chunk_size: DEFAULT_MULTIPROOF_TASK_CHUNK_SIZE,
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             precompile_cache_disabled: false,
+            reader_wait_for_commit: false,
             state_root_fallback: false,
             always_process_payload_attributes_on_canonical_head: false,
             allow_unwind_canonical_header: false,
@@ -323,6 +329,7 @@ impl TreeConfig {
             multiproof_chunk_size,
             reserved_cpu_cores,
             precompile_cache_disabled,
+            reader_wait_for_commit: false,
             state_root_fallback,
             always_process_payload_attributes_on_canonical_head,
             allow_unwind_canonical_header,
@@ -462,6 +469,12 @@ impl TreeConfig {
     /// Returns whether precompile cache is disabled.
     pub const fn precompile_cache_disabled(&self) -> bool {
         self.precompile_cache_disabled
+    }
+
+    /// Trusting-reader: whether to wait (return SYNCING) for an uncommitted
+    /// linear tip block instead of executing it (see field docs).
+    pub const fn reader_wait_for_commit(&self) -> bool {
+        self.reader_wait_for_commit
     }
 
     /// Returns whether to use state root fallback.
@@ -622,6 +635,12 @@ impl TreeConfig {
     /// Setter for whether to disable the precompile cache.
     pub const fn without_precompile_cache(mut self, precompile_cache_disabled: bool) -> Self {
         self.precompile_cache_disabled = precompile_cache_disabled;
+        self
+    }
+
+    /// Setter for trusting-reader wait-for-commit (see field docs).
+    pub const fn with_reader_wait_for_commit(mut self, reader_wait_for_commit: bool) -> Self {
+        self.reader_wait_for_commit = reader_wait_for_commit;
         self
     }
 

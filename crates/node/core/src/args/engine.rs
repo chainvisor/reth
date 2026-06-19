@@ -559,6 +559,13 @@ pub struct EngineArgs {
     #[arg(long = "engine.reader-force-at-tip", default_value_t = false)]
     pub reader_force_at_tip: bool,
 
+    /// Trusting-reader: wait (return SYNCING) for the writer to commit an
+    /// uncommitted linear tip block, then ADOPT it, instead of EXECUTING it.
+    /// Holds tip at the commit-gap lag with no cold `older` re-faults (closes
+    /// the sawtooth). Pairs with --engine.reader-force-at-tip. Default off.
+    #[arg(long = "engine.reader-wait-for-commit", default_value_t = false)]
+    pub reader_wait_for_commit: bool,
+
     /// Add random jitter before each proof computation (trie-debug only).
     /// Each proof worker sleeps for a random duration up to this value before
     /// starting work. Useful for stress-testing timing-sensitive proof logic.
@@ -650,6 +657,7 @@ impl Default for EngineArgs {
             bal_parallel_state_root_disabled,
             disable_bal_batch_io: false,
             reader_force_at_tip: false,
+            reader_wait_for_commit: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -706,6 +714,7 @@ impl EngineArgs {
             .without_bal_parallel_execution(self.bal_parallel_execution_disabled)
             .without_bal_parallel_state_root(self.bal_parallel_state_root_disabled)
             .without_bal_batch_io(self.disable_bal_batch_io)
+            .with_reader_wait_for_commit(self.reader_wait_for_commit)
             .with_min_blocks_for_pipeline_run(if self.reader_force_at_tip {
                 u64::MAX
             } else {
@@ -779,6 +788,7 @@ mod tests {
             bal_parallel_state_root_disabled: true,
             disable_bal_batch_io: true,
             reader_force_at_tip: false,
+            reader_wait_for_commit: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         };

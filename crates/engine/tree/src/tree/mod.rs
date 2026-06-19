@@ -1054,6 +1054,18 @@ where
         }
         // Is the block already on-disk? (the writer committed it via base-advance)
         let Some(header) = self.provider.sealed_header_by_hash(num_hash.hash)? else {
+            // Linear, but the writer has NOT committed this tip block yet.
+            // Default (force-at-tip): fall through and EXECUTE it (the warm,
+            // in-flight tip block). With --engine.reader-wait-for-commit:
+            // return SYNCING so the CL retries until the writer commits it,
+            // then we ADOPT it (no EVM) on a later retry — the guest HOLDS at
+            // the commit-gap lag instead of cold-faulting the uncommitted
+            // tip's `older` state at reader S3 speed (the sawtooth). Integrity-
+            // safe: this path NEVER executes; it only ever adopts verified
+            // writer-committed state once the block lands on-disk.
+            if self.config.reader_wait_for_commit() {
+                return Ok(Some(PayloadStatus::new(PayloadStatusEnum::Syncing, None)));
+            }
             return Ok(None);
         };
         // Advance the canonical head to the on-disk block (incremental trie
