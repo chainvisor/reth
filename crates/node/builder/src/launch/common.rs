@@ -483,18 +483,22 @@ where
         let static_files_config = &self.toml_config().static_files;
         static_files_config.validate()?;
 
-        // chainvisor trusting-reader: open static files READ-ONLY too (the guest
-        // never writes them; the writer owns durable static-file writes). The RW
-        // builder takes an exclusive storage lock, which we must NOT hold on a
-        // read-only replica.
+        // chainvisor trusting-reader: static files stay READ-WRITE even here
+        // (same as the executing reader). The writer's chainvisor snapshot can
+        // capture a NippyJar mid-append — the per-segment sidecar/index claims
+        // more rows than the data file holds. The RW builder HEALS (truncates the
+        // over-claimed index down to the data) on open — reth's standard
+        // static-file recovery; the read_only builder has no writer to heal with,
+        // so it reads the over-claimed rows -> EOF -> "failed to fill whole
+        // buffer" -> boot crash. The heal + the exclusive storage lock land in
+        // the READER's COW overlay (sole user of its NBD), NOT the writer's base
+        // static files and NOT the MDBX meta page — so the trusting-reader's
+        // RO-MDBX premise (no COW meta shadow) is preserved.
         let reader_trusting = self.node_config().engine.reader_trusting;
 
         // Apply per-segment blocks_per_file configuration
-        let static_file_builder = if reader_trusting {
-            StaticFileProviderBuilder::read_only(self.data_dir().static_files())
-        } else {
-            StaticFileProviderBuilder::read_write(self.data_dir().static_files())
-        };
+        let static_file_builder =
+            StaticFileProviderBuilder::read_write(self.data_dir().static_files());
         let static_file_provider = static_file_builder
             .with_metrics()
             .with_blocks_per_file_for_segments(&static_files_config.as_blocks_per_file_map())
