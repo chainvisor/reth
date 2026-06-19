@@ -32,7 +32,7 @@ use reth_node_core::{
 use reth_node_events::node;
 use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider},
-    BlockNumReader, StorageSettingsCache,
+    BlockNumReader, HeaderProvider, StorageSettingsCache,
 };
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
@@ -291,6 +291,52 @@ impl EngineNodeLauncher {
 
         let chainspec = ctx.chain_spec();
         let provider = ctx.blockchain_db().clone();
+
+        // chainvisor trusting-reader (pure-adopt): the engine never executes
+        // payloads; instead this poller ADOPTS the writer's committed on-disk
+        // head. Every 500ms it reads the on-disk tip block number
+        // (`last_block_number()` = the DB's last block, NOT the in-memory head),
+        // fetches that block's `SealedHeader`, and sets it as the canonical head.
+        // "latest" state then auto-falls through to the on-disk
+        // `LatestStateProvider`. Robust + best-effort: any error just retries on
+        // the next tick. Default off; zero effect unless --engine.reader-trusting.
+        if ctx.node_config().engine.reader_trusting {
+            let poll_provider = provider.clone();
+            ctx.task_executor().spawn_critical_task(
+                "trusting-reader head poller",
+                async move {
+                    info!(target: "reth::cli", "trusting-reader: head-pointer poller started");
+                    let mut last_adopted: u64 = 0;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // On-disk tip the writer has committed (database last block).
+                        let tip = match poll_provider.last_block_number() {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        };
+                        if tip == last_adopted {
+                            continue;
+                        }
+                        match poll_provider.sealed_header(tip) {
+                            Ok(Some(header)) => {
+                                poll_provider
+                                    .canonical_in_memory_state()
+                                    .set_canonical_head(header);
+                                last_adopted = tip;
+                                debug!(
+                                    target: "reth::cli",
+                                    number = tip,
+                                    "trusting-reader: adopted writer-committed head"
+                                );
+                            }
+                            // Not on-disk yet / read error: retry next tick.
+                            Ok(None) | Err(_) => continue,
+                        }
+                    }
+                },
+            );
+        }
+
         let (exit, rx) = oneshot::channel();
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
         let startup_sync_state_idle = ctx.node_config().debug.startup_sync_state_idle;

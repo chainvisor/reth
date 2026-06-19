@@ -765,6 +765,21 @@ where
         // record pre-execution phase duration
         self.metrics.block_validation.record_payload_validation(start.elapsed().as_secs_f64());
 
+        // ── TRUSTING-READER PURE-ADOPT (reader-trusting) ─────────────────
+        // The engine NEVER executes payloads in this mode: the MDBX is opened
+        // RDONLY (it cannot persist) and a separate head-pointer poller adopts
+        // the writer's committed on-disk head out-of-band. So once the payload's
+        // consensus-rule layout has been validated above, short-circuit with
+        // SYNCING — do NOT enter the adopt-or-execute paths below (both can
+        // mutate in-memory tree state and the execute path would attempt a cold
+        // re-execution we explicitly forbid). The CL keeps retrying; the head
+        // advances solely via the poller. Integrity-safe: this path performs no
+        // execution and no writes. Default off (zero effect unless the flag is
+        // set on this node).
+        if self.config.reader_trusting() {
+            return Ok(TreeOutcome::new(PayloadStatus::from_status(PayloadStatusEnum::Syncing)));
+        }
+
         // ── TRUSTING-READER ADOPT (reader-force-at-tip) ──────────────────
         // If the trusted upstream writer has already committed this block to
         // the on-disk provider (the chainvisor base-advance moved the mounted
@@ -1272,6 +1287,19 @@ where
 
         // Record metrics
         self.record_forkchoice_metrics();
+
+        // ── TRUSTING-READER PURE-ADOPT (reader-trusting) ─────────────────
+        // The canonical head is driven solely by the out-of-band head-pointer
+        // poller (which advances `canonical_in_memory_state` to the writer's
+        // committed on-disk tip). The engine tree must NOT process FCUs here:
+        // `apply_chain_update` would mutate tree state and `handle_missing_block`
+        // could kick off a backfill/download — neither is valid on an RDONLY
+        // replica that never executes. Return SYNCING (the CL keeps polling)
+        // and ignore any payload attributes (we never build payloads). Default
+        // off (zero effect unless the flag is set on this node).
+        if self.config.reader_trusting() {
+            return Ok(TreeOutcome::new(OnForkChoiceUpdated::syncing()));
+        }
 
         // Pre-validation of forkchoice state
         if let Some(early_result) = self.validate_forkchoice_state(state)? {

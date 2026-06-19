@@ -566,6 +566,20 @@ pub struct EngineArgs {
     #[arg(long = "engine.reader-wait-for-commit", default_value_t = false)]
     pub reader_wait_for_commit: bool,
 
+    /// Trusting-reader (pure-adopt): open MDBX RDONLY (no COW meta shadow → the
+    /// writer's base meta is served) and ADOPT the writer's committed head via a
+    /// head-pointer poller, NEVER executing payloads. Per poll, read the on-disk
+    /// tip header and `set_canonical_head(header)`; "latest" state auto-falls
+    /// through to the on-disk `LatestStateProvider`. Disables persistence,
+    /// opens the DB + static files read-only, skips the consistency-check unwind,
+    /// and short-circuits the engine's execution path. Default off.
+    ///
+    /// Distinct from --engine.reader-wait-for-commit (which still drives adoption
+    /// through the engine's new-payload path); this mode bypasses execution
+    /// entirely and is driven solely by the poller.
+    #[arg(long = "engine.reader-trusting", env = "CV_RETH_READER_TRUSTING", default_value_t = false)]
+    pub reader_trusting: bool,
+
     /// Add random jitter before each proof computation (trie-debug only).
     /// Each proof worker sleeps for a random duration up to this value before
     /// starting work. Useful for stress-testing timing-sensitive proof logic.
@@ -658,6 +672,7 @@ impl Default for EngineArgs {
             disable_bal_batch_io: false,
             reader_force_at_tip: false,
             reader_wait_for_commit: false,
+            reader_trusting: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -681,7 +696,10 @@ impl EngineArgs {
         let config = TreeConfig::default()
             .with_persistence_threshold(self.persistence_threshold)
             .with_persistence_backpressure_threshold(self.persistence_backpressure_threshold)
-            .with_persistence_disabled(self.persistence_disabled)
+            // Trusting-reader opens MDBX RDONLY: persistence MUST be off (it can
+            // never write canonical blocks / static files). Force it regardless
+            // of --engine.disable-persistence.
+            .with_persistence_disabled(self.persistence_disabled || self.reader_trusting)
             .with_memory_block_buffer_target(self.memory_block_buffer_target)
             .with_invalid_header_hit_eviction_threshold(self.invalid_header_hit_eviction_threshold)
             .with_legacy_state_root(self.legacy_state_root_task_enabled)
@@ -715,6 +733,7 @@ impl EngineArgs {
             .without_bal_parallel_state_root(self.bal_parallel_state_root_disabled)
             .without_bal_batch_io(self.disable_bal_batch_io)
             .with_reader_wait_for_commit(self.reader_wait_for_commit)
+            .with_reader_trusting(self.reader_trusting)
             .with_min_blocks_for_pipeline_run(if self.reader_force_at_tip {
                 u64::MAX
             } else {
@@ -789,6 +808,7 @@ mod tests {
             disable_bal_batch_io: true,
             reader_force_at_tip: false,
             reader_wait_for_commit: false,
+            reader_trusting: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         };

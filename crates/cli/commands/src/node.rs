@@ -5,7 +5,7 @@ use clap::{value_parser, Args, Parser};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
-use reth_db::init_db;
+use reth_db::{init_db, open_db_read_only};
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
@@ -204,8 +204,20 @@ where
         let data_dir = node_config.datadir();
         let db_path = data_dir.db();
 
-        tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = init_db(db_path.clone(), self.db.database_args())?.with_metrics();
+        // chainvisor trusting-reader: open MDBX READ-ONLY so the guest never
+        // writes — no COW meta shadow is created, so the underlying writer's base
+        // meta page is served and the reader sees the writer's committed tip. The
+        // writer already created the tables and stamped the client version, so we
+        // SKIP the RW post-steps (`create_and_track_tables_for`,
+        // `record_client_version`) that `init_db` performs — `open_db_read_only`
+        // does neither. Everything else (metrics) is identical.
+        let database = if node_config.engine.reader_trusting {
+            tracing::info!(target: "reth::cli", path = ?db_path, "Opening database (read-only, trusting-reader)");
+            open_db_read_only(db_path.clone(), self.db.database_args())?.with_metrics()
+        } else {
+            tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
+            init_db(db_path.clone(), self.db.database_args())?.with_metrics()
+        };
 
         if with_unused_ports {
             node_config = node_config.with_unused_ports();

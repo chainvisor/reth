@@ -483,13 +483,23 @@ where
         let static_files_config = &self.toml_config().static_files;
         static_files_config.validate()?;
 
+        // chainvisor trusting-reader: open static files READ-ONLY too (the guest
+        // never writes them; the writer owns durable static-file writes). The RW
+        // builder takes an exclusive storage lock, which we must NOT hold on a
+        // read-only replica.
+        let reader_trusting = self.node_config().engine.reader_trusting;
+
         // Apply per-segment blocks_per_file configuration
-        let static_file_provider =
+        let static_file_builder = if reader_trusting {
+            StaticFileProviderBuilder::read_only(self.data_dir().static_files())
+        } else {
             StaticFileProviderBuilder::read_write(self.data_dir().static_files())
-                .with_metrics()
-                .with_blocks_per_file_for_segments(&static_files_config.as_blocks_per_file_map())
-                .with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default())
-                .build()?;
+        };
+        let static_file_provider = static_file_builder
+            .with_metrics()
+            .with_blocks_per_file_for_segments(&static_files_config.as_blocks_per_file_map())
+            .with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default())
+            .build()?;
 
         // Use the provided RocksDB provider or create a new one
         let rocksdb_provider = if let Some(provider) = rocksdb_provider {
@@ -514,64 +524,73 @@ where
         .with_minimum_pruning_distance(prune_config.minimum_pruning_distance)
         .with_changeset_cache(changeset_cache);
 
-        // Check consistency between the database and static files, returning
-        // the unwind targets for each storage layer if inconsistencies are
-        // found.
-        let (rocksdb_unwind, static_file_unwind) = factory.check_consistency()?;
+        // chainvisor trusting-reader: SKIP the consistency-check + unwind
+        // pipeline entirely. The DB and static files are opened READ-ONLY and
+        // persistence is disabled, so an unwind (which writes) is both impossible
+        // and unnecessary — the trusted writer is the single source that mutates
+        // these layers, and it commits them consistently. Running the check here
+        // would, at best, no-op and, at worst, try to take write locks / spawn an
+        // unwind pipeline against read-only storage.
+        if !reader_trusting {
+            // Check consistency between the database and static files, returning
+            // the unwind targets for each storage layer if inconsistencies are
+            // found.
+            let (rocksdb_unwind, static_file_unwind) = factory.check_consistency()?;
 
-        // Take the minimum block number to ensure all storage layers are consistent.
-        let unwind_target = [rocksdb_unwind, static_file_unwind].into_iter().flatten().min();
+            // Take the minimum block number to ensure all storage layers are consistent.
+            let unwind_target = [rocksdb_unwind, static_file_unwind].into_iter().flatten().min();
 
-        if let Some(unwind_block) = unwind_target {
-            // Highly unlikely to happen, and given its destructive nature, it's better to panic
-            // instead. Unwinding to 0 would leave MDBX with a huge free list size.
-            let inconsistency_source = match (rocksdb_unwind, static_file_unwind) {
-                (Some(_), Some(_)) => "RocksDB and static file",
-                (Some(_), None) => "RocksDB",
-                (None, Some(_)) => "static file",
-                (None, None) => unreachable!(),
-            };
-            assert_ne!(
-                unwind_block, 0,
-                "A {} inconsistency was found that would trigger an unwind to block 0",
-                inconsistency_source
-            );
-
-            let unwind_target = PipelineTarget::Unwind(unwind_block);
-
-            info!(target: "reth::cli", %unwind_target, %inconsistency_source, "Executing unwind after consistency check.");
-
-            let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
-
-            // Builds an unwind-only pipeline
-            let pipeline = PipelineBuilder::default()
-                .add_stages(DefaultStages::new(
-                    factory.clone(),
-                    tip_rx,
-                    Arc::new(NoopConsensus::default()),
-                    NoopHeaderDownloader::default(),
-                    NoopBodiesDownloader::default(),
-                    NoopEvmConfig::<Evm>::default(),
-                    self.toml_config().stages.clone(),
-                    self.prune_modes(),
-                    None,
-                ))
-                .build(
-                    factory.clone(),
-                    StaticFileProducer::new(factory.clone(), self.prune_modes()),
+            if let Some(unwind_block) = unwind_target {
+                // Highly unlikely to happen, and given its destructive nature, it's better to panic
+                // instead. Unwinding to 0 would leave MDBX with a huge free list size.
+                let inconsistency_source = match (rocksdb_unwind, static_file_unwind) {
+                    (Some(_), Some(_)) => "RocksDB and static file",
+                    (Some(_), None) => "RocksDB",
+                    (None, Some(_)) => "static file",
+                    (None, None) => unreachable!(),
+                };
+                assert_ne!(
+                    unwind_block, 0,
+                    "A {} inconsistency was found that would trigger an unwind to block 0",
+                    inconsistency_source
                 );
 
-            // Unwinds to block
-            let (tx, rx) = oneshot::channel();
+                let unwind_target = PipelineTarget::Unwind(unwind_block);
 
-            // Pipeline should be run as blocking and panic if it fails.
-            self.task_executor().spawn_critical_blocking_task("pipeline task", async move {
-                let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
-                let _ = tx.send(result);
-            });
-            rx.await?.inspect_err(|err| {
-                error!(target: "reth::cli", %unwind_target, %inconsistency_source, %err, "failed to run unwind")
-            })?;
+                info!(target: "reth::cli", %unwind_target, %inconsistency_source, "Executing unwind after consistency check.");
+
+                let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
+
+                // Builds an unwind-only pipeline
+                let pipeline = PipelineBuilder::default()
+                    .add_stages(DefaultStages::new(
+                        factory.clone(),
+                        tip_rx,
+                        Arc::new(NoopConsensus::default()),
+                        NoopHeaderDownloader::default(),
+                        NoopBodiesDownloader::default(),
+                        NoopEvmConfig::<Evm>::default(),
+                        self.toml_config().stages.clone(),
+                        self.prune_modes(),
+                        None,
+                    ))
+                    .build(
+                        factory.clone(),
+                        StaticFileProducer::new(factory.clone(), self.prune_modes()),
+                    );
+
+                // Unwinds to block
+                let (tx, rx) = oneshot::channel();
+
+                // Pipeline should be run as blocking and panic if it fails.
+                self.task_executor().spawn_critical_blocking_task("pipeline task", async move {
+                    let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
+                    let _ = tx.send(result);
+                });
+                rx.await?.inspect_err(|err| {
+                    error!(target: "reth::cli", %unwind_target, %inconsistency_source, %err, "failed to run unwind")
+                })?;
+            }
         }
 
         Ok(factory)

@@ -144,6 +144,11 @@ pub struct TreeConfig {
     /// EXECUTING it. Avoids cold-faulting the uncommitted tip's `older` state
     /// at reader S3-read speed (the sawtooth). Gated; default off.
     reader_wait_for_commit: bool,
+    /// Trusting-reader (pure-adopt): the engine never executes payloads; a
+    /// head-pointer poller adopts the writer's committed on-disk head. When set,
+    /// the new-payload path short-circuits (returns SYNCING) so the RDONLY DB is
+    /// never asked to persist. Gated; default off.
+    reader_trusting: bool,
     /// Whether to use state root fallback for testing
     state_root_fallback: bool,
     /// Whether to always process payload attributes and begin a payload build process
@@ -250,6 +255,7 @@ impl Default for TreeConfig {
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             precompile_cache_disabled: false,
             reader_wait_for_commit: false,
+            reader_trusting: false,
             state_root_fallback: false,
             always_process_payload_attributes_on_canonical_head: false,
             allow_unwind_canonical_header: false,
@@ -330,6 +336,7 @@ impl TreeConfig {
             reserved_cpu_cores,
             precompile_cache_disabled,
             reader_wait_for_commit: false,
+            reader_trusting: false,
             state_root_fallback,
             always_process_payload_attributes_on_canonical_head,
             allow_unwind_canonical_header,
@@ -475,6 +482,12 @@ impl TreeConfig {
     /// linear tip block instead of executing it (see field docs).
     pub const fn reader_wait_for_commit(&self) -> bool {
         self.reader_wait_for_commit
+    }
+
+    /// Trusting-reader (pure-adopt): whether the engine should NOT execute
+    /// payloads (the head-pointer poller drives the canonical head instead).
+    pub const fn reader_trusting(&self) -> bool {
+        self.reader_trusting
     }
 
     /// Returns whether to use state root fallback.
@@ -641,6 +654,12 @@ impl TreeConfig {
     /// Setter for trusting-reader wait-for-commit (see field docs).
     pub const fn with_reader_wait_for_commit(mut self, reader_wait_for_commit: bool) -> Self {
         self.reader_wait_for_commit = reader_wait_for_commit;
+        self
+    }
+
+    /// Setter for trusting-reader pure-adopt mode (see field docs).
+    pub const fn with_reader_trusting(mut self, reader_trusting: bool) -> Self {
+        self.reader_trusting = reader_trusting;
         self
     }
 
