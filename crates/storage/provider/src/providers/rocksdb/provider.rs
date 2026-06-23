@@ -330,13 +330,11 @@ impl RocksDBBuilder {
         self
     }
 
-    /// Builds the [`RocksDBProvider`].
-    pub fn build(self) -> ProviderResult<RocksDBProvider> {
-        let options =
-            Self::default_options(self.log_level, &self.block_cache, self.enable_statistics);
-
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = self
-            .column_families
+    /// Build the column-family descriptors. Extracted so the open path can rebuild
+    /// a fresh set when retrying after a trust-based repair (`open_cf_descriptors`
+    /// consumes the descriptors).
+    fn cf_descriptors(&self) -> Vec<ColumnFamilyDescriptor> {
+        self.column_families
             .iter()
             .map(|name| {
                 let cf_options = if name == tables::TransactionHashNumbers::NAME {
@@ -346,7 +344,15 @@ impl RocksDBBuilder {
                 };
                 ColumnFamilyDescriptor::new(name.clone(), cf_options)
             })
-            .collect();
+            .collect()
+    }
+
+    /// Builds the [`RocksDBProvider`].
+    pub fn build(self) -> ProviderResult<RocksDBProvider> {
+        let options =
+            Self::default_options(self.log_level, &self.block_cache, self.enable_statistics);
+
+        let cf_descriptors = self.cf_descriptors();
 
         let metrics = self.enable_metrics.then(RocksDBMetrics::default);
 
@@ -363,18 +369,49 @@ impl RocksDBBuilder {
                 .join(format!("rocksdb-secondary-tmp-{}", std::process::id()));
             reth_fs_util::create_dir_all(&secondary_path).map_err(ProviderError::other)?;
 
-            let db = DB::open_cf_descriptors_as_secondary(
+            let db = match DB::open_cf_descriptors_as_secondary(
                 &options,
                 &self.path,
                 &secondary_path,
                 cf_descriptors,
-            )
-            .map_err(|e| {
-                ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
-                    message: e.to_string().into(),
-                    code: -1,
-                }))
-            })?;
+            ) {
+                Ok(db) => db,
+                // Trust-based recovery (see the read-write branch below): a torn writer snapshot
+                // can leave RocksDB with an SST ahead of its WAL/MANIFEST. We trust the on-disk
+                // SSTs, so repair the (reader-owned COW) DB and retry as secondary.
+                Err(e) if e.to_string().contains("Corruption") => {
+                    tracing::warn!(
+                        target: "reth::providers::rocksdb",
+                        error = %e,
+                        path = ?self.path,
+                        "rocksdb secondary open hit corruption (torn writer snapshot); repairing from trusted SSTs and retrying",
+                    );
+                    DB::repair(&options, &self.path).map_err(|re| {
+                        ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                            message: format!("rocksdb repair failed: {re}").into(),
+                            code: -1,
+                        }))
+                    })?;
+                    DB::open_cf_descriptors_as_secondary(
+                        &options,
+                        &self.path,
+                        &secondary_path,
+                        self.cf_descriptors(),
+                    )
+                    .map_err(|e2| {
+                        ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                            message: e2.to_string().into(),
+                            code: -1,
+                        }))
+                    })?
+                }
+                Err(e) => {
+                    return Err(ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                        message: e.to_string().into(),
+                        code: -1,
+                    })))
+                }
+            };
             Ok(RocksDBProvider(Arc::new(RocksDBProviderInner::Secondary {
                 db,
                 metrics,
@@ -385,14 +422,51 @@ impl RocksDBBuilder {
             // rollback) OptimisticTransactionDB uses optimistic concurrency control (conflict
             // detection at commit) and is backed by DBCommon, giving us access to
             // cancel_all_background_work for clean shutdown.
-            let db =
-                OptimisticTransactionDB::open_cf_descriptors(&options, &self.path, cf_descriptors)
-                    .map_err(|e| {
+            let db = match OptimisticTransactionDB::open_cf_descriptors(
+                &options,
+                &self.path,
+                cf_descriptors,
+            ) {
+                Ok(db) => db,
+                // TRUST-BASED RECOVERY (deterministic-replica): the writer's LVM snapshot can
+                // catch RocksDB mid-flush (an SST flushed but its WAL/MANIFEST not yet synced) ->
+                // "Corruption: SST file is ahead of WALs". We trust the writer's on-disk SSTs
+                // 100%, so repair -- rebuild the MANIFEST from the SSTs -- then retry. Any
+                // un-synced WAL tail is re-fetched as the reader adopts the writer's advancing
+                // committed head. Self-gating: the writer's own live DB never errors here so it
+                // never repairs; only a reader opening a torn snapshot does.
+                Err(e) if e.to_string().contains("Corruption") => {
+                    tracing::warn!(
+                        target: "reth::providers::rocksdb",
+                        error = %e,
+                        path = ?self.path,
+                        "rocksdb open hit corruption (torn writer snapshot); repairing from trusted SSTs and retrying",
+                    );
+                    DB::repair(&options, &self.path).map_err(|re| {
                         ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
-                            message: e.to_string().into(),
+                            message: format!("rocksdb repair failed: {re}").into(),
                             code: -1,
                         }))
                     })?;
+                    OptimisticTransactionDB::open_cf_descriptors(
+                        &options,
+                        &self.path,
+                        self.cf_descriptors(),
+                    )
+                    .map_err(|e2| {
+                        ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                            message: e2.to_string().into(),
+                            code: -1,
+                        }))
+                    })?
+                }
+                Err(e) => {
+                    return Err(ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                        message: e.to_string().into(),
+                        code: -1,
+                    })))
+                }
+            };
             Ok(RocksDBProvider(Arc::new(RocksDBProviderInner::ReadWrite { db, metrics })))
         }
     }
