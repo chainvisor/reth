@@ -517,7 +517,7 @@ where
         };
 
         let prune_config = self.prune_config();
-        let factory = ProviderFactory::new(
+        let mut factory = ProviderFactory::new(
             self.right().clone(),
             self.chain_spec(),
             static_file_provider,
@@ -527,6 +527,23 @@ where
         .with_prune_modes(prune_config.segments)
         .with_minimum_pruning_distance(prune_config.minimum_pruning_distance)
         .with_changeset_cache(changeset_cache);
+
+        // chainvisor trusting-reader (RDONLY adopt): wire the read-only sync so
+        // every `last_block_number()` poll (the engine.rs head poller) re-scans
+        // the static-file index (`initialize_index`) + catches up RocksDB
+        // (`try_catch_up_with_primary`, a no-op for the non-secondary RocksDB)
+        // whenever the writer's committed MDBX txnid advances. WITHOUT this the
+        // index is frozen at open → `last_block_number()` never advances → the
+        // poller adopts the boot head FOREVER (the "coherence wall" that froze the
+        // trusting reader at its mount block). The refresh machinery already
+        // exists (`ReadOnlySyncState` / `sync_providers_if_needed`); it was simply
+        // never wired for the trusting-reader node — only the standalone
+        // `open_read_only` builder used it. Gated on `reader_trusting` so
+        // executing/normal readers are unaffected. `false` = no fs-watcher; the
+        // 500 ms head poll drives the catch-up (internally gated on the txnid).
+        if reader_trusting {
+            factory = factory.with_read_only_sync(false);
+        }
 
         // chainvisor trusting-reader: SKIP the consistency-check + unwind
         // pipeline entirely. The DB and static files are opened READ-ONLY and
