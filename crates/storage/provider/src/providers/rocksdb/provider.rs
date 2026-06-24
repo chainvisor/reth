@@ -1157,6 +1157,32 @@ impl RocksDBProvider {
         Ok(())
     }
 
+    /// Drains all RocksDB memtables to SST + syncs the WAL, leaving a
+    /// crash-consistent on-disk state for an external filesystem snapshot
+    /// (FIFREEZE + `lvcreate -s`) WITHOUT stopping or restarting the guest.
+    ///
+    /// Why: the writer opens RocksDB with `wal_ttl_seconds=0` /
+    /// `wal_size_limit_mb=0`, so obsolete WAL files are deleted IMMEDIATELY
+    /// after a memtable flush — there is no grace window. A FIFREEZE that
+    /// catches the filesystem mid flush->delete-WAL cycle captures an SST whose
+    /// covering WAL was just removed, so a reader mounting that snapshot fails
+    /// to open with `Corruption: SST file is ahead of WALs`. Emptying the
+    /// memtable to SST immediately before FIFREEZE closes that race: there is
+    /// no un-flushed memtable to flush-then-delete-WAL during the freeze window
+    /// (the writer's RocksDB write rate is far below the freeze duration, so no
+    /// background flush re-opens the race). Compaction during the freeze is
+    /// already crash-safe via the atomic MANIFEST. No `disable_file_deletions`
+    /// is required (and rust-rocksdb 0.24 does not expose it).
+    ///
+    /// No-op on a secondary (read-only) provider — a reader has nothing to
+    /// quiesce.
+    pub fn flush_all_for_snapshot(&self) -> ProviderResult<()> {
+        if matches!(&*self.0, RocksDBProviderInner::Secondary { .. }) {
+            return Ok(());
+        }
+        self.flush(ROCKSDB_TABLES)
+    }
+
     /// Creates a raw iterator over all entries in the specified table.
     ///
     /// Returns raw `(key_bytes, value_bytes)` pairs without decoding.

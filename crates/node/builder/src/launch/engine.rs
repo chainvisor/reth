@@ -32,7 +32,7 @@ use reth_node_core::{
 use reth_node_events::node;
 use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider},
-    BlockNumReader, HeaderProvider, StorageSettingsCache,
+    BlockNumReader, HeaderProvider, RocksDBProviderFactory, StorageSettingsCache,
 };
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
@@ -335,6 +335,61 @@ impl EngineNodeLauncher {
                     }
                 },
             );
+        }
+
+        // chainvisor writer snapshot quiesce (FlushInPlace): when
+        // CV_RETH_FLUSH_ON_SIGUSR1=1, a SIGUSR1 drains all RocksDB memtables to
+        // SST + syncs the WAL (`RocksDBProvider::flush_all_for_snapshot`), then
+        // touches CV_RETH_FLUSH_MARKER_PATH. The writer (chainvisor shadower —
+        // reth's PARENT process in the same container) signals this immediately
+        // BEFORE its FIFREEZE + `lvcreate -s`, then waits for the marker, so the
+        // LVM snapshot captures a crash-consistent RocksDB. Needed because the
+        // writer opens RocksDB with `wal_ttl_seconds=0` (obsolete WALs deleted
+        // immediately): an un-flushed memtable racing the freeze yields a
+        // reader-side `Corruption: SST file is ahead of WALs`. Default off; never
+        // armed on a reader (and `flush_all_for_snapshot` is a no-op on a
+        // read-only/secondary provider regardless).
+        if std::env::var("CV_RETH_FLUSH_ON_SIGUSR1").as_deref() == Ok("1") {
+            match std::env::var("CV_RETH_FLUSH_MARKER_PATH") {
+                Ok(marker_path) => {
+                    let flush_provider = provider.clone();
+                    ctx.task_executor().spawn_critical_task(
+                        "rocksdb snapshot-flush signal handler",
+                        async move {
+                            loop {
+                                let mut sigusr1 = match tokio::signal::unix::signal(
+                                    tokio::signal::unix::SignalKind::user_defined1(),
+                                ) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        error!(target: "reth::cli", %e, "rocksdb snapshot-flush: SIGUSR1 install failed; retry 30s");
+                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        continue;
+                                    }
+                                };
+                                info!(target: "reth::cli", marker = %marker_path, "rocksdb snapshot-flush SIGUSR1 handler armed");
+                                while sigusr1.recv().await.is_some() {
+                                    let started = std::time::Instant::now();
+                                    match flush_provider.rocksdb_provider().flush_all_for_snapshot() {
+                                        Ok(()) => match std::fs::write(&marker_path, b"") {
+                                            Ok(()) => info!(
+                                                target: "reth::cli",
+                                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                                "rocksdb snapshot-flush complete"
+                                            ),
+                                            Err(e) => error!(target: "reth::cli", %e, "rocksdb snapshot-flush: marker write failed"),
+                                        },
+                                        Err(e) => error!(target: "reth::cli", %e, "rocksdb snapshot-flush failed"),
+                                    }
+                                }
+                            }
+                        },
+                    );
+                }
+                Err(_) => {
+                    error!(target: "reth::cli", "CV_RETH_FLUSH_ON_SIGUSR1=1 but CV_RETH_FLUSH_MARKER_PATH unset — snapshot-flush handler NOT armed");
+                }
+            }
         }
 
         let (exit, rx) = oneshot::channel();
