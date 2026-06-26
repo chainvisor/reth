@@ -41,6 +41,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 use tracing::{info, instrument, trace, warn};
 
@@ -66,6 +67,12 @@ struct ReadOnlySyncState {
     last_synced_txnid: AtomicU64,
     /// Serializes the slow-path catch-up (`RocksDB` + static file re-init).
     sync_lock: Mutex<()>,
+    /// Wall-clock gate for the FORCE refresh. `last_txnid()` is read through
+    /// our RDONLY MDBX mmap, which goes STALE when chainvisor base-advances the
+    /// device under us (the meta page changes externally) — so the txnid gate
+    /// never moves and a trusting reader freezes at its boot head. Force a
+    /// static-file/RocksDB re-read on this short cadence to follow committed tip.
+    last_refresh: Mutex<Instant>,
 }
 
 /// A common provider that fetches data from a database or static file.
@@ -231,6 +238,7 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         let state = Arc::new(ReadOnlySyncState {
             last_synced_txnid: AtomicU64::new(0),
             sync_lock: Mutex::new(()),
+            last_refresh: Mutex::new(Instant::now()),
         });
         self.read_only_sync = Some(state);
 
@@ -293,8 +301,25 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         let Some(sync_state) = &self.read_only_sync else { return Ok(()) };
         let current_txnid = self.db.last_txnid().unwrap_or(0);
 
-        // Fast path: no contention when nothing changed.
-        if current_txnid == sync_state.last_synced_txnid.load(Ordering::Relaxed) {
+        // FORCE-refresh gate. `current_txnid` is read through our RDONLY MDBX
+        // mmap, which goes STALE when chainvisor base-advances the device under
+        // us — so the txnid fast-path below would freeze a trusting reader at
+        // its boot head forever (the device's committed tip advances but our
+        // mapped meta never changes). Independently force a static-file/RocksDB
+        // re-read on a short wall-clock cadence so committed tip keeps being
+        // followed. Re-reads only FINALIZED static files → integrity-safe.
+        let force = {
+            let mut last = sync_state.last_refresh.lock().unwrap_or_else(|e| e.into_inner());
+            if last.elapsed() >= Duration::from_secs(2) {
+                *last = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+
+        // Fast path: no contention when nothing changed and no forced refresh due.
+        if !force && current_txnid == sync_state.last_synced_txnid.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -302,12 +327,15 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         let _guard = sync_state.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // Double-check after acquiring the lock — another thread may have already synced.
-        if current_txnid == sync_state.last_synced_txnid.load(Ordering::Relaxed) {
+        if !force && current_txnid == sync_state.last_synced_txnid.load(Ordering::Relaxed) {
             return Ok(());
         }
 
         self.rocksdb_provider.try_catch_up_with_primary()?;
-        self.static_file_provider.initialize_index()?;
+        // force_refresh (not initialize_index): drop the stale jar mmaps + the
+        // kernel page cache so the re-scan re-reads the externally-advanced
+        // device, not our boot-time cached pages.
+        self.static_file_provider.force_refresh()?;
         sync_state.last_synced_txnid.store(current_txnid, Ordering::Relaxed);
         Ok(())
     }

@@ -1176,6 +1176,27 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         Ok(())
     }
 
+    /// Force-refresh the static-file view after the underlying device was
+    /// advanced EXTERNALLY (the chainvisor base-advance rewrote/extended the
+    /// NippyJar files under our live RDONLY mmap, so neither our cached jar
+    /// mmaps nor the kernel page cache reflect the writer's newly-committed
+    /// blocks). Drops the cached jar handles + the kernel page/slab cache,
+    /// then re-scans the directory + headers so the next reads see the fresh
+    /// blocks. Re-reads only FINALIZED static files → data-integrity-safe;
+    /// the drop_caches write is best-effort (needs CAP_SYS_ADMIN — the reader
+    /// guest runs privileged; a failure just leaves the page cache, i.e. a
+    /// no-op refresh, never corruption).
+    pub fn force_refresh(&self) -> ProviderResult<()> {
+        // Drop cached jar handles → munmap the stale mappings so the kernel
+        // page cache backing them becomes reclaimable.
+        self.map.clear();
+        // Drop the kernel page + slab (inode/dentry) cache so the re-scan
+        // re-reads the advanced device rather than our stale cached pages.
+        let _ = std::fs::write("/proc/sys/vm/drop_caches", "3");
+        // Re-scan the directory + jar headers with the now-fresh data.
+        self.initialize_index()
+    }
+
     /// Initializes the inner transaction and block index
     pub fn initialize_index(&self) -> ProviderResult<()> {
         let mut indexes = self.indexes.write();
