@@ -314,7 +314,18 @@ impl EngineNodeLauncher {
                             Ok(n) => n,
                             Err(_) => continue,
                         };
-                        if tip == last_adopted {
+                        // Monotonic head guard. The writer's committed tip is
+                        // FINAL (committed blocks don't roll back), so a `tip`
+                        // far BELOW `last_adopted` is a transient static-file
+                        // re-scan inconsistency (the force_refresh poll racing
+                        // the chainvisor base-advance), NOT a real regression —
+                        // adopting it would serve a stale (e.g. ~10h-old) head.
+                        // Skip an unchanged tip and any drop deeper than a
+                        // shallow reorg; still follow small (<= 64) reorgs.
+                        const REORG_TOLERANCE: u64 = 64;
+                        if tip == last_adopted
+                            || (tip < last_adopted && last_adopted - tip > REORG_TOLERANCE)
+                        {
                             continue;
                         }
                         match poll_provider.sealed_header(tip) {
