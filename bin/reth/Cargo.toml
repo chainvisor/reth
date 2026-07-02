@@ -27,6 +27,9 @@ systemd-units = { enable = false, start = false, unit-name = "reth", unit-script
 workspace = true
 
 [dependencies]
+# chainvisor: SIGUSR1 disposition shield in main() (FlushInPlace quiesce safety)
+libc.workspace = true
+
 # reth
 reth-ethereum-cli.workspace = true
 reth-chainspec.workspace = true

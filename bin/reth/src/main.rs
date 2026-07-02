@@ -20,6 +20,24 @@ use tracing::info;
 fn main() {
     reth_cli_util::sigsegv_handler::install();
 
+    // chainvisor FlushInPlace quiesce shield: when the writer (chainvisor, our
+    // parent in the same container) is configured with
+    // CV_SNAPSHOT_QUIESCE=flush-in-place it sends us SIGUSR1 before every LVM
+    // snapshot and waits for the marker file. The flush handler proper only
+    // arms once the provider is up (launch/engine.rs, gated on the same env
+    // var) — but the default SIGUSR1 disposition TERMINATES the process, so a
+    // quiesce landing during the (minutes-long) cold-open / RocksDB WAL replay
+    // killed the guest on every snapshot tick (measured 2026-07-02:
+    // `guest exited s=ExitStatus(unix_wait_status(10))` in a restart loop).
+    // Ignore SIGUSR1 from the first instruction; tokio's signal stream
+    // replaces the disposition when the real handler arms. Until then the
+    // writer's marker wait times out and it aborts that snapshot loudly —
+    // exactly the intended "failed quiesce must abort" semantics.
+    #[cfg(unix)]
+    if std::env::var("CV_RETH_FLUSH_ON_SIGUSR1").as_deref() == Ok("1") {
+        unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+    }
+
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
