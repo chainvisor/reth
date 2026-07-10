@@ -21,7 +21,6 @@ use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, HeaderProvider, ProviderError, ProviderFactory,
     RocksDBProviderFactory, StageCheckpointReader,
 };
-use reth_prune::PruneModes;
 use reth_stages::{prelude::*, ControlFlow, Pipeline, StageId, StageSet};
 use reth_static_file::StaticFileProducer;
 use reth_storage_api::StorageSettingsCache;
@@ -123,8 +122,14 @@ where
         .sealed_header(provider_factory.last_block_number()?)?
         .expect("should have genesis");
 
-    let static_file_producer =
-        StaticFileProducer::new(provider_factory.clone(), PruneModes::default());
+    // Import must preserve the node's storage contract.  In particular, minimal
+    // nodes recover senders inline and fully prune SenderRecovery; replacing the
+    // configured modes with defaults would make the offline pipeline rebuild a
+    // segment that the live engine intentionally does not persist.
+    let static_file_producer = StaticFileProducer::new(
+        provider_factory.clone(),
+        config.prune.segments.clone(),
+    );
 
     // Track if we stopped due to an invalid block
     let mut stopped_on_invalid_block = false;
@@ -329,7 +334,7 @@ where
                 body_downloader,
                 evm_config,
                 config.stages.clone(),
-                PruneModes::default(),
+                config.prune.segments.clone(),
                 None,
             )
             .builder()
