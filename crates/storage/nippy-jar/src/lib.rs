@@ -354,6 +354,29 @@ pub struct DataReader {
     offset_size: u8,
 }
 
+/// Stable logical-read seam consumed by chainvisor's stock-reth writer
+/// uprobe. The call happens after the offsets mmap produced a valid byte
+/// offset and immediately before the caller slices the NippyJar data mmap.
+///
+/// A versioned, unmangled C ABI makes the three scalar arguments stable on
+/// SysV AMD64 (`reader=%rdi`, `index=%rsi`, `offset=%rdx`). `black_box`, the
+/// used return value, and `inline(never)` jointly keep the call edge alive in
+/// the optimized reth binary without changing the value observed by reth.
+#[doc(hidden)]
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub extern "C" fn chainvisor_reth_nippyjar_offset_probe_v1(
+    reader: *const DataReader,
+    index: usize,
+    offset: u64,
+) -> u64 {
+    let (_, _, offset) = std::hint::black_box((reader, index, offset));
+    offset
+}
+
+const _: extern "C" fn(*const DataReader, usize, u64) -> u64 =
+    chainvisor_reth_nippyjar_offset_probe_v1;
+
 impl DataReader {
     /// Reads the respective data and offsets file and returns [`DataReader`].
     pub fn new(path: impl AsRef<Path>) -> Result<Self, NippyJarError> {
@@ -408,18 +431,8 @@ impl DataReader {
     /// address in the gigabyte range — past any data file's size.
     ///
     /// This wrapper sidesteps sret by returning a plain `u64`.
-    /// chainvisor's matcher anchors on `DataReader::offset_u64::`
-    /// (with trailing `::` to disambiguate from
-    /// `offset_at`/`offsets_count`/`offset_size`).
-    ///
-    /// **`#[inline(never)]` is load-bearing** — without it the
-    /// Rust compiler inlines this body into [`Self::offset`] (and
-    /// transitively into every `NippyJarCursor::read_value`
-    /// call site), erasing the symbol and breaking the probe
-    /// install. The performance cost is sub-percent: one
-    /// multiplication + a small mmap touch, dwarfed by what
-    /// the caller does with the returned offset.
-    #[inline(never)]
+    /// Chainvisor captures the successfully resolved value at the stable
+    /// C-ABI seam above, so this implementation may remain optimizer-visible.
     pub fn offset_u64(&self, index: usize) -> u64 {
         // + 1 represents the offset_len u8 which is in the beginning of the file
         let from = index * self.offset_size as usize + 1;
@@ -437,13 +450,16 @@ impl DataReader {
     /// hot path (cursor reads) keeps its established error-
     /// propagation shape while the uprobe-friendly helper exists
     /// for chainvisor to attach to.
-    #[inline(never)]
     pub fn offset(&self, index: usize) -> Result<u64, NippyJarError> {
         let raw = self.offset_u64(index);
         if raw == u64::MAX {
             Err(NippyJarError::OffsetOutOfBounds { index })
         } else {
-            Ok(raw)
+            Ok(chainvisor_reth_nippyjar_offset_probe_v1(
+                self as *const Self,
+                index,
+                raw,
+            ))
         }
     }
 
@@ -510,6 +526,15 @@ mod tests {
 
     type ColumnResults<T> = Vec<ColumnResult<T>>;
     type ColumnValues = Vec<Vec<u8>>;
+
+    #[test]
+    fn chainvisor_offset_probe_preserves_the_resolved_offset() {
+        let offset = 0x1234_5678_9abc_def0;
+        assert_eq!(
+            chainvisor_reth_nippyjar_offset_probe_v1(std::ptr::null(), 17, offset),
+            offset
+        );
+    }
 
     fn test_data(seed: Option<u64>) -> (ColumnValues, ColumnValues) {
         let value_length = 32;
