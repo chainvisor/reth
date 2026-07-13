@@ -18,6 +18,7 @@ use std::{
     error::Error as StdError,
     fs::File,
     io::{self, Read, Write},
+    os::unix::fs::MetadataExt,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -352,35 +353,47 @@ pub struct DataReader {
     offset_mmap: Mmap,
     /// Number of bytes that represent one offset.
     offset_size: u8,
+    /// Exact filesystem identity of the data file. These values are
+    /// captured once from the open descriptor, so the chainvisor logical-read
+    /// marker can identify the file without guessing from a non-unique offset.
+    data_dev: u64,
+    data_ino: u64,
 }
 
 /// Stable logical-read seam consumed by chainvisor's stock-reth writer
 /// uprobe. The call happens after the offsets mmap produced a valid byte
 /// offset and immediately before the caller slices the NippyJar data mmap.
 ///
-/// A versioned, unmangled C ABI makes the three scalar arguments stable on
-/// SysV AMD64 (`reader=%rdi`, `index=%rsi`, `offset=%rdx`). `black_box`, the
-/// used return value, and `inline(never)` jointly keep the call edge alive in
-/// the optimized reth binary without changing the value observed by reth.
+/// A versioned, unmangled C ABI makes the four scalar arguments stable on
+/// SysV AMD64 (`dev=%rdi`, `ino=%rsi`, `index=%rdx`, `offset=%rcx`). Device
+/// and inode come from the still-open data-file descriptor and uniquely name
+/// the mmap backing this reader; `(index, offset)` remains an independent
+/// sidecar-consistency check. `black_box`, the used return value, and
+/// `inline(never)` jointly keep the call edge alive in the optimized reth
+/// binary without changing the value observed by reth.
 #[doc(hidden)]
 #[inline(never)]
 #[unsafe(no_mangle)]
-pub extern "C" fn chainvisor_reth_nippyjar_offset_probe_v1(
-    reader: *const DataReader,
+pub extern "C" fn chainvisor_reth_nippyjar_offset_probe_v2(
+    data_dev: u64,
+    data_ino: u64,
     index: usize,
     offset: u64,
 ) -> u64 {
-    let (_, _, offset) = std::hint::black_box((reader, index, offset));
+    let (_, _, _, offset) = std::hint::black_box((data_dev, data_ino, index, offset));
     offset
 }
 
-const _: extern "C" fn(*const DataReader, usize, u64) -> u64 =
-    chainvisor_reth_nippyjar_offset_probe_v1;
+const _: extern "C" fn(u64, u64, usize, u64) -> u64 =
+    chainvisor_reth_nippyjar_offset_probe_v2;
 
 impl DataReader {
     /// Reads the respective data and offsets file and returns [`DataReader`].
     pub fn new(path: impl AsRef<Path>) -> Result<Self, NippyJarError> {
         let data_file = File::open(path.as_ref())?;
+        let data_metadata = data_file.metadata()?;
+        let data_dev = data_metadata.dev();
+        let data_ino = data_metadata.ino();
         // SAFETY: File is read-only and its descriptor is kept alive as long as the mmap handle.
         let data_mmap = unsafe { Mmap::map(&data_file)? };
 
@@ -398,7 +411,15 @@ impl DataReader {
             return Err(NippyJarError::OffsetSizeTooSmall { offset_size })
         }
 
-        Ok(Self { data_file, data_mmap, offset_file, offset_size, offset_mmap })
+        Ok(Self {
+            data_file,
+            data_mmap,
+            offset_file,
+            offset_size,
+            offset_mmap,
+            data_dev,
+            data_ino,
+        })
     }
 
     /// Returns the offset for the requested data index as a raw
@@ -455,8 +476,9 @@ impl DataReader {
         if raw == u64::MAX {
             Err(NippyJarError::OffsetOutOfBounds { index })
         } else {
-            Ok(chainvisor_reth_nippyjar_offset_probe_v1(
-                self as *const Self,
+            Ok(chainvisor_reth_nippyjar_offset_probe_v2(
+                self.data_dev,
+                self.data_ino,
                 index,
                 raw,
             ))
@@ -531,9 +553,20 @@ mod tests {
     fn chainvisor_offset_probe_preserves_the_resolved_offset() {
         let offset = 0x1234_5678_9abc_def0;
         assert_eq!(
-            chainvisor_reth_nippyjar_offset_probe_v1(std::ptr::null(), 17, offset),
+            chainvisor_reth_nippyjar_offset_probe_v2(11, 22, 17, offset),
             offset
         );
+    }
+
+    #[test]
+    fn chainvisor_data_reader_caches_exact_data_file_identity() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"data").unwrap();
+        std::fs::write(file.path().with_extension(OFFSETS_FILE_EXTENSION), [8u8]).unwrap();
+
+        let metadata = std::fs::metadata(file.path()).unwrap();
+        let reader = DataReader::new(file.path()).unwrap();
+        assert_eq!((reader.data_dev, reader.data_ino), (metadata.dev(), metadata.ino()));
     }
 
     fn test_data(seed: Option<u64>) -> (ColumnValues, ColumnValues) {
