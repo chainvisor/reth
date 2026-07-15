@@ -95,6 +95,16 @@ use futures::{future::Either, stream, Stream, StreamExt};
 use reth_node_ethstats::EthStatsService;
 use reth_node_events::{cl::ConsensusLayerHealthEvents, node::NodeEvent};
 
+/// Whether a stage is installed in the pipeline whose consistency is being checked.
+const fn pipeline_consistency_stage_enabled(
+    stage: StageId,
+    era_enabled: bool,
+    sender_recovery_pruning_enabled: bool,
+) -> bool {
+    (era_enabled || !matches!(stage, StageId::Era)) &&
+        (sender_recovery_pruning_enabled || !matches!(stage, StageId::PruneSenderRecovery))
+}
+
 /// Reusable setup for launching a node.
 ///
 /// This is the entry point for the node launch process. It implements a builder
@@ -990,10 +1000,14 @@ where
     ///
     /// A target block hash if the pipeline is inconsistent, otherwise `None`.
     pub fn check_pipeline_consistency(&self) -> ProviderResult<Option<B256>> {
-        // We skip the era stage if it's not enabled
+        // Optional cursors are ownership checks only when their corresponding stage is installed.
+        // In particular, a stale PruneSenderRecovery checkpoint from an old configuration cannot
+        // be repaired by a pipeline without sender-recovery pruning.
         let era_enabled = self.era_import_source().is_some();
-        let mut all_stages =
-            StageId::ALL.into_iter().filter(|id| era_enabled || id != &StageId::Era);
+        let sender_recovery_pruning_enabled = self.prune_modes().sender_recovery.is_some();
+        let mut all_stages = StageId::ALL.into_iter().filter(|id| {
+            pipeline_consistency_stage_enabled(*id, era_enabled, sender_recovery_pruning_enabled)
+        });
 
         // Get the expected first stage based on config.
         let first_stage = all_stages.next().expect("there must be at least one stage");
@@ -1311,9 +1325,10 @@ pub fn metrics_hooks<N: NodeTypesWithDB>(provider_factory: &ProviderFactory<N>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchContext, NodeConfig};
+    use super::{pipeline_consistency_stage_enabled, LaunchContext, NodeConfig};
     use reth_config::Config;
     use reth_node_core::args::PruningArgs;
+    use reth_stages::StageId;
 
     const EXTENSION: &str = "toml";
 
@@ -1364,5 +1379,12 @@ mod tests {
 
             assert_eq!(reth_config, loaded_config);
         })
+    }
+
+    #[test]
+    fn pipeline_consistency_tracks_only_configured_sender_recovery_owner() {
+        assert!(!pipeline_consistency_stage_enabled(StageId::PruneSenderRecovery, false, false));
+        assert!(pipeline_consistency_stage_enabled(StageId::PruneSenderRecovery, false, true));
+        assert!(pipeline_consistency_stage_enabled(StageId::Headers, false, false));
     }
 }

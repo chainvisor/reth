@@ -46,7 +46,10 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     ops::{RangeBounds, RangeInclusive},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::broadcast;
 
@@ -68,10 +71,13 @@ pub struct MockEthProvider<T: NodePrimitives = EthPrimitives, ChainSpec = reth_c
     pub state_roots: Arc<Mutex<Vec<B256>>>,
     /// Local block body indices store
     pub block_body_indices: Arc<Mutex<HashMap<BlockNumber, StoredBlockBodyIndices>>>,
+    /// Pipeline stage checkpoints used by coordination tests.
+    pub stage_checkpoints: Arc<Mutex<HashMap<StageId, StageCheckpoint>>>,
     /// Local BAL store handle
     pub bal_store: BalStoreHandle,
     tx: TxMock,
     prune_modes: Arc<PruneModes>,
+    database_provider_access: Arc<AtomicBool>,
 }
 
 impl<T: NodePrimitives, ChainSpec> Clone for MockEthProvider<T, ChainSpec>
@@ -87,9 +93,11 @@ where
             chain_spec: self.chain_spec.clone(),
             state_roots: self.state_roots.clone(),
             block_body_indices: self.block_body_indices.clone(),
+            stage_checkpoints: self.stage_checkpoints.clone(),
             bal_store: self.bal_store.clone(),
             tx: self.tx.clone(),
             prune_modes: self.prune_modes.clone(),
+            database_provider_access: self.database_provider_access.clone(),
         }
     }
 }
@@ -105,9 +113,11 @@ impl<T: NodePrimitives> MockEthProvider<T, reth_chainspec::ChainSpec> {
             chain_spec: Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build()),
             state_roots: Default::default(),
             block_body_indices: Default::default(),
+            stage_checkpoints: Default::default(),
             bal_store: Default::default(),
             tx: Default::default(),
             prune_modes: Default::default(),
+            database_provider_access: Default::default(),
         }
     }
 }
@@ -124,6 +134,12 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
         for (hash, block) in iter {
             self.add_block(hash, block)
         }
+    }
+
+    /// Remove a block and its header from the local stores.
+    pub fn remove_block(&self, hash: B256) {
+        self.blocks.lock().remove(&hash);
+        self.headers.lock().remove(&hash);
     }
 
     /// Add header to local header store
@@ -174,6 +190,33 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
         self.block_body_indices.lock().insert(block_number, indices);
     }
 
+    /// Set a pipeline stage checkpoint.
+    pub fn set_stage_checkpoint(&self, stage: StageId, checkpoint: StageCheckpoint) {
+        self.stage_checkpoints.lock().insert(stage, checkpoint);
+    }
+
+    /// Remove a pipeline stage checkpoint.
+    pub fn remove_stage_checkpoint(&self, stage: StageId) {
+        self.stage_checkpoints.lock().remove(&stage);
+    }
+
+    /// Set the prune modes exposed by this test provider.
+    pub fn with_prune_modes(mut self, prune_modes: PruneModes) -> Self {
+        self.prune_modes = Arc::new(prune_modes);
+        self
+    }
+
+    /// Allow this mock to vend cloned read/write database providers.
+    pub fn with_database_provider_access(self) -> Self {
+        self.database_provider_access.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Enable or disable cloned read/write database providers for this mock.
+    pub fn set_database_provider_access(&self, enabled: bool) {
+        self.database_provider_access.store(enabled, Ordering::Relaxed);
+    }
+
     /// Add state root to local state root store
     pub fn add_state_root(&self, state_root: B256) {
         self.state_roots.lock().push(state_root);
@@ -189,9 +232,11 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
             chain_spec: Arc::new(chain_spec),
             state_roots: self.state_roots,
             block_body_indices: self.block_body_indices,
+            stage_checkpoints: self.stage_checkpoints,
             bal_store: self.bal_store,
             tx: self.tx,
             prune_modes: self.prune_modes,
+            database_provider_access: self.database_provider_access,
         }
     }
 
@@ -268,11 +313,19 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Clone + 'static> DatabaseProvi
     type ProviderRW = Self;
 
     fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
-        Err(ConsistentViewError::Syncing { best_block: GotExpected::new(0, 0) }.into())
+        if self.database_provider_access.load(Ordering::Relaxed) {
+            Ok(self.clone())
+        } else {
+            Err(ConsistentViewError::Syncing { best_block: GotExpected::new(0, 0) }.into())
+        }
     }
 
     fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
-        Err(ConsistentViewError::Syncing { best_block: GotExpected::new(0, 0) }.into())
+        if self.database_provider_access.load(Ordering::Relaxed) {
+            Ok(self.clone())
+        } else {
+            Err(ConsistentViewError::Syncing { best_block: GotExpected::new(0, 0) }.into())
+        }
     }
 }
 
@@ -756,8 +809,8 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> AccountReader for MockEthProvide
 impl<T: NodePrimitives, ChainSpec: Send + Sync> StageCheckpointReader
     for MockEthProvider<T, ChainSpec>
 {
-    fn get_stage_checkpoint(&self, _id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
-        Ok(None)
+    fn get_stage_checkpoint(&self, id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
+        Ok(self.stage_checkpoints.lock().get(&id).cloned())
     }
 
     fn get_stage_checkpoint_progress(&self, _id: StageId) -> ProviderResult<Option<Vec<u8>>> {
@@ -765,7 +818,12 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> StageCheckpointReader
     }
 
     fn get_all_checkpoints(&self) -> ProviderResult<Vec<(String, StageCheckpoint)>> {
-        Ok(vec![])
+        Ok(self
+            .stage_checkpoints
+            .lock()
+            .iter()
+            .map(|(stage, checkpoint)| (stage.to_string(), checkpoint.clone()))
+            .collect())
     }
 }
 

@@ -1,4 +1,8 @@
-use crate::metrics::PersistenceMetrics;
+use crate::{
+    metrics::PersistenceMetrics,
+    persistence_fence::{PersistenceCheckpointSnapshot, PersistenceFenceError},
+};
+use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumHash;
 use crossbeam_channel::Sender as CrossbeamSender;
 use reth_chain_state::ExecutedBlock;
@@ -31,6 +35,9 @@ pub struct PersistenceResult {
     /// The commit duration, only available for save-blocks operations.
     pub commit_duration: Option<Duration>,
 }
+
+/// Typed completion sent back to the engine tree for every persistence action.
+pub type PersistenceActionResult = Result<PersistenceResult, PersistenceError>;
 
 /// Writes parts of reth's in memory tree state to the database and static files.
 ///
@@ -96,16 +103,33 @@ where
         while let Ok(action) = self.incoming.recv() {
             match action {
                 PersistenceAction::RemoveBlocksAbove(new_tip_num, sender) => {
-                    let last_block = self.on_remove_blocks_above(new_tip_num)?;
-                    // send new sync metrics based on removed blocks
-                    let _ =
-                        self.sync_metrics_tx.send(MetricEvent::SyncHeight { height: new_tip_num });
-                    let _ = sender.send(PersistenceResult { last_block, commit_duration: None });
+                    let result = self
+                        .on_remove_blocks_above(new_tip_num)
+                        .map(|last_block| PersistenceResult { last_block, commit_duration: None });
+                    if result.is_ok() {
+                        let _ = self
+                            .sync_metrics_tx
+                            .send(MetricEvent::SyncHeight { height: new_tip_num });
+                    }
+                    let failed = result.is_err();
+                    if let Err(err) = &result {
+                        error!(target: "engine::persistence", %err, "Persistence action failed; stopping service");
+                    }
+                    let _ = sender.send(result);
+                    if failed {
+                        return Ok(())
+                    }
                 }
-                PersistenceAction::SaveBlocks(blocks, sender) => {
-                    let result = self.on_save_blocks(blocks)?;
-                    let result_number = result.last_block.map(|b| b.number);
-
+                PersistenceAction::SaveBlocks(blocks, expected_last_persisted, sender) => {
+                    let result = self.on_save_blocks(blocks, expected_last_persisted);
+                    let result_number = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|result| result.last_block.map(|block| block.number));
+                    let failed = result.is_err();
+                    if let Err(err) = &result {
+                        error!(target: "engine::persistence", %err, "Persistence action failed; stopping service");
+                    }
                     let _ = sender.send(result);
 
                     if let Some(block_number) = result_number {
@@ -113,6 +137,9 @@ where
                         let _ = self
                             .sync_metrics_tx
                             .send(MetricEvent::SyncHeight { height: block_number });
+                    }
+                    if failed {
+                        return Ok(())
                     }
                 }
                 PersistenceAction::SaveFinalizedBlock(finalized_block) => {
@@ -148,8 +175,11 @@ where
     fn on_save_blocks(
         &mut self,
         blocks: Vec<ExecutedBlock<N::Primitives>>,
+        expected_last_persisted: BlockNumHash,
     ) -> Result<PersistenceResult, PersistenceError> {
-        let first_block = blocks.first().map(|b| b.recovered_block.num_hash());
+        let first_block = blocks
+            .first()
+            .map(|block| (block.recovered_block.num_hash(), block.recovered_block.parent_hash()));
         let last_block = blocks.last().map(|b| b.recovered_block.num_hash());
         let block_count = blocks.len();
 
@@ -162,6 +192,36 @@ where
 
         if let Some(last) = last_block {
             let provider_rw = self.provider.database_provider_rw()?;
+            let snapshot = PersistenceCheckpointSnapshot::read(&provider_rw)?;
+            let finish = match snapshot.validate(expected_last_persisted) {
+                Ok(finish) => finish,
+                Err(err) => {
+                    self.metrics.fence_rejections.increment(1);
+                    return Err(err.into())
+                }
+            };
+            if let Some((first, parent_hash)) = first_block &&
+                let Err(err) = PersistenceCheckpointSnapshot::validate_first_block(
+                    finish,
+                    first,
+                    parent_hash,
+                )
+            {
+                self.metrics.fence_rejections.increment(1);
+                return Err(err.into())
+            }
+            for pair in blocks.windows(2) {
+                let previous = pair[0].recovered_block.num_hash();
+                let next = pair[1].recovered_block.num_hash();
+                if let Err(err) = PersistenceCheckpointSnapshot::validate_next_block(
+                    previous,
+                    next,
+                    pair[1].recovered_block.parent_hash(),
+                ) {
+                    self.metrics.fence_rejections.increment(1);
+                    return Err(err.into())
+                }
+            }
             provider_rw.save_blocks(blocks, SaveBlocksMode::Full)?;
 
             if let Some(finalized) = pending_finalized {
@@ -207,6 +267,10 @@ where
 /// One of the errors that can happen when using the persistence service.
 #[derive(Debug, Error)]
 pub enum PersistenceError {
+    /// Engine persistence attempted to overlap a pipeline-owned range.
+    #[error(transparent)]
+    Fence(#[from] PersistenceFenceError),
+
     /// A pruner error
     #[error(transparent)]
     PrunerError(#[from] PrunerError),
@@ -224,13 +288,13 @@ pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
     ///
     /// First, header, transaction, and receipt-related data should be written to static files.
     /// Then the execution history-related data will be written to the database.
-    SaveBlocks(Vec<ExecutedBlock<N>>, CrossbeamSender<PersistenceResult>),
+    SaveBlocks(Vec<ExecutedBlock<N>>, BlockNumHash, CrossbeamSender<PersistenceActionResult>),
 
     /// Removes block data above the given block number from the database.
     ///
     /// This will first update checkpoints from the database, then remove actual block data from
     /// static files.
-    RemoveBlocksAbove(u64, CrossbeamSender<PersistenceResult>),
+    RemoveBlocksAbove(u64, CrossbeamSender<PersistenceActionResult>),
 
     /// Update the persisted finalized block on disk
     SaveFinalizedBlock(u64),
@@ -309,9 +373,10 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     pub fn save_blocks(
         &self,
         blocks: Vec<ExecutedBlock<T>>,
-        tx: CrossbeamSender<PersistenceResult>,
+        expected_last_persisted: BlockNumHash,
+        tx: CrossbeamSender<PersistenceActionResult>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
-        self.send_action(PersistenceAction::SaveBlocks(blocks, tx))
+        self.send_action(PersistenceAction::SaveBlocks(blocks, expected_last_persisted, tx))
     }
 
     /// Queues the finalized block number to be persisted on disk.
@@ -344,7 +409,7 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     pub fn remove_blocks_above(
         &self,
         block_num: u64,
-        tx: CrossbeamSender<PersistenceResult>,
+        tx: CrossbeamSender<PersistenceActionResult>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
         self.send_action(PersistenceAction::RemoveBlocksAbove(block_num, tx))
     }
@@ -379,15 +444,58 @@ mod tests {
     use reth_exex_types::FinishedExExHeight;
     use reth_provider::{
         providers::{ProviderFactoryBuilder, ReadOnlyConfig},
-        test_utils::{create_test_provider_factory, MockNodeTypes},
-        AccountReader, ChainSpecProvider, HeaderProvider, StorageSettingsCache,
+        test_utils::{create_test_provider_factory, MockNodeTypes, MockNodeTypesWithDB},
+        AccountReader, BlockBodyIndicesProvider, ChainSpecProvider, HeaderProvider,
+        StageCheckpointReader, StageCheckpointWriter, StorageSettingsCache,
         TryIntoHistoricalStateProvider,
     };
     use reth_prune::Pruner;
+    use reth_stages_api::StageId;
+    use std::ops::Range;
     use tokio::sync::mpsc::unbounded_channel;
 
-    fn default_persistence_handle() -> PersistenceHandle<EthPrimitives> {
+    fn executed_chain(range: Range<u64>, mut parent_hash: B256) -> Vec<ExecutedBlock> {
+        let mut builder = TestBlockBuilder::eth();
+        range
+            .map(|number| {
+                let block = builder.get_executed_block_with_number(number, parent_hash);
+                parent_hash = block.recovered_block().hash();
+                block
+            })
+            .collect()
+    }
+
+    fn persistence_service(
+        provider: ProviderFactory<MockNodeTypesWithDB>,
+    ) -> PersistenceService<MockNodeTypesWithDB> {
+        let (_finished_exex_height_tx, finished_exex_height_rx) =
+            tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
+        let pruner =
+            Pruner::new_with_factory(provider.clone(), vec![], 5, 0, None, finished_exex_height_rx);
+        let (_action_tx, action_rx) = std::sync::mpsc::channel();
+        let (sync_metrics_tx, _sync_metrics_rx) = unbounded_channel();
+        PersistenceService::new(provider, action_rx, pruner, sync_metrics_tx)
+    }
+
+    fn seeded_provider(
+        block_count: u64,
+        persisted_count: usize,
+    ) -> (ProviderFactory<MockNodeTypesWithDB>, Vec<ExecutedBlock<EthPrimitives>>) {
         let provider = create_test_provider_factory();
+        let blocks = executed_chain(0..block_count, B256::ZERO);
+        let provider_rw = provider.database_provider_rw().unwrap();
+        provider_rw.save_blocks(blocks[..persisted_count].to_vec(), SaveBlocksMode::Full).unwrap();
+        provider_rw.commit().unwrap();
+        (provider, blocks)
+    }
+
+    fn default_persistence_handle() -> (PersistenceHandle<EthPrimitives>, BlockNumHash) {
+        let provider = create_test_provider_factory();
+        let genesis = TestBlockBuilder::eth().get_executed_block_with_number(0, B256::random());
+        let genesis_num_hash = genesis.recovered_block().num_hash();
+        let provider_rw = provider.database_provider_rw().unwrap();
+        provider_rw.save_blocks(vec![genesis], SaveBlocksMode::Full).unwrap();
+        provider_rw.commit().unwrap();
 
         let (_finished_exex_height_tx, finished_exex_height_rx) =
             tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
@@ -396,39 +504,43 @@ mod tests {
             Pruner::new_with_factory(provider.clone(), vec![], 5, 0, None, finished_exex_height_rx);
 
         let (sync_metrics_tx, _sync_metrics_rx) = unbounded_channel();
-        PersistenceHandle::<EthPrimitives>::spawn_service(provider, pruner, sync_metrics_tx)
+        (
+            PersistenceHandle::<EthPrimitives>::spawn_service(provider, pruner, sync_metrics_tx),
+            genesis_num_hash,
+        )
     }
 
     #[test]
     fn test_save_blocks_empty() {
         reth_tracing::init_test_tracing();
-        let handle = default_persistence_handle();
+        let (handle, genesis) = default_persistence_handle();
 
         let blocks = vec![];
         let (tx, rx) = crossbeam_channel::bounded(1);
 
-        handle.save_blocks(blocks, tx).unwrap();
+        handle.save_blocks(blocks, genesis, tx).unwrap();
 
-        let result = rx.recv().unwrap();
+        let result = rx.recv().unwrap().unwrap();
         assert!(result.last_block.is_none());
     }
 
     #[test]
     fn test_save_blocks_single_block() {
         reth_tracing::init_test_tracing();
-        let handle = default_persistence_handle();
-        let block_number = 0;
+        let (handle, genesis) = default_persistence_handle();
+        let block_number = 1;
         let mut test_block_builder = TestBlockBuilder::eth();
         let executed =
-            test_block_builder.get_executed_block_with_number(block_number, B256::random());
+            test_block_builder.get_executed_block_with_number(block_number, genesis.hash);
         let block_hash = executed.recovered_block().hash();
 
         let blocks = vec![executed];
         let (tx, rx) = crossbeam_channel::bounded(1);
 
-        handle.save_blocks(blocks, tx).unwrap();
+        handle.save_blocks(blocks, genesis, tx).unwrap();
 
-        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("test timed out");
+        let result =
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("test timed out").unwrap();
 
         assert_eq!(block_hash, result.last_block.unwrap().hash);
     }
@@ -436,35 +548,238 @@ mod tests {
     #[test]
     fn test_save_blocks_multiple_blocks() {
         reth_tracing::init_test_tracing();
-        let handle = default_persistence_handle();
+        let (handle, genesis) = default_persistence_handle();
 
-        let mut test_block_builder = TestBlockBuilder::eth();
-        let blocks = test_block_builder.get_executed_blocks(0..5).collect::<Vec<_>>();
+        let blocks = executed_chain(1..6, genesis.hash);
         let last_hash = blocks.last().unwrap().recovered_block().hash();
         let (tx, rx) = crossbeam_channel::bounded(1);
 
-        handle.save_blocks(blocks, tx).unwrap();
-        let result = rx.recv().unwrap();
+        handle.save_blocks(blocks, genesis, tx).unwrap();
+        let result = rx.recv().unwrap().unwrap();
         assert_eq!(last_hash, result.last_block.unwrap().hash);
     }
 
     #[test]
     fn test_save_blocks_multiple_calls() {
         reth_tracing::init_test_tracing();
-        let handle = default_persistence_handle();
+        let (handle, genesis) = default_persistence_handle();
 
-        let ranges = [0..1, 1..2, 2..4, 4..5];
-        let mut test_block_builder = TestBlockBuilder::eth();
+        let ranges = [1..2, 2..3, 3..5, 5..6];
+        let blocks = executed_chain(1..6, genesis.hash);
+        let mut expected_last_persisted = genesis;
         for range in ranges {
-            let blocks = test_block_builder.get_executed_blocks(range).collect::<Vec<_>>();
-            let last_hash = blocks.last().unwrap().recovered_block().hash();
+            let batch = blocks[(range.start - 1) as usize..(range.end - 1) as usize].to_vec();
+            let last_hash = batch.last().unwrap().recovered_block().hash();
             let (tx, rx) = crossbeam_channel::bounded(1);
 
-            handle.save_blocks(blocks, tx).unwrap();
+            handle.save_blocks(batch, expected_last_persisted, tx).unwrap();
 
-            let result = rx.recv().unwrap();
+            let result = rx.recv().unwrap().unwrap();
             assert_eq!(last_hash, result.last_block.unwrap().hash);
+            expected_last_persisted = result.last_block.unwrap();
         }
+    }
+
+    #[test]
+    fn service_fence_rejects_toctou_before_writing_any_block_data() {
+        let (provider, blocks) = seeded_provider(2, 1);
+        let provider_rw = provider.database_provider_rw().unwrap();
+        provider_rw
+            .save_stage_checkpoint(StageId::Bodies, reth_stages_api::StageCheckpoint::new(1))
+            .unwrap();
+        provider_rw.commit().unwrap();
+
+        // This models the service seeing a different checkpoint frontier than the tree admitted.
+        let mut service = persistence_service(provider.clone());
+        let error = service
+            .on_save_blocks(vec![blocks[1].clone()], blocks[0].recovered_block().num_hash())
+            .expect_err("Bodies ahead of Finish must be rejected");
+        assert!(matches!(
+            error,
+            PersistenceError::Fence(PersistenceFenceError::OwnerStageDoesNotMatchFinish {
+                stage: StageId::Bodies,
+                checkpoint: 1,
+                finish: 0,
+            })
+        ));
+
+        let provider_ro = provider.database_provider_ro().unwrap();
+        assert_eq!(
+            provider_ro.get_stage_checkpoint(StageId::Finish).unwrap().unwrap().block_number,
+            0
+        );
+        assert!(provider_ro.block_body_indices(1).unwrap().is_none());
+        assert!(provider_ro.sealed_header(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn service_fence_rejects_same_height_hash_divergence_before_writing() {
+        let (provider, blocks) = seeded_provider(2, 1);
+        let mut expected = blocks[0].recovered_block().num_hash();
+        expected.hash = B256::random();
+
+        let mut service = persistence_service(provider.clone());
+        assert!(matches!(
+            service.on_save_blocks(vec![blocks[1].clone()], expected),
+            Err(PersistenceError::Fence(
+                PersistenceFenceError::FinishHashDoesNotMatchLastPersisted { .. }
+            ))
+        ));
+
+        let provider_ro = provider.database_provider_ro().unwrap();
+        assert!(provider_ro.block_body_indices(1).unwrap().is_none());
+        assert!(provider_ro.sealed_header(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn service_fence_rejects_overlap_gap_and_wrong_parent_without_writes() {
+        for case in ["overlap", "gap", "wrong_parent"] {
+            let (provider, blocks) = seeded_provider(1, 1);
+            let finish = blocks[0].recovered_block().num_hash();
+            let mut builder = TestBlockBuilder::eth();
+            let candidate = match case {
+                "overlap" => builder.get_executed_block_with_number(finish.number, finish.hash),
+                "gap" => builder.get_executed_block_with_number(finish.number + 2, finish.hash),
+                "wrong_parent" => {
+                    builder.get_executed_block_with_number(finish.number + 1, B256::random())
+                }
+                _ => unreachable!(),
+            };
+            let candidate_number = candidate.recovered_block().number;
+            let mut service = persistence_service(provider.clone());
+            let error = service
+                .on_save_blocks(vec![candidate], finish)
+                .expect_err("unsafe range must be rejected");
+            match case {
+                "wrong_parent" => assert!(matches!(
+                    error,
+                    PersistenceError::Fence(
+                        PersistenceFenceError::FirstBlockParentDoesNotMatchFinish { .. }
+                    )
+                )),
+                _ => assert!(matches!(
+                    error,
+                    PersistenceError::Fence(
+                        PersistenceFenceError::FirstBlockDoesNotExtendFinish { .. }
+                    )
+                )),
+            }
+
+            let provider_ro = provider.database_provider_ro().unwrap();
+            assert_eq!(
+                provider_ro.get_stage_checkpoint(StageId::Finish).unwrap().unwrap().block_number,
+                finish.number
+            );
+            if candidate_number > finish.number {
+                assert!(provider_ro.block_body_indices(candidate_number).unwrap().is_none());
+                assert!(provider_ro.sealed_header(candidate_number).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn service_fence_rejects_second_block_overlap_gap_and_wrong_parent_without_writes() {
+        for case in ["overlap", "gap", "wrong_parent"] {
+            let (provider, blocks) = seeded_provider(1, 1);
+            let finish = blocks[0].recovered_block().num_hash();
+            let mut builder = TestBlockBuilder::eth();
+            let first = builder.get_executed_block_with_number(finish.number + 1, finish.hash);
+            let second = match case {
+                "overlap" => builder.get_executed_block_with_number(
+                    first.recovered_block().number,
+                    first.recovered_block().hash(),
+                ),
+                "gap" => builder.get_executed_block_with_number(
+                    first.recovered_block().number + 2,
+                    first.recovered_block().hash(),
+                ),
+                "wrong_parent" => builder.get_executed_block_with_number(
+                    first.recovered_block().number + 1,
+                    B256::random(),
+                ),
+                _ => unreachable!(),
+            };
+            let second_number = second.recovered_block().number;
+            let mut service = persistence_service(provider.clone());
+            let error = service
+                .on_save_blocks(vec![first, second], finish)
+                .expect_err("malformed later batch block must be rejected");
+            match case {
+                "wrong_parent" => assert!(matches!(
+                    error,
+                    PersistenceError::Fence(
+                        PersistenceFenceError::BatchBlockParentDoesNotMatchPrevious { .. }
+                    )
+                )),
+                _ => assert!(matches!(
+                    error,
+                    PersistenceError::Fence(
+                        PersistenceFenceError::BatchBlockDoesNotExtendPrevious { .. }
+                    )
+                )),
+            }
+
+            let provider_ro = provider.database_provider_ro().unwrap();
+            assert!(provider_ro.block_body_indices(finish.number + 1).unwrap().is_none());
+            assert!(provider_ro.sealed_header(finish.number + 1).unwrap().is_none());
+            if second_number != finish.number + 1 {
+                assert!(provider_ro.block_body_indices(second_number).unwrap().is_none());
+                assert!(provider_ro.sealed_header(second_number).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn service_fence_accepts_era_lag_and_aligned_owner_append() {
+        let (provider, blocks) = seeded_provider(3, 2);
+        let provider_rw = provider.database_provider_rw().unwrap();
+        provider_rw
+            .save_stage_checkpoint(StageId::Era, reth_stages_api::StageCheckpoint::new(0))
+            .unwrap();
+        provider_rw.commit().unwrap();
+
+        let mut service = persistence_service(provider.clone());
+        let result = service
+            .on_save_blocks(vec![blocks[2].clone()], blocks[1].recovered_block().num_hash())
+            .expect("Era is independent and must not block Engine persistence");
+        assert_eq!(result.last_block.map(|block| block.number), Some(2));
+
+        let provider_ro = provider.database_provider_ro().unwrap();
+        assert_eq!(
+            provider_ro.get_stage_checkpoint(StageId::Finish).unwrap().unwrap().block_number,
+            2
+        );
+        assert!(provider_ro.block_body_indices(2).unwrap().is_some());
+    }
+
+    #[test]
+    fn service_thread_returns_typed_fence_error() {
+        let (provider, blocks) = seeded_provider(2, 1);
+        let provider_rw = provider.database_provider_rw().unwrap();
+        provider_rw
+            .save_stage_checkpoint(StageId::Bodies, reth_stages_api::StageCheckpoint::new(1))
+            .unwrap();
+        provider_rw.commit().unwrap();
+
+        let (_finished_exex_height_tx, finished_exex_height_rx) =
+            tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
+        let pruner =
+            Pruner::new_with_factory(provider.clone(), vec![], 5, 0, None, finished_exex_height_rx);
+        let (sync_metrics_tx, _sync_metrics_rx) = unbounded_channel();
+        let handle =
+            PersistenceHandle::<EthPrimitives>::spawn_service(provider, pruner, sync_metrics_tx);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle
+            .save_blocks(vec![blocks[1].clone()], blocks[0].recovered_block().num_hash(), tx)
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("typed result timed out"),
+            Err(PersistenceError::Fence(PersistenceFenceError::OwnerStageDoesNotMatchFinish {
+                stage: StageId::Bodies,
+                ..
+            }))
+        ));
     }
 
     /// Verifies that committing `save_blocks` history before running the pruner

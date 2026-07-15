@@ -10,7 +10,10 @@ use crate::{
     download::BasicBlockDownloader,
     engine::{EngineApiKind, EngineApiRequest, EngineApiRequestHandler, EngineHandler},
     persistence::PersistenceHandle,
-    tree::{EngineApiTreeHandler, EngineValidator, TreeConfig, WaitForCaches},
+    tree::{
+        error::AdvancePersistenceError, EngineApiTreeHandler, EngineValidator, TreeConfig,
+        WaitForCaches,
+    },
 };
 use futures::Stream;
 use reth_consensus::FullConsensus;
@@ -24,7 +27,7 @@ use reth_provider::{
     ProviderFactory,
 };
 use reth_prune::PrunerWithFactory;
-use reth_stages_api::{MetricEventsSender, Pipeline};
+use reth_stages_api::{MetricEventsSender, Pipeline, PipelineTarget};
 use reth_tasks::Runtime;
 use reth_trie_db::ChangesetCache;
 use std::sync::Arc;
@@ -60,18 +63,22 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     pruner: PrunerWithFactory<ProviderFactory<N>>,
     payload_builder: PayloadBuilderHandle<N::Payload>,
     payload_validator: V,
+    initial_backfill_target: Option<PipelineTarget>,
     tree_config: TreeConfig,
     sync_metrics_tx: MetricEventsSender,
     evm_config: C,
     changeset_cache: ChangesetCache,
     runtime: Runtime,
-) -> ChainOrchestrator<
-    EngineHandler<
-        EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
-        S,
-        BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
+) -> Result<
+    ChainOrchestrator<
+        EngineHandler<
+            EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
+            S,
+            BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
+        >,
+        PipelineSync<N>,
     >,
-    PipelineSync<N>,
+    AdvancePersistenceError,
 >
 where
     N: ProviderNodeTypes,
@@ -94,17 +101,18 @@ where
         persistence_handle,
         payload_builder,
         canonical_in_memory_state,
+        initial_backfill_target,
         tree_config,
         engine_kind,
         evm_config,
         changeset_cache,
         runtime,
-    );
+    )?;
 
     let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
     let handler = EngineHandler::new(engine_handler, downloader, incoming_requests);
 
     let backfill_sync = PipelineSync::new(pipeline, pipeline_task_spawner);
 
-    ChainOrchestrator::new(handler, backfill_sync)
+    Ok(ChainOrchestrator::new(handler, backfill_sync))
 }

@@ -1,5 +1,5 @@
 use reth_metrics::{
-    metrics::{Gauge, Histogram},
+    metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
 
@@ -23,4 +23,6 @@ pub(crate) struct PersistenceMetrics {
     pub(crate) save_blocks_batch_size: Histogram,
     /// How long it took for blocks to be pruned
     pub(crate) prune_before_duration_seconds: Histogram,
+    /// Number of save requests rejected by the durable stage-ownership fence.
+    pub(crate) fence_rejections: Counter,
 }

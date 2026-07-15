@@ -175,6 +175,8 @@ pub struct EngineMetrics {
     pub(crate) backpressure_active: Gauge,
     /// Time spent blocked waiting on persistence because backpressure was active.
     pub(crate) backpressure_stall_duration: Histogram,
+    /// Whether Engine persistence is currently blocked by divergent pipeline checkpoints.
+    pub(crate) persistence_fence_blocked: Gauge,
     /// Tracks the how often we failed to deliver a newPayload response.
     ///
     /// This effectively tracks how often the message sender dropped the channel and indicates a CL

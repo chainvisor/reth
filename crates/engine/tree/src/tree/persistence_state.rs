@@ -20,7 +20,7 @@
 //! The [`PersistenceState`] tracks ongoing persistence operations and coordinates
 //! between the main execution thread and background persistence workers.
 
-use crate::persistence::PersistenceResult;
+use crate::persistence::PersistenceActionResult;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
@@ -37,7 +37,7 @@ pub struct PersistenceState {
     /// Receiver end of channel where the result of the persistence task will be
     /// sent when done. A None value means there's no persistence task in progress.
     pub(crate) rx:
-        Option<(CrossbeamReceiver<PersistenceResult>, Instant, CurrentPersistenceAction)>,
+        Option<(CrossbeamReceiver<PersistenceActionResult>, Instant, CurrentPersistenceAction)>,
 }
 
 impl PersistenceState {
@@ -51,7 +51,7 @@ impl PersistenceState {
     pub(crate) fn start_remove(
         &mut self,
         new_tip_num: u64,
-        rx: CrossbeamReceiver<PersistenceResult>,
+        rx: CrossbeamReceiver<PersistenceActionResult>,
     ) {
         self.rx =
             Some((rx, Instant::now(), CurrentPersistenceAction::RemovingBlocks { new_tip_num }));
@@ -61,7 +61,7 @@ impl PersistenceState {
     pub(crate) fn start_save(
         &mut self,
         highest: BlockNumHash,
-        rx: CrossbeamReceiver<PersistenceResult>,
+        rx: CrossbeamReceiver<PersistenceActionResult>,
     ) {
         self.rx = Some((rx, Instant::now(), CurrentPersistenceAction::SavingBlocks { highest }));
     }

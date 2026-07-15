@@ -177,7 +177,8 @@ async fn test_engine_graceful_shutdown() -> eyre::Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(2), done_rx)
         .await
         .expect("shutdown timed out")
-        .expect("shutdown completion channel should not be closed");
+        .expect("shutdown completion channel should not be closed")
+        .expect("shutdown persistence should succeed");
 
     let db_block = node.inner.provider.last_block_number()?;
     assert_eq!(db_block, 1, "Database should have persisted block 1");

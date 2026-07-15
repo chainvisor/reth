@@ -4,7 +4,7 @@ pub use jsonrpsee::{
     core::middleware::layer::Either,
     server::middleware::rpc::{RpcService, RpcServiceBuilder},
 };
-use reth_engine_tree::tree::WaitForCaches;
+use reth_engine_tree::tree::{error::AdvancePersistenceError, WaitForCaches};
 pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
 pub use reth_rpc_builder::{
     middleware::{RethAuthHttpMiddleware, RethRpcMiddleware},
@@ -1588,7 +1588,7 @@ impl EngineShutdown {
     ///
     /// Returns a receiver that resolves when shutdown is complete.
     /// Returns `None` if shutdown was already triggered.
-    pub fn shutdown(&self) -> Option<oneshot::Receiver<()>> {
+    pub fn shutdown(&self) -> Option<oneshot::Receiver<Result<(), AdvancePersistenceError>>> {
         let mut guard = self.tx.lock();
         let tx = guard.take()?;
         let (done_tx, done_rx) = oneshot::channel();
@@ -1606,6 +1606,6 @@ impl Default for EngineShutdown {
 /// Request to shutdown the engine.
 #[derive(Debug)]
 pub struct EngineShutdownRequest {
-    /// Channel to signal shutdown completion.
-    pub done_tx: oneshot::Sender<()>,
+    /// Channel carrying the exact shutdown-persistence outcome.
+    pub done_tx: oneshot::Sender<Result<(), AdvancePersistenceError>>,
 }

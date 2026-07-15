@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    persistence::PersistenceAction,
+    persistence::{PersistenceAction, PersistenceError, PersistenceResult},
     tree::{
         payload_validator::{BasicEngineValidator, TreeCtx, ValidationOutcome},
         persistence_state::CurrentPersistenceAction,
@@ -28,6 +28,7 @@ use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm_ethereum::MockEvmConfig;
 use reth_primitives_traits::Block as _;
 use reth_provider::test_utils::MockEthProvider;
+use reth_stages_api::{StageCheckpoint, StageId};
 use reth_tasks::spawn_os_thread;
 use std::{
     collections::BTreeMap,
@@ -157,6 +158,18 @@ struct TestHarness {
     provider: MockEthProvider,
 }
 
+fn executed_chain_from(parent_hash: B256, range: std::ops::Range<u64>) -> Vec<ExecutedBlock> {
+    let mut builder = TestBlockBuilder::eth();
+    let mut parent_hash = parent_hash;
+    range
+        .map(|number| {
+            let block = builder.get_executed_block_with_number(number, parent_hash);
+            parent_hash = block.recovered_block().hash();
+            block
+        })
+        .collect()
+}
+
 impl TestHarness {
     fn new(chain_spec: Arc<ChainSpec>) -> Self {
         use std::sync::mpsc::channel;
@@ -179,7 +192,13 @@ impl TestHarness {
 
         let consensus = Arc::new(EthBeaconConsensus::new(chain_spec.clone()));
 
-        let provider = MockEthProvider::default();
+        let provider = MockEthProvider::default()
+            .with_chain_spec((*chain_spec).clone())
+            .with_genesis_block()
+            .with_database_provider_access();
+        for stage in StageId::ALL {
+            provider.set_stage_checkpoint(stage, StageCheckpoint::new(0));
+        }
 
         let payload_validator = MockEngineValidator;
 
@@ -189,6 +208,7 @@ impl TestHarness {
 
         let header = chain_spec.genesis_header().clone();
         let header = SealedHeader::seal_slow(header);
+        let genesis_num_hash = header.num_hash();
         let engine_api_tree_state = EngineApiTreeState::new(
             10,
             10,
@@ -222,7 +242,7 @@ impl TestHarness {
             engine_api_tree_state,
             canonical_in_memory_state,
             persistence_handle,
-            PersistenceState { last_persisted_block: BlockNumHash::default(), rx: None },
+            PersistenceState { last_persisted_block: genesis_num_hash, rx: None },
             payload_builder,
             tree_config,
             EngineApiKind::Ethereum,
@@ -395,7 +415,10 @@ pub(crate) struct ValidatorTestHarness {
 
 impl ValidatorTestHarness {
     fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        let genesis_hash = chain_spec.genesis_hash();
         let harness = TestHarness::new(chain_spec.clone());
+        harness.provider.remove_block(genesis_hash);
+        harness.provider.set_database_provider_access(false);
 
         // Create validator identical to the one in TestHarness
         let consensus = Arc::new(EthBeaconConsensus::new(chain_spec));
@@ -503,9 +526,8 @@ fn test_tree_persist_block_batch() {
 
     // we need more than tree_config.persistence_threshold() +1 blocks to
     // trigger the persistence task.
-    let blocks: Vec<_> = test_block_builder
-        .get_executed_blocks(1..tree_config.persistence_threshold() + 2)
-        .collect();
+    let genesis_hash = SealedHeader::seal_slow(chain_spec.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..tree_config.persistence_threshold() + 2);
     let mut test_harness = TestHarness::new(chain_spec).with_blocks(blocks);
 
     let mut blocks = vec![];
@@ -539,13 +561,11 @@ fn test_tree_persist_block_batch() {
 async fn test_tree_persist_blocks() {
     let tree_config = TreeConfig::default();
     let chain_spec = MAINNET.clone();
-    let mut test_block_builder = TestBlockBuilder::eth().with_chain_spec((*chain_spec).clone());
 
     // we need more than tree_config.persistence_threshold() +1 blocks to
     // trigger the persistence task.
-    let blocks: Vec<_> = test_block_builder
-        .get_executed_blocks(1..tree_config.persistence_threshold() + 2)
-        .collect();
+    let genesis_hash = SealedHeader::seal_slow(chain_spec.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..tree_config.persistence_threshold() + 2);
     let test_harness = TestHarness::new(chain_spec).with_blocks(blocks.clone());
     spawn_os_thread("engine", || test_harness.tree.run());
 
@@ -554,7 +574,7 @@ async fn test_tree_persist_blocks() {
 
     let received_action =
         test_harness.action_rx.recv().expect("Failed to receive save blocks action");
-    if let PersistenceAction::SaveBlocks(saved_blocks, _) = received_action {
+    if let PersistenceAction::SaveBlocks(saved_blocks, _, _) = received_action {
         // only blocks.len() - tree_config.memory_block_buffer_target() will be
         // persisted
         let expected_persist_len = blocks.len() - tree_config.memory_block_buffer_target() as usize;
@@ -734,10 +754,10 @@ fn test_backpressure_waits_for_persistence_before_reading_incoming() {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(10));
         persist_tx
-            .send(PersistenceResult {
+            .send(Ok(PersistenceResult {
                 last_block: Some(persisted),
                 commit_duration: Some(Duration::ZERO),
-            })
+            }))
             .unwrap();
     });
 
@@ -766,6 +786,54 @@ fn test_backpressure_waits_for_persistence_before_reading_incoming() {
 }
 
 #[test]
+fn test_reth_new_payload_wait_propagates_typed_persistence_failure() {
+    let mut test_harness = TestHarness::new(MAINNET.clone());
+    let persisted = test_harness.tree.persistence_state.last_persisted_block;
+    let (persist_tx, persist_rx) = crossbeam_channel::bounded(1);
+    test_harness.tree.persistence_state.start_save(persisted, persist_rx);
+    persist_tx.send(Err(PersistenceError::Fence(PersistenceFenceError::MissingFinish))).unwrap();
+
+    let sealed =
+        test_harness.block_builder.generate_random_block(persisted.number + 1, persisted.hash);
+    let hash = sealed.hash();
+    let block = sealed.into_block();
+    let payload = ExecutionData {
+        payload: ExecutionPayloadV1::from_block_unchecked(hash, &block).into(),
+        sidecar: ExecutionPayloadSidecar::none(),
+    };
+    let (tx, rx) = oneshot::channel();
+
+    assert!(matches!(
+        test_harness.tree.on_engine_message(FromEngine::Request(
+            BeaconEngineMessage::RethNewPayload {
+                payload,
+                wait_for_persistence: true,
+                wait_for_caches: false,
+                tx,
+                enqueued_at: std::time::Instant::now(),
+            }
+            .into(),
+        )),
+        Err(InsertBlockFatalError::RethNewPayloadPersistenceFailureDelivered)
+    ));
+
+    let response = rx.blocking_recv().expect("reth_newPayload response channel closed");
+    let BeaconOnNewPayloadError::Internal(error) = response.expect_err("failure must reach caller")
+    else {
+        panic!("unexpected reth_newPayload error variant")
+    };
+    let error = error
+        .downcast::<AdvancePersistenceError>()
+        .expect("caller must receive the typed persistence error");
+    assert!(matches!(
+        *error,
+        AdvancePersistenceError::Persistence(PersistenceError::Fence(
+            PersistenceFenceError::MissingFinish
+        ))
+    ));
+}
+
+#[test]
 fn test_disabled_persistence_does_not_emit_save_blocks_or_backpressure() {
     let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(1..4).collect();
     let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
@@ -787,14 +855,366 @@ fn test_disabled_persistence_does_not_emit_save_blocks_or_backpressure() {
     assert!(!test_harness.tree.should_backpressure());
 }
 
+#[test]
+fn test_persistence_fence_forces_one_sub_threshold_pipeline_convergence() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..5);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    test_harness.tree.config = test_harness.tree.config.with_persistence_threshold(0);
+    test_harness.provider.set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(1));
+
+    // The mismatch is only one block, below the ordinary 32-block pipeline threshold. It must
+    // still deterministically schedule pipeline convergence and never queue SaveBlocks.
+    test_harness.tree.advance_persistence().unwrap();
+    assert!(test_harness.action_rx.try_recv().is_err());
+    assert_eq!(test_harness.tree.backfill_sync_state, BackfillSyncState::Pending);
+    let event = test_harness.from_tree_rx.try_recv().expect("missing convergence action");
+    let EngineApiEvent::BackfillAction(BackfillAction::Start(target)) = event else {
+        panic!("unexpected event {event:?}");
+    };
+    assert_eq!(target.sync_target(), Some(blocks[0].recovered_block().hash()));
+
+    // A completed no-progress repair is fatal; it may not silently schedule a second run.
+    test_harness.tree.backfill_sync_state = BackfillSyncState::Idle;
+    assert!(matches!(
+        test_harness.tree.advance_persistence(),
+        Err(AdvancePersistenceError::FenceRepairFailed { .. })
+    ));
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_persistence_fence_prefers_higher_known_fcu_target() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..6);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    test_harness.tree.config = test_harness.tree.config.with_persistence_threshold(0);
+    test_harness.provider.set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(1));
+    test_harness.tree.state.forkchoice_state_tracker.set_latest(
+        ForkchoiceState {
+            head_block_hash: blocks[4].recovered_block().hash(),
+            safe_block_hash: blocks[3].recovered_block().hash(),
+            finalized_block_hash: blocks[2].recovered_block().hash(),
+        },
+        ForkchoiceStatus::Syncing,
+    );
+
+    test_harness.tree.advance_persistence().unwrap();
+    let event = test_harness.from_tree_rx.try_recv().expect("missing convergence action");
+    let EngineApiEvent::BackfillAction(BackfillAction::Start(target)) = event else {
+        panic!("unexpected event {event:?}");
+    };
+    assert_eq!(target.sync_target(), Some(blocks[2].recovered_block().hash()));
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_tree_fence_rejects_overlap_gap_and_wrong_parent_without_dispatch() {
+    for case in ["overlap", "gap", "wrong_parent"] {
+        let mut test_harness = TestHarness::new(MAINNET.clone());
+        let finish = test_harness.tree.persistence_state.last_persisted_block;
+        let mut builder = TestBlockBuilder::eth();
+        let block = match case {
+            "overlap" => builder.get_executed_block_with_number(finish.number, finish.hash),
+            "gap" => builder.get_executed_block_with_number(finish.number + 2, finish.hash),
+            "wrong_parent" => {
+                builder.get_executed_block_with_number(finish.number + 1, B256::random())
+            }
+            _ => unreachable!(),
+        };
+        let error = test_harness
+            .tree
+            .persist_blocks(vec![block])
+            .expect_err("unsafe batch must be rejected");
+        match case {
+            "wrong_parent" => assert!(matches!(
+                error,
+                AdvancePersistenceError::FenceBatchRejected {
+                    mismatch: PersistenceFenceError::FirstBlockParentDoesNotMatchFinish { .. },
+                }
+            )),
+            _ => assert!(matches!(
+                error,
+                AdvancePersistenceError::FenceBatchRejected {
+                    mismatch: PersistenceFenceError::FirstBlockDoesNotExtendFinish { .. },
+                }
+            )),
+        }
+        assert!(test_harness.action_rx.try_recv().is_err());
+        assert!(!test_harness.tree.persistence_state.in_progress());
+    }
+}
+
+#[test]
+fn test_tree_fence_rejects_malformed_second_batch_block_without_dispatch() {
+    for case in ["overlap", "gap", "wrong_parent"] {
+        let mut test_harness = TestHarness::new(MAINNET.clone());
+        let finish = test_harness.tree.persistence_state.last_persisted_block;
+        let mut builder = TestBlockBuilder::eth();
+        let first = builder.get_executed_block_with_number(finish.number + 1, finish.hash);
+        let second = match case {
+            "overlap" => builder.get_executed_block_with_number(
+                first.recovered_block().number,
+                first.recovered_block().hash(),
+            ),
+            "gap" => builder.get_executed_block_with_number(
+                first.recovered_block().number + 2,
+                first.recovered_block().hash(),
+            ),
+            "wrong_parent" => builder
+                .get_executed_block_with_number(first.recovered_block().number + 1, B256::random()),
+            _ => unreachable!(),
+        };
+        let error = test_harness
+            .tree
+            .persist_blocks(vec![first, second])
+            .expect_err("malformed later batch block must be rejected");
+        match case {
+            "wrong_parent" => assert!(matches!(
+                error,
+                AdvancePersistenceError::FenceBatchRejected {
+                    mismatch: PersistenceFenceError::BatchBlockParentDoesNotMatchPrevious { .. },
+                }
+            )),
+            _ => assert!(matches!(
+                error,
+                AdvancePersistenceError::FenceBatchRejected {
+                    mismatch: PersistenceFenceError::BatchBlockDoesNotExtendPrevious { .. },
+                }
+            )),
+        }
+        assert!(test_harness.action_rx.try_recv().is_err());
+        assert!(!test_harness.tree.persistence_state.in_progress());
+    }
+}
+
+#[test]
+fn test_tree_fence_rejects_same_height_hash_divergence_without_dispatch() {
+    let mut test_harness = TestHarness::new(MAINNET.clone());
+    let durable = test_harness.tree.persistence_state.last_persisted_block;
+    test_harness.tree.persistence_state.last_persisted_block.hash = B256::random();
+    let block =
+        TestBlockBuilder::eth().get_executed_block_with_number(durable.number + 1, durable.hash);
+
+    assert!(matches!(
+        test_harness.tree.persist_blocks(vec![block]),
+        Err(AdvancePersistenceError::FenceBatchRejected {
+            mismatch: PersistenceFenceError::FinishHashDoesNotMatchLastPersisted { .. },
+        })
+    ));
+    assert!(test_harness.action_rx.try_recv().is_err());
+    assert!(!test_harness.tree.persistence_state.in_progress());
+}
+
+#[test]
+fn test_tree_fence_dispatches_aligned_same_branch_append() {
+    let mut test_harness = TestHarness::new(MAINNET.clone());
+    let finish = test_harness.tree.persistence_state.last_persisted_block;
+    let block =
+        TestBlockBuilder::eth().get_executed_block_with_number(finish.number + 1, finish.hash);
+
+    test_harness.tree.persist_blocks(vec![block.clone()]).unwrap();
+    let PersistenceAction::SaveBlocks(saved, expected, _) =
+        test_harness.action_rx.try_recv().expect("missing persistence action")
+    else {
+        panic!("unexpected persistence action")
+    };
+    assert_eq!(saved, vec![block]);
+    assert_eq!(expected, finish);
+    assert!(test_harness.tree.persistence_state.in_progress());
+}
+
+#[test]
+fn test_graceful_flush_returns_typed_divergent_owner_error_without_dispatch() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..3);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    test_harness.provider.set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(1));
+    let (terminate_tx, mut terminate_rx) = oneshot::channel();
+
+    test_harness.tree.finish_termination(terminate_tx);
+    assert!(matches!(
+        terminate_rx.try_recv(),
+        Ok(Err(AdvancePersistenceError::UnsafeShutdownFence {
+            mismatch: PersistenceFenceError::OwnerStageDoesNotMatchFinish {
+                stage: StageId::Bodies,
+                ..
+            },
+        }))
+    ));
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_graceful_flush_rejects_pending_and_active_pipeline_without_dispatch() {
+    for persistence_disabled in [false, true] {
+        for state in [BackfillSyncState::Pending, BackfillSyncState::Active] {
+            let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+            let blocks = executed_chain_from(genesis_hash, 1..3);
+            let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+            test_harness.tree.config =
+                test_harness.tree.config.with_persistence_disabled(persistence_disabled);
+            test_harness.tree.backfill_sync_state = state;
+            let (terminate_tx, mut terminate_rx) = oneshot::channel();
+
+            test_harness.tree.finish_termination(terminate_tx);
+            assert!(matches!(
+                terminate_rx.try_recv(),
+                Ok(Err(AdvancePersistenceError::UnsafeShutdownPipelineBusy))
+            ));
+            assert!(test_harness.action_rx.try_recv().is_err());
+            assert!(!test_harness.tree.persistence_state.in_progress());
+        }
+    }
+}
+
+#[test]
+fn test_pending_handoff_blocks_persistence_before_pipeline_started() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..2);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    test_harness.tree.config = test_harness.tree.config.with_persistence_threshold(0);
+    let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+    let action = BackfillAction::Start(B256::repeat_byte(0x55).into());
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Event(FromOrchestrator::BackfillSyncPending {
+            action,
+            tx: pending_tx,
+        }))
+        .unwrap();
+
+    assert_eq!(pending_rx.recv().unwrap(), Ok(()));
+    assert_eq!(test_harness.tree.backfill_sync_state, BackfillSyncState::Pending);
+    test_harness.tree.advance_persistence().unwrap();
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_pending_handoff_rejects_inflight_persistence_without_state_change() {
+    let mut test_harness = TestHarness::new(MAINNET.clone());
+    let persisted = test_harness.tree.persistence_state.last_persisted_block;
+    let (_persistence_tx, persistence_rx) = crossbeam_channel::bounded(1);
+    test_harness.tree.persistence_state.start_save(persisted, persistence_rx);
+    let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Event(FromOrchestrator::BackfillSyncPending {
+            action: BackfillAction::Start(B256::repeat_byte(0x66).into()),
+            tx: pending_tx,
+        }))
+        .unwrap();
+
+    assert_eq!(pending_rx.recv().unwrap(), Err(BackfillPendingError::PersistenceInProgress));
+    assert_eq!(test_harness.tree.backfill_sync_state, BackfillSyncState::Idle);
+    assert!(test_harness.tree.backfill_pending_reservation.is_none());
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_startup_admission_fences_owner_ahead_when_persistence_is_disabled() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..2);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    test_harness.tree.config =
+        test_harness.tree.config.with_persistence_disabled(true).with_persistence_threshold(0);
+    test_harness.provider.set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(1));
+
+    test_harness.tree.initialize_persistence_admission().unwrap();
+
+    assert_eq!(test_harness.tree.backfill_sync_state, BackfillSyncState::Pending);
+    let event = test_harness.from_tree_rx.try_recv().expect("missing startup repair action");
+    let EngineApiEvent::BackfillAction(BackfillAction::Start(target)) = event else {
+        panic!("unexpected startup event {event:?}");
+    };
+    assert_eq!(target.sync_target(), Some(blocks[0].recovered_block().hash()));
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_startup_admission_fails_if_owner_ahead_cannot_be_repaired() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..2);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    test_harness.tree.config = test_harness
+        .tree
+        .config
+        .with_persistence_disabled(true)
+        .with_min_blocks_for_pipeline_run(u64::MAX);
+    test_harness.provider.set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(1));
+
+    assert!(matches!(
+        test_harness.tree.initialize_persistence_admission(),
+        Err(AdvancePersistenceError::FenceRepairUnavailable {
+            mismatch: PersistenceFenceError::OwnerStageDoesNotMatchFinish {
+                stage: StageId::Bodies,
+                ..
+            }
+        })
+    ));
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_run_fences_owner_ahead_before_queued_engine_payload() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..2);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    test_harness.tree.config = test_harness.tree.config.with_persistence_threshold(0);
+    test_harness.provider.set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(1));
+
+    let sealed =
+        test_harness.block_builder.generate_random_block(2, blocks[0].recovered_block().hash());
+    let hash = sealed.hash();
+    let payload = ExecutionData {
+        payload: ExecutionPayloadV1::from_block_unchecked(hash, &sealed.into_block()).into(),
+        sidecar: ExecutionPayloadSidecar::none(),
+    };
+    let (payload_tx, _payload_rx) = oneshot::channel();
+    test_harness
+        .to_tree_tx
+        .send(FromEngine::Request(
+            BeaconEngineMessage::RethNewPayload {
+                payload,
+                wait_for_persistence: false,
+                wait_for_caches: false,
+                tx: payload_tx,
+                enqueued_at: std::time::Instant::now(),
+            }
+            .into(),
+        ))
+        .unwrap();
+
+    let TestHarness { tree, to_tree_tx, mut from_tree_rx, action_rx, .. } = test_harness;
+    let tree_thread = spawn_os_thread("startup-fence-test", || tree.run());
+
+    let first_event = from_tree_rx.blocking_recv().expect("missing startup fence action");
+    let EngineApiEvent::BackfillAction(BackfillAction::Start(target)) = first_event else {
+        panic!("Engine input was handled before startup fence: {first_event:?}");
+    };
+    assert_eq!(target.sync_target(), Some(blocks[0].recovered_block().hash()));
+    assert!(action_rx.try_recv().is_err(), "Engine persistence dispatched across startup fence");
+
+    let (terminate_tx, terminate_rx) = oneshot::channel();
+    to_tree_tx.send(FromEngine::Event(FromOrchestrator::Terminate { tx: terminate_tx })).unwrap();
+    assert!(matches!(
+        terminate_rx.blocking_recv(),
+        Ok(Err(AdvancePersistenceError::UnsafeShutdownPipelineBusy))
+    ));
+    tree_thread.join().unwrap();
+}
+
 #[tokio::test]
 async fn test_force_at_tip_persists_with_stale_backfill_state() {
     let tree_config = TreeConfig::default()
         .with_min_blocks_for_pipeline_run(u64::MAX)
         .with_persistence_threshold(0);
-    let blocks: Vec<_> = TestBlockBuilder::eth()
-        .get_executed_blocks(1..tree_config.persistence_threshold() + 2)
-        .collect();
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..tree_config.persistence_threshold() + 2);
     let mut test_harness = TestHarness::new(MAINNET.clone())
         .with_blocks(blocks.clone())
         .with_backfill_state(BackfillSyncState::Active);
@@ -811,7 +1231,7 @@ async fn test_force_at_tip_persists_with_stale_backfill_state() {
 
     let received_action =
         test_harness.action_rx.recv().expect("failed to receive save blocks action");
-    let PersistenceAction::SaveBlocks(saved_blocks, _) = received_action else {
+    let PersistenceAction::SaveBlocks(saved_blocks, _, _) = received_action else {
         panic!("unexpected action received {received_action:?}");
     };
     assert_eq!(saved_blocks.len(), blocks.len());
@@ -824,47 +1244,41 @@ fn test_force_at_tip_direct_insert_advances_canonical_head_for_persistence() {
         .with_min_blocks_for_pipeline_run(u64::MAX)
         .with_memory_block_buffer_target(0)
         .with_persistence_threshold(0);
-    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
-    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(vec![blocks[0].clone()]);
+    let mut test_harness = TestHarness::new(MAINNET.clone());
     test_harness.tree.config = tree_config;
-    test_harness.tree.persistence_state.last_persisted_block =
-        blocks[0].recovered_block().num_hash();
+    let genesis = test_harness.tree.persistence_state.last_persisted_block;
+    let block = TestBlockBuilder::eth().get_executed_block_with_number(1, genesis.hash);
 
     let _ = test_harness
         .tree
         .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlock(
-            blocks[1].clone(),
+            block.clone(),
         )))
         .unwrap();
 
     assert_eq!(
         test_harness.tree.state.tree_state.canonical_block_number(),
-        blocks[1].recovered_block().number
+        block.recovered_block().number
     );
     assert!(test_harness.tree.should_persist());
 
     test_harness.tree.advance_persistence().unwrap();
     let received_action =
         test_harness.action_rx.recv().expect("failed to receive save blocks action");
-    let PersistenceAction::SaveBlocks(saved_blocks, _) = received_action else {
+    let PersistenceAction::SaveBlocks(saved_blocks, _, _) = received_action else {
         panic!("unexpected action received {received_action:?}");
     };
-    assert_eq!(saved_blocks, vec![blocks[1].clone()]);
+    assert_eq!(saved_blocks, vec![block]);
 }
 
 #[test]
 fn test_force_at_tip_drops_backfill_actions() {
     let mut test_harness = TestHarness::new(MAINNET.clone());
-    test_harness.tree.config = test_harness
-        .tree
-        .config
-        .with_min_blocks_for_pipeline_run(u64::MAX);
+    test_harness.tree.config = test_harness.tree.config.with_min_blocks_for_pipeline_run(u64::MAX);
 
     test_harness
         .tree
-        .emit_event(EngineApiEvent::BackfillAction(BackfillAction::Start(
-            B256::random().into(),
-        )));
+        .emit_event(EngineApiEvent::BackfillAction(BackfillAction::Start(B256::random().into())));
 
     assert_eq!(test_harness.tree.backfill_sync_state, BackfillSyncState::Idle);
     assert!(test_harness.from_tree_rx.try_recv().is_err());
@@ -880,7 +1294,14 @@ async fn test_tree_state_on_new_head_reorg() {
     test_harness.tree.config =
         test_harness.tree.config.with_persistence_threshold(1).with_memory_block_buffer_target(1);
     let mut test_block_builder = TestBlockBuilder::eth();
-    let blocks: Vec<_> = test_block_builder.get_executed_blocks(1..6).collect();
+    let mut parent_hash = test_harness.tree.persistence_state.last_persisted_block.hash;
+    let blocks: Vec<_> = (1..6)
+        .map(|number| {
+            let block = test_block_builder.get_executed_block_with_number(number, parent_hash);
+            parent_hash = block.recovered_block().hash();
+            block
+        })
+        .collect();
 
     for block in &blocks {
         test_harness.tree.state.tree_state.insert_executed(block.clone());
@@ -929,18 +1350,23 @@ async fn test_tree_state_on_new_head_reorg() {
 
     // get rid of the prev action
     let received_action = test_harness.action_rx.recv().unwrap();
-    let PersistenceAction::SaveBlocks(saved_blocks, sender) = received_action else {
+    let PersistenceAction::SaveBlocks(saved_blocks, _, sender) = received_action else {
         panic!("received wrong action");
     };
     assert_eq!(saved_blocks, vec![blocks[0].clone(), blocks[1].clone()]);
 
     // send the response so we can advance again
     sender
-        .send(PersistenceResult {
+        .send(Ok(PersistenceResult {
             last_block: Some(blocks[1].recovered_block().num_hash()),
             commit_duration: Some(Duration::ZERO),
-        })
+        }))
         .unwrap();
+    test_harness
+        .persist_blocks(blocks[..2].iter().map(|block| block.recovered_block().clone()).collect());
+    for stage in StageId::ALL {
+        test_harness.provider.set_stage_checkpoint(stage, StageCheckpoint::new(2));
+    }
 
     // we should be persisting blocks[1] because we threw out the prev action
     let current_action = test_harness.tree.persistence_state.current_action().cloned();
@@ -1075,6 +1501,11 @@ async fn test_get_canonical_blocks_to_persist() {
     let last_persisted_block_number = 3;
     test_harness.tree.persistence_state.last_persisted_block =
         blocks[last_persisted_block_number as usize].recovered_block.num_hash();
+    for stage in StageId::ALL {
+        test_harness
+            .provider
+            .set_stage_checkpoint(stage, StageCheckpoint::new(last_persisted_block_number));
+    }
 
     let persistence_threshold = 4;
     let memory_block_buffer_target = 3;
@@ -1319,6 +1750,8 @@ fn test_on_new_payload_canonical_insertion() {
     let payload1 = ExecutionPayloadV1::from_block_unchecked(hash1, &block1);
 
     let mut test_harness = TestHarness::new(HOLESKY.clone());
+    test_harness.provider.remove_block(HOLESKY.genesis_hash());
+    test_harness.provider.set_database_provider_access(false);
 
     // Case 1: Submit payload when NOT sync target head - should be syncing (disconnected)
     let outcome1 = test_harness
@@ -1453,6 +1886,8 @@ fn test_on_new_payload_malformed_payload() {
     reth_tracing::init_test_tracing();
 
     let mut test_harness = TestHarness::new(HOLESKY.clone());
+    test_harness.provider.remove_block(HOLESKY.genesis_hash());
+    test_harness.provider.set_database_provider_access(false);
 
     // Use test data
     let s = include_str!("../../test-data/holesky/1.rlp");
@@ -2189,10 +2624,9 @@ mod forkchoice_updated_tests {
     #[test]
     fn test_engine_termination_with_everything_persisted() {
         let chain_spec = MAINNET.clone();
-        let mut test_block_builder = TestBlockBuilder::eth().with_chain_spec((*chain_spec).clone());
-
         // Create 10 blocks to persist
-        let blocks: Vec<_> = test_block_builder.get_executed_blocks(1..11).collect();
+        let genesis_hash = SealedHeader::seal_slow(chain_spec.genesis_header().clone()).hash();
+        let blocks = executed_chain_from(genesis_hash, 1..11);
         let canonical_tip = blocks.last().unwrap().recovered_block().number;
         let test_harness = TestHarness::new(chain_spec).with_blocks(blocks);
 
@@ -2200,6 +2634,7 @@ mod forkchoice_updated_tests {
         let (terminate_tx, mut terminate_rx) = oneshot::channel();
 
         let to_tree_tx = test_harness.to_tree_tx.clone();
+        let provider = test_harness.provider.clone();
         let action_rx = test_harness.action_rx;
 
         // Spawn tree in background thread
@@ -2213,21 +2648,28 @@ mod forkchoice_updated_tests {
         // Handle persistence actions until termination completes
         let mut last_persisted_number = 0;
         loop {
-            if terminate_rx.try_recv().is_ok() {
-                break;
+            if let Ok(result) = terminate_rx.try_recv() {
+                result.expect("termination persistence should succeed");
+                break
             }
 
-            if let Ok(PersistenceAction::SaveBlocks(saved_blocks, sender)) =
+            if let Ok(PersistenceAction::SaveBlocks(saved_blocks, _, sender)) =
                 action_rx.recv_timeout(std::time::Duration::from_millis(100))
             {
                 if let Some(last) = saved_blocks.last() {
                     last_persisted_number = last.recovered_block().number;
+                    for stage in StageId::ALL {
+                        provider.set_stage_checkpoint(
+                            stage,
+                            StageCheckpoint::new(last_persisted_number),
+                        );
+                    }
                 }
                 sender
-                    .send(PersistenceResult {
+                    .send(Ok(PersistenceResult {
                         last_block: saved_blocks.last().map(|b| b.recovered_block().num_hash()),
                         commit_duration: Some(Duration::ZERO),
-                    })
+                    }))
                     .unwrap();
             }
         }
@@ -2240,8 +2682,8 @@ mod forkchoice_updated_tests {
     #[test]
     fn test_engine_termination_skips_flush_when_persistence_disabled() {
         let chain_spec = MAINNET.clone();
-        let mut test_block_builder = TestBlockBuilder::eth().with_chain_spec((*chain_spec).clone());
-        let blocks: Vec<_> = test_block_builder.get_executed_blocks(1..11).collect();
+        let genesis_hash = SealedHeader::seal_slow(chain_spec.genesis_header().clone()).hash();
+        let blocks = executed_chain_from(genesis_hash, 1..11);
         let mut test_harness = TestHarness::new(chain_spec).with_blocks(blocks);
         test_harness.tree.config = test_harness
             .tree
@@ -2262,12 +2704,13 @@ mod forkchoice_updated_tests {
 
         let mut terminated = false;
         for _ in 0..100 {
-            if terminate_rx.try_recv().is_ok() {
+            if let Ok(result) = terminate_rx.try_recv() {
+                result.expect("disabled persistence shutdown should succeed");
                 terminated = true;
                 break;
             }
 
-            if let Ok(PersistenceAction::SaveBlocks(saved_blocks, _)) =
+            if let Ok(PersistenceAction::SaveBlocks(saved_blocks, _, _)) =
                 action_rx.recv_timeout(Duration::from_millis(10))
             {
                 panic!(

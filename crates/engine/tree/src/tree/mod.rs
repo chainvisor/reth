@@ -1,14 +1,15 @@
 use crate::{
     backfill::{BackfillAction, BackfillSyncState},
-    chain::FromOrchestrator,
+    chain::{BackfillPendingError, FromOrchestrator},
     engine::{DownloadRequest, EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine},
-    persistence::PersistenceHandle,
+    persistence::{PersistenceActionResult, PersistenceHandle},
+    persistence_fence::{PersistenceCheckpointSnapshot, PersistenceFenceError},
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
 };
 use alloy_consensus::BlockHeader;
-use alloy_eips::{eip1898::BlockWithParent, BlockNumHash, NumHash};
 #[cfg(test)]
 use alloy_eips::merge::EPOCH_SLOTS;
+use alloy_eips::{eip1898::BlockWithParent, BlockNumHash, NumHash};
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
@@ -37,7 +38,7 @@ use reth_provider::{
     StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
-use reth_stages_api::ControlFlow;
+use reth_stages_api::{ControlFlow, PipelineTarget};
 use reth_tasks::{spawn_os_thread, utils::increase_thread_priority};
 use reth_trie_db::ChangesetCache;
 use revm::interpreter::debug_unreachable;
@@ -64,7 +65,7 @@ pub mod precompile_cache;
 mod tests;
 mod trie_updates;
 
-use crate::{persistence::PersistenceResult, tree::error::AdvancePersistenceError};
+use crate::tree::error::AdvancePersistenceError;
 pub use block_buffer::BlockBuffer;
 pub use invalid_headers::InvalidHeaderCache;
 pub use metrics::EngineApiMetrics;
@@ -96,6 +97,13 @@ pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 /// This ensures that recent trie changesets are kept in memory for potential reorgs,
 /// even when the finalized block is not set (e.g., on L2s like Optimism).
 const CHANGESET_CACHE_RETENTION_BLOCKS: u64 = 64;
+
+/// One-shot pipeline repair triggered by the Engine persistence ownership fence.
+#[derive(Clone, Debug)]
+struct PersistenceFenceRepair {
+    target: BlockNumHash,
+    mismatch: PersistenceFenceError,
+}
 
 /// A builder for creating state providers that can be used across threads.
 #[derive(Clone, Debug)]
@@ -292,6 +300,12 @@ where
     persistence_state: PersistenceState,
     /// Flag indicating the state of the node's backfill synchronization process.
     backfill_sync_state: BackfillSyncState,
+    /// One tree-originated Pending action that the orchestrator is permitted to consume once.
+    backfill_pending_reservation: Option<BackfillAction>,
+    /// The one permitted pipeline convergence attempt for a divergent persistence frontier.
+    persistence_fence_repair: Option<PersistenceFenceRepair>,
+    /// Whether startup persistence ownership was checked before accepting Engine input.
+    startup_admission_complete: bool,
     /// Keeps track of the state of the canonical chain that isn't persisted yet.
     /// This is intended to be accessed from external sources, such as rpc.
     canonical_in_memory_state: CanonicalInMemoryState<N>,
@@ -335,6 +349,9 @@ where
             .field("persistence", &self.persistence)
             .field("persistence_state", &self.persistence_state)
             .field("backfill_sync_state", &self.backfill_sync_state)
+            .field("backfill_pending_reservation", &self.backfill_pending_reservation)
+            .field("persistence_fence_repair", &self.persistence_fence_repair)
+            .field("startup_admission_complete", &self.startup_admission_complete)
             .field("canonical_in_memory_state", &self.canonical_in_memory_state)
             .field("payload_builder", &self.payload_builder)
             .field("config", &self.config)
@@ -396,6 +413,9 @@ where
             persistence,
             persistence_state,
             backfill_sync_state: BackfillSyncState::Idle,
+            backfill_pending_reservation: None,
+            persistence_fence_repair: None,
+            startup_admission_complete: false,
             state,
             canonical_in_memory_state,
             payload_builder,
@@ -424,13 +444,19 @@ where
         persistence: PersistenceHandle<N>,
         payload_builder: PayloadBuilderHandle<T>,
         canonical_in_memory_state: CanonicalInMemoryState<N>,
+        initial_backfill_target: Option<PipelineTarget>,
         config: TreeConfig,
         kind: EngineApiKind,
         evm_config: C,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
-    ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
-    {
+    ) -> Result<
+        (
+            Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
+            UnboundedReceiver<EngineApiEvent<N>>,
+        ),
+        AdvancePersistenceError,
+    > {
         let best_block_number = provider.best_block_number().unwrap_or(0);
         let header = provider.sealed_header(best_block_number).ok().flatten().unwrap_or_default();
 
@@ -448,7 +474,7 @@ where
             kind,
         );
 
-        let task = Self::new(
+        let mut task = Self::new(
             provider,
             consensus,
             payload_validator,
@@ -464,12 +490,21 @@ where
             changeset_cache,
             runtime,
         );
+        if let Some(target) = initial_backfill_target {
+            // Launch already proved that pipeline backfill is enabled and has a concrete target.
+            // Install ownership before the tree thread or RPC surface can admit Engine work.
+            task.backfill_sync_state = BackfillSyncState::Pending;
+            task.backfill_pending_reservation = Some(BackfillAction::Start(target));
+        }
+        // Complete startup ownership admission synchronously so launch can fail before exposing
+        // RPC. This check deliberately runs even when Engine persistence itself is disabled.
+        task.initialize_persistence_admission()?;
         let incoming = task.incoming_tx.clone();
         spawn_os_thread("engine", || {
             increase_thread_priority();
             task.run()
         });
-        (incoming, outgoing)
+        Ok((incoming, outgoing))
     }
 
     /// Returns a [`TreeOutcome`] indicating the forkchoice head is valid and canonical.
@@ -516,6 +551,15 @@ where
     ///
     /// This will block the current thread and process incoming messages.
     pub fn run(mut self) {
+        // Establish persistence admission before reading the first Engine message. This catches
+        // owner-ahead divergence that launch's interrupted-pipeline check cannot detect. When an
+        // initial pipeline target was already selected, the constructor starts in Pending and this
+        // deliberately waits for that pipeline instead of dispatching a duplicate repair.
+        if let Err(err) = self.initialize_persistence_admission() {
+            error!(target: "engine::tree", %err, "Initial persistence admission failed");
+            return
+        }
+
         loop {
             // Each iteration has three phases:
             //
@@ -809,9 +853,9 @@ where
         };
 
         // if the block is valid and it is the current sync target head, make it canonical
-        if outcome.outcome.is_valid()
-            && !committed_linear_extension
-            && self.is_sync_target_head(block_hash)
+        if outcome.outcome.is_valid() &&
+            !committed_linear_extension &&
+            self.is_sync_target_head(block_hash)
         {
             // Only create the canonical event if this block isn't already the canonical head
             if self.state.tree_state.canonical_block_hash() != block_hash {
@@ -1003,8 +1047,8 @@ where
         &mut self,
         block_hash: B256,
     ) -> ProviderResult<bool> {
-        if !self.config.pipeline_backfill_disabled()
-            || self.state.tree_state.canonical_block_hash() == block_hash
+        if !self.config.pipeline_backfill_disabled() ||
+            self.state.tree_state.canonical_block_hash() == block_hash
         {
             return Ok(false)
         }
@@ -1055,10 +1099,7 @@ where
         let num_hash = payload.num_hash();
         // Idempotent: already our canonical head.
         if self.state.tree_state.canonical_block_hash() == num_hash.hash {
-            return Ok(Some(PayloadStatus::new(
-                PayloadStatusEnum::Valid,
-                Some(num_hash.hash),
-            )));
+            return Ok(Some(PayloadStatus::new(PayloadStatusEnum::Valid, Some(num_hash.hash))));
         }
         // Linear-only: adopt iff this block extends OUR current canonical head
         // by one. The CL feeds blocks in order so the parent is our prior
@@ -1096,10 +1137,7 @@ where
             hash = ?num_hash.hash,
             "force-at-tip: ADOPTED writer-committed block (no execution)"
         );
-        Ok(Some(PayloadStatus::new(
-            PayloadStatusEnum::Valid,
-            Some(num_hash.hash),
-        )))
+        Ok(Some(PayloadStatus::new(PayloadStatusEnum::Valid, Some(num_hash.hash))))
     }
 
     /// Updates the latest block state to the specified canonical ancestor.
@@ -1536,10 +1574,13 @@ where
 
     /// Helper method to save blocks and set the persistence state. This ensures we keep track of
     /// the current persistence action while we're saving blocks.
-    fn persist_blocks(&mut self, blocks_to_persist: Vec<ExecutedBlock<N>>) {
+    fn persist_blocks(
+        &mut self,
+        blocks_to_persist: Vec<ExecutedBlock<N>>,
+    ) -> Result<(), AdvancePersistenceError> {
         if blocks_to_persist.is_empty() {
             debug!(target: "engine::tree", "Returned empty set of blocks to persist");
-            return
+            return Ok(())
         }
 
         // NOTE: checked non-empty above
@@ -1549,11 +1590,145 @@ where
             .map(|b| b.recovered_block().num_hash())
             .expect("Checked non-empty persisting blocks");
 
+        // Re-read the complete admission predicate immediately before dispatch. The background
+        // service repeats this through its provider_rw transaction to close the final TOCTOU gap.
+        let provider = self.provider.database_provider_ro()?;
+        let snapshot = PersistenceCheckpointSnapshot::read(&provider)?;
+        drop(provider);
+        let finish = snapshot
+            .validate(self.persistence_state.last_persisted_block)
+            .map_err(|mismatch| AdvancePersistenceError::FenceBatchRejected { mismatch })?;
+        let (first_block, first_parent_hash) = blocks_to_persist
+            .first()
+            .map(|block| {
+                (block.recovered_block().num_hash(), block.recovered_block().parent_hash())
+            })
+            .expect("checked non-empty persistence batch");
+        PersistenceCheckpointSnapshot::validate_first_block(finish, first_block, first_parent_hash)
+            .map_err(|mismatch| AdvancePersistenceError::FenceBatchRejected { mismatch })?;
+        for pair in blocks_to_persist.windows(2) {
+            PersistenceCheckpointSnapshot::validate_next_block(
+                pair[0].recovered_block().num_hash(),
+                pair[1].recovered_block().num_hash(),
+                pair[1].recovered_block().parent_hash(),
+            )
+            .map_err(|mismatch| AdvancePersistenceError::FenceBatchRejected { mismatch })?;
+        }
+
         debug!(target: "engine::tree", count=blocks_to_persist.len(), blocks = ?blocks_to_persist.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(), "Persisting blocks");
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let _ = self.persistence.save_blocks(blocks_to_persist, tx);
+        self.persistence
+            .save_blocks(blocks_to_persist, self.persistence_state.last_persisted_block, tx)
+            .map_err(|_| AdvancePersistenceError::ChannelClosed)?;
 
         self.persistence_state.start_save(highest_num_hash, rx);
+        Ok(())
+    }
+
+    /// Select a convergence target at or above every owner checkpoint. A higher known FCU
+    /// finalized target (or head when finality is zero) lets the mandatory run close both gaps.
+    fn persistence_fence_repair_target(
+        &self,
+        minimum_number: u64,
+    ) -> Result<BlockNumHash, AdvancePersistenceError> {
+        let hash = self.provider.block_hash(minimum_number)?.ok_or(
+            AdvancePersistenceError::FenceRepairTargetMissing { block_number: minimum_number },
+        )?;
+        let mut target = BlockNumHash::new(minimum_number, hash);
+
+        if let Some(state) = self.state.forkchoice_state_tracker.sync_target_state() {
+            let fcu_hash = if state.finalized_block_hash.is_zero() {
+                state.head_block_hash
+            } else {
+                state.finalized_block_hash
+            };
+            let known_fcu = self
+                .state
+                .buffer
+                .block(&fcu_hash)
+                .map(|block| block.num_hash())
+                .or(self.sealed_header_by_hash(fcu_hash)?.map(|header| header.num_hash()));
+            if let Some(candidate) = known_fcu &&
+                candidate.number > target.number
+            {
+                target = candidate;
+            }
+        }
+
+        Ok(target)
+    }
+
+    /// Admit Engine persistence only at an exact, unowned frontier. A mismatch schedules one
+    /// forced pipeline convergence even below the normal backfill-distance threshold.
+    fn persistence_fence_allows_save(&mut self) -> Result<bool, AdvancePersistenceError> {
+        let provider = self.provider.database_provider_ro()?;
+        let snapshot = PersistenceCheckpointSnapshot::read(&provider)?;
+        drop(provider);
+
+        match snapshot.validate(self.persistence_state.last_persisted_block) {
+            Ok(_) => {
+                self.metrics.engine.persistence_fence_blocked.set(0.0);
+                self.persistence_fence_repair = None;
+                Ok(true)
+            }
+            Err(mismatch) => {
+                self.metrics.engine.persistence_fence_blocked.set(1.0);
+                ::metrics::counter!(
+                    "consensus_engine_beacon_persistence_fence_blocks_total",
+                    "stage" => mismatch.stage().as_str().to_owned(),
+                    "reason" => mismatch.reason(),
+                )
+                .increment(1);
+
+                if let Some(attempt) = &self.persistence_fence_repair {
+                    return Err(AdvancePersistenceError::FenceRepairFailed {
+                        target: attempt.target,
+                        initial: attempt.mismatch.clone(),
+                        current: mismatch,
+                    })
+                }
+                if self.config.pipeline_backfill_disabled() {
+                    return Err(AdvancePersistenceError::FenceRepairUnavailable { mismatch })
+                }
+
+                let highest =
+                    snapshot.highest_checkpoint(self.persistence_state.last_persisted_block.number);
+                let target = self.persistence_fence_repair_target(highest)?;
+                warn!(
+                    target: "engine::tree",
+                    blocking_stage = %mismatch.stage(),
+                    reason = mismatch.reason(),
+                    %mismatch,
+                    ?target,
+                    "Engine persistence fenced; scheduling one pipeline convergence run"
+                );
+
+                let action = BackfillAction::Start(target.hash.into());
+                self.outgoing
+                    .send(EngineApiEvent::BackfillAction(action.clone()))
+                    .map_err(|_| AdvancePersistenceError::FenceRepairDispatchFailed)?;
+                self.backfill_sync_state = BackfillSyncState::Pending;
+                self.backfill_pending_reservation = Some(action);
+                self.metrics.engine.pipeline_runs.increment(1);
+                self.persistence_fence_repair = Some(PersistenceFenceRepair { target, mismatch });
+                Ok(false)
+            }
+        }
+    }
+
+    /// Establish the durable Backfill-to-Live ownership frontier before any Engine input is read.
+    /// This is separate from save enablement: even a node with Engine persistence disabled must
+    /// not process live Engine work against an owner-divergent database.
+    fn initialize_persistence_admission(&mut self) -> Result<(), AdvancePersistenceError> {
+        if self.startup_admission_complete {
+            return Ok(())
+        }
+
+        if !self.pipeline_busy() {
+            let _ = self.persistence_fence_allows_save()?;
+        }
+        self.startup_admission_complete = true;
+        Ok(())
     }
 
     /// Triggers new persistence actions if no persistence task is currently in progress.
@@ -1566,34 +1741,44 @@ where
         }
 
         if !self.persistence_state.in_progress() {
+            if self.pipeline_busy() {
+                return Ok(())
+            }
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
+            } else if !self.persistence_fence_allows_save()? {
+                return Ok(())
             } else if self.should_persist() {
                 let blocks_to_persist =
                     self.get_canonical_blocks_to_persist(PersistTarget::Threshold)?;
-                self.persist_blocks(blocks_to_persist);
+                self.persist_blocks(blocks_to_persist)?;
             }
         }
 
         Ok(())
     }
 
-    /// Finishes termination by persisting all remaining blocks and signaling completion.
-    ///
-    /// This blocks until all persistence is complete. Always signals completion,
-    /// even if an error occurs.
+    /// Finishes termination by persisting all remaining blocks and returning the exact outcome to
+    /// the caller.
     fn finish_termination(
         &mut self,
-        pending_termination: oneshot::Sender<()>,
-    ) -> Result<(), AdvancePersistenceError> {
+        pending_termination: oneshot::Sender<Result<(), AdvancePersistenceError>>,
+    ) {
         trace!(target: "engine::tree", "finishing termination, persisting remaining blocks");
         let result = self.persist_until_complete();
-        let _ = pending_termination.send(());
-        result
+        if let Err(err) = &result {
+            error!(target: "engine::tree", %err, "Termination persistence failed");
+        }
+        if pending_termination.send(result).is_err() {
+            warn!(target: "engine::tree", "Termination caller dropped before receiving persistence outcome");
+        }
     }
 
     /// Persists all remaining blocks until none are left.
     fn persist_until_complete(&mut self) -> Result<(), AdvancePersistenceError> {
+        if !self.backfill_sync_state.is_idle() {
+            return Err(AdvancePersistenceError::UnsafeShutdownPipelineBusy)
+        }
         if self.config.persistence_disabled() {
             debug!(
                 target: "engine::tree",
@@ -1601,7 +1786,6 @@ where
             );
             return Ok(())
         }
-
         loop {
             // Wait for any in-progress persistence to complete (blocking)
             if let Some((rx, start_time, action)) = self.persistence_state.rx.take() {
@@ -1609,6 +1793,15 @@ where
                 let result = rx.recv().map_err(|_| AdvancePersistenceError::ChannelClosed)?;
                 self.on_persistence_complete(result, start_time)?;
             }
+
+            let provider = self.provider.database_provider_ro()?;
+            let snapshot = PersistenceCheckpointSnapshot::read(&provider)?;
+            drop(provider);
+            if let Err(mismatch) = snapshot.validate(self.persistence_state.last_persisted_block) {
+                self.metrics.engine.persistence_fence_blocked.set(1.0);
+                return Err(AdvancePersistenceError::UnsafeShutdownFence { mismatch })
+            }
+            self.metrics.engine.persistence_fence_blocked.set(0.0);
 
             let blocks_to_persist = self.get_canonical_blocks_to_persist(PersistTarget::Head)?;
 
@@ -1618,7 +1811,7 @@ where
             }
 
             debug!(target: "engine::tree", count = blocks_to_persist.len(), "persisting remaining blocks before shutdown");
-            self.persist_blocks(blocks_to_persist);
+            self.persist_blocks(blocks_to_persist)?;
         }
     }
 
@@ -1646,13 +1839,37 @@ where
         }
     }
 
+    /// Wait for the current persistence action and apply its typed completion. Any worker/channel
+    /// failure is returned to the engine loop instead of being ignored or converted into a panic.
+    fn wait_for_inflight_persistence(&mut self) -> Result<Duration, AdvancePersistenceError> {
+        let Some((rx, start_time, _action)) = self.persistence_state.rx.take() else {
+            return Ok(Duration::ZERO)
+        };
+
+        let (persistence_tx, persistence_rx) = std::sync::mpsc::channel();
+        self.runtime.spawn_blocking_named("wait-persist", move || {
+            let start = Instant::now();
+            let completion = rx
+                .recv()
+                .map(|result| (result, start_time, start.elapsed()))
+                .map_err(|_| AdvancePersistenceError::ChannelClosed);
+            let _ = persistence_tx.send(completion);
+        });
+        let completion =
+            persistence_rx.recv().map_err(|_| AdvancePersistenceError::ChannelClosed)?;
+        let (result, start_time, wait_duration) = completion?;
+        self.on_persistence_complete(result, start_time)?;
+        Ok(wait_duration)
+    }
+
     /// Handles a completed persistence task.
     fn on_persistence_complete(
         &mut self,
-        result: PersistenceResult,
+        result: PersistenceActionResult,
         start_time: Instant,
     ) -> Result<(), AdvancePersistenceError> {
         self.metrics.engine.persistence_duration.record(start_time.elapsed());
+        let result = result?;
 
         let commit_duration = result.commit_duration;
         let Some(BlockNumHash {
@@ -1718,14 +1935,42 @@ where
     ) -> Result<ops::ControlFlow<()>, InsertBlockFatalError> {
         match msg {
             FromEngine::Event(event) => match event {
+                FromOrchestrator::BackfillSyncPending { action, tx } => {
+                    let outcome = if self.config.pipeline_backfill_disabled() {
+                        self.backfill_sync_state = BackfillSyncState::Idle;
+                        self.backfill_pending_reservation = None;
+                        Err(BackfillPendingError::PipelineBackfillDisabled)
+                    } else if self.persistence_state.in_progress() {
+                        Err(BackfillPendingError::PersistenceInProgress)
+                    } else if self.backfill_sync_state.is_active() {
+                        Err(BackfillPendingError::PipelineAlreadyActive)
+                    } else if self.backfill_sync_state.is_pending() {
+                        match self.backfill_pending_reservation.take() {
+                            Some(expected) if expected == action => Ok(()),
+                            Some(expected) => {
+                                self.backfill_pending_reservation = Some(expected);
+                                Err(BackfillPendingError::PendingReservationMismatch)
+                            }
+                            None => Err(BackfillPendingError::PipelineAlreadyPending),
+                        }
+                    } else {
+                        // An external direct start acquires and consumes its reservation in this
+                        // single acknowledged transition.
+                        self.backfill_sync_state = BackfillSyncState::Pending;
+                        Ok(())
+                    };
+                    if tx.send(outcome).is_err() {
+                        return Err(InsertBlockFatalError::BackfillPendingAcknowledgementClosed)
+                    }
+                }
                 FromOrchestrator::BackfillSyncStarted => {
                     if self.config.pipeline_backfill_disabled() {
-                        debug!(
-                            target: "engine::tree",
-                            "ignoring pipeline backfill start because pipeline backfill is disabled"
-                        );
-                        self.backfill_sync_state = BackfillSyncState::Idle;
-                        return Ok(ops::ControlFlow::Continue(()));
+                        return Err(InsertBlockFatalError::BackfillStartedWhileDisabled)
+                    }
+                    if !self.backfill_sync_state.is_pending() ||
+                        self.backfill_pending_reservation.is_some()
+                    {
+                        return Err(InsertBlockFatalError::BackfillStartedWithoutPending)
                     }
 
                     debug!(target: "engine::tree", "received backfill sync started event");
@@ -1745,9 +1990,7 @@ where
                 }
                 FromOrchestrator::Terminate { tx } => {
                     debug!(target: "engine::tree", "received terminate request");
-                    if let Err(err) = self.finish_termination(tx) {
-                        error!(target: "engine::tree", %err, "Termination failed");
-                    }
+                    self.finish_termination(tx);
                     return Ok(ops::ControlFlow::Break(()))
                 }
             },
@@ -1872,33 +2115,24 @@ where
                                 );
 
                                 let backpressure_wait = enqueued_at.elapsed();
+                                let num_hash = payload.num_hash();
 
                                 let explicit_persistence_wait = if wait_for_persistence {
-                                    let pending_persistence = self.persistence_state.rx.take();
-                                    if let Some((rx, start_time, _action)) = pending_persistence {
-                                        let (persistence_tx, persistence_rx) =
-                                            std::sync::mpsc::channel();
-                                        self.runtime.spawn_blocking_named(
-                                            "wait-persist",
-                                            move || {
-                                                let start = Instant::now();
-                                                let result = rx
-                                                    .recv()
-                                                    .expect("persistence state channel closed");
-                                                let _ = persistence_tx.send((
-                                                    result,
-                                                    start_time,
-                                                    start.elapsed(),
-                                                ));
-                                            },
-                                        );
-                                        let (result, start_time, wait_duration) = persistence_rx
-                                            .recv()
-                                            .expect("persistence result channel closed");
-                                        let _ = self.on_persistence_complete(result, start_time);
-                                        wait_duration
-                                    } else {
-                                        Duration::ZERO
+                                    match self.wait_for_inflight_persistence() {
+                                        Ok(wait) => wait,
+                                        Err(err) => {
+                                            error!(target: "engine::tree", payload=?num_hash, %err, "reth_newPayload persistence wait failed");
+                                            if let Err(send_err) = tx.send(Err(
+                                                BeaconOnNewPayloadError::Internal(Box::new(err)),
+                                            )) {
+                                                error!(target: "engine::tree", payload=?num_hash, ?send_err, "Failed to deliver reth_newPayload persistence error");
+                                                self.metrics
+                                                    .engine
+                                                    .failed_new_payload_response_deliveries
+                                                    .increment(1);
+                                            }
+                                            return Err(InsertBlockFatalError::RethNewPayloadPersistenceFailureDelivered)
+                                        }
                                     }
                                 } else {
                                     Duration::ZERO
@@ -1909,7 +2143,6 @@ where
 
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
-                                let num_hash = payload.num_hash();
                                 let mut output = self.on_new_payload(payload);
                                 let latency = start.elapsed();
                                 self.metrics.engine.new_payload.update_response_metrics(
@@ -2198,7 +2431,7 @@ where
     fn emit_event(&mut self, event: impl Into<EngineApiEvent<N>>) {
         let event = event.into();
 
-        if event.is_backfill_action() {
+        if let EngineApiEvent::BackfillAction(action) = &event {
             if self.config.pipeline_backfill_disabled() {
                 debug!(
                     target: "engine::tree",
@@ -2222,6 +2455,7 @@ where
             }
 
             self.backfill_sync_state = BackfillSyncState::Pending;
+            self.backfill_pending_reservation = Some(action.clone());
             self.metrics.engine.pipeline_runs.increment(1);
             debug!(target: "engine::tree", "emitting backfill action event");
         }
@@ -3564,7 +3798,7 @@ where
     /// A persistence task completed.
     PersistenceComplete {
         /// The unified result of the persistence operation.
-        result: PersistenceResult,
+        result: PersistenceActionResult,
         /// When the persistence operation started.
         start_time: Instant,
     },

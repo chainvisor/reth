@@ -1,6 +1,8 @@
 //! Internal errors for the tree module.
 
+use crate::{persistence::PersistenceError, persistence_fence::PersistenceFenceError};
 use alloy_consensus::BlockHeader;
+use alloy_eips::BlockNumHash;
 use reth_consensus::ConsensusError;
 use reth_errors::{BlockExecutionError, BlockValidationError, ProviderError};
 use reth_evm::execute::InternalBlockExecutionError;
@@ -16,6 +18,54 @@ pub enum AdvancePersistenceError {
     /// A provider error
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// The persistence worker rejected an unsafe or failed disk action.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    /// Checkpoints cannot be converged because pipeline backfill is disabled.
+    #[error(
+        "engine persistence fence cannot converge with pipeline backfill disabled: {mismatch}"
+    )]
+    FenceRepairUnavailable {
+        /// Blocking checkpoint mismatch.
+        mismatch: PersistenceFenceError,
+    },
+    /// No canonical block exists for the checkpoint convergence target.
+    #[error("engine persistence fence cannot find block {block_number} for pipeline convergence")]
+    FenceRepairTargetMissing {
+        /// Highest checkpoint that must be converged.
+        block_number: u64,
+    },
+    /// Dispatch of the one permitted convergence run failed.
+    #[error("engine persistence fence could not dispatch its pipeline convergence action")]
+    FenceRepairDispatchFailed,
+    /// The one permitted convergence run completed without aligning all owner stages.
+    #[error(
+        "engine persistence fence convergence to {target:?} failed: initial={initial}; current={current}"
+    )]
+    FenceRepairFailed {
+        /// Pipeline target used by the convergence attempt.
+        target: BlockNumHash,
+        /// Mismatch that triggered the attempt.
+        initial: PersistenceFenceError,
+        /// Mismatch still present after the attempt.
+        current: PersistenceFenceError,
+    },
+    /// The tree constructed a batch that does not extend the admitted durable frontier.
+    #[error("engine persistence batch rejected before dispatch: {mismatch}")]
+    FenceBatchRejected {
+        /// Blocking admission mismatch.
+        mismatch: PersistenceFenceError,
+    },
+    /// Graceful shutdown may not flush an Engine tree across a divergent pipeline frontier.
+    #[error("refusing unsafe graceful persistence flush: {mismatch}")]
+    UnsafeShutdownFence {
+        /// Blocking checkpoint mismatch.
+        mismatch: PersistenceFenceError,
+    },
+    /// Graceful shutdown may not start Engine persistence while pipeline backfill owns the
+    /// database.
+    #[error("refusing graceful persistence flush while pipeline backfill is pending or active")]
+    UnsafeShutdownPipelineBusy,
 }
 
 #[derive(thiserror::Error)]
@@ -161,6 +211,22 @@ pub enum InsertBlockFatalError {
     /// An internal / fatal block execution error
     #[error(transparent)]
     BlockExecutionError(#[from] InternalBlockExecutionError),
+    /// A fatal persistence failure while processing an Engine API request.
+    #[error(transparent)]
+    Persistence(#[from] AdvancePersistenceError),
+    /// The exact persistence failure was returned through the reth_newPayload response channel;
+    /// the tree must still stop so it cannot continue after losing persistence coordination.
+    #[error("fatal reth_newPayload persistence failure was delivered to the caller")]
+    RethNewPayloadPersistenceFailureDelivered,
+    /// The orchestrator dropped the Pending acknowledgement before the tree could deliver it.
+    #[error("backfill-pending acknowledgement receiver closed")]
+    BackfillPendingAcknowledgementClosed,
+    /// A pipeline task reported Started without a preceding acknowledged Pending handoff.
+    #[error("pipeline backfill started without an acknowledged pending handoff")]
+    BackfillStartedWithoutPending,
+    /// A pipeline task reported Started even though pipeline backfill is disabled.
+    #[error("pipeline backfill started while pipeline backfill is disabled")]
+    BackfillStartedWhileDisabled,
 }
 
 /// Error variants that are caused by invalid blocks

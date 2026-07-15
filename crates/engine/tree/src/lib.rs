@@ -104,6 +104,8 @@ pub mod engine;
 pub mod launch;
 /// Metrics support.
 pub mod metrics;
+mod persistence_fence;
+pub use persistence_fence::PersistenceFenceError;
 /// The background writer service, coordinating write operations on static files and the database.
 pub mod persistence;
 /// Support for interacting with the blockchain tree.

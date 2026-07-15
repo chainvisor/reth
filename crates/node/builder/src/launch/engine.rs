@@ -9,13 +9,14 @@ use crate::{
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
 };
 use alloy_consensus::BlockHeader;
+use alloy_primitives::B256;
 use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
     launch::build_engine_orchestrator,
-    tree::TreeConfig,
+    tree::{error::AdvancePersistenceError, TreeConfig},
 };
 use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
@@ -41,6 +42,29 @@ use reth_trie_db::ChangesetCache;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+fn engine_shutdown_outcome_to_exit(
+    outcome: &Result<(), AdvancePersistenceError>,
+) -> eyre::Result<()> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(err) => Err(eyre::eyre!("Engine shutdown persistence failed: {err}")),
+    }
+}
+
+fn ensure_initial_backfill_allowed(
+    tree_config: &TreeConfig,
+    initial_target: Option<B256>,
+) -> eyre::Result<()> {
+    if tree_config.pipeline_backfill_disabled() &&
+        let Some(target) = initial_target
+    {
+        return Err(eyre::eyre!(
+            "database requires initial pipeline convergence to {target}, but pipeline backfill is disabled"
+        ))
+    }
+    Ok(())
+}
 
 /// The engine node launcher.
 #[derive(Debug)]
@@ -228,6 +252,13 @@ impl EngineNodeLauncher {
             EngineApiKind::Ethereum
         };
 
+        // Determine startup ownership before the tree thread and RPC surface are exposed. A known
+        // target starts the tree in Pending; disabled backfill must fail launch rather than serve
+        // an unconverged database.
+        let initial_target = ctx.initial_backfill_target()?;
+        ensure_initial_backfill_allowed(&engine_tree_config, initial_target)?;
+        let initial_pipeline_target = initial_target.map(Into::into);
+
         let mut orchestrator = build_engine_orchestrator(
             engine_kind,
             consensus.clone(),
@@ -240,12 +271,22 @@ impl EngineNodeLauncher {
             pruner,
             ctx.components().payload_builder_handle().clone(),
             engine_validator,
+            initial_pipeline_target,
             engine_tree_config,
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
             changeset_cache,
             ctx.task_executor().clone(),
-        );
+        )?;
+
+        if let Some(initial_target) = initial_target {
+            debug!(target: "reth::cli", %initial_target, "establish initial backfill ownership");
+            orchestrator.start_backfill_sync(initial_target).map_err(|err| {
+                eyre::eyre!(
+                    "failed to establish initial pipeline ownership before RPC startup: {err}"
+                )
+            })?;
+        }
 
         info!(target: "reth::cli", "Consensus engine initialized");
 
@@ -279,7 +320,6 @@ impl EngineNodeLauncher {
         let (engine_shutdown, shutdown_rx) = EngineShutdown::new();
 
         // Run consensus engine to completion
-        let initial_target = ctx.initial_backfill_target()?;
         let mut built_payloads = ctx
             .components()
             .payload_builder_handle()
@@ -302,50 +342,45 @@ impl EngineNodeLauncher {
         // the next tick. Default off; zero effect unless --engine.reader-trusting.
         if ctx.node_config().engine.reader_trusting {
             let poll_provider = provider.clone();
-            ctx.task_executor().spawn_critical_task(
-                "trusting-reader head poller",
-                async move {
-                    info!(target: "reth::cli", "trusting-reader: head-pointer poller started");
-                    let mut last_adopted: u64 = 0;
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        // On-disk tip the writer has committed (database last block).
-                        let tip = match poll_provider.last_block_number() {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
-                        // Monotonic head guard. The writer's committed tip is
-                        // FINAL (committed blocks don't roll back), so a `tip`
-                        // far BELOW `last_adopted` is a transient static-file
-                        // re-scan inconsistency (the force_refresh poll racing
-                        // the chainvisor base-advance), NOT a real regression —
-                        // adopting it would serve a stale (e.g. ~10h-old) head.
-                        // Skip an unchanged tip and any drop deeper than a
-                        // shallow reorg; still follow small (<= 64) reorgs.
-                        const REORG_TOLERANCE: u64 = 64;
-                        if tip == last_adopted
-                            || (tip < last_adopted && last_adopted - tip > REORG_TOLERANCE)
-                        {
-                            continue;
-                        }
-                        match poll_provider.sealed_header(tip) {
-                            Ok(Some(header)) => {
-                                poll_provider
-                                    .canonical_in_memory_state()
-                                    .set_canonical_head(header);
-                                last_adopted = tip;
-                                debug!(
-                                    target: "reth::cli",
-                                    number = tip,
-                                    "trusting-reader: adopted writer-committed head"
-                                );
-                            }
-                            // Not on-disk yet / read error: retry next tick.
-                            Ok(None) | Err(_) => continue,
-                        }
+            ctx.task_executor().spawn_critical_task("trusting-reader head poller", async move {
+                info!(target: "reth::cli", "trusting-reader: head-pointer poller started");
+                let mut last_adopted: u64 = 0;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // On-disk tip the writer has committed (database last block).
+                    let tip = match poll_provider.last_block_number() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    // Monotonic head guard. The writer's committed tip is
+                    // FINAL (committed blocks don't roll back), so a `tip`
+                    // far BELOW `last_adopted` is a transient static-file
+                    // re-scan inconsistency (the force_refresh poll racing
+                    // the chainvisor base-advance), NOT a real regression —
+                    // adopting it would serve a stale (e.g. ~10h-old) head.
+                    // Skip an unchanged tip and any drop deeper than a
+                    // shallow reorg; still follow small (<= 64) reorgs.
+                    const REORG_TOLERANCE: u64 = 64;
+                    if tip == last_adopted ||
+                        (tip < last_adopted && last_adopted - tip > REORG_TOLERANCE)
+                    {
+                        continue;
                     }
-                },
-            );
+                    match poll_provider.sealed_header(tip) {
+                        Ok(Some(header)) => {
+                            poll_provider.canonical_in_memory_state().set_canonical_head(header);
+                            last_adopted = tip;
+                            debug!(
+                                target: "reth::cli",
+                                number = tip,
+                                "trusting-reader: adopted writer-committed head"
+                            );
+                        }
+                        // Not on-disk yet / read error: retry next tick.
+                        Ok(None) | Err(_) => continue,
+                    }
+                }
+            });
         }
 
         // chainvisor writer snapshot quiesce (FlushInPlace): when
@@ -406,14 +441,11 @@ impl EngineNodeLauncher {
         let (exit, rx) = oneshot::channel();
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
         let startup_sync_state_idle = ctx.node_config().debug.startup_sync_state_idle;
+        let initial_backfill_started = initial_target.is_some();
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
-            if let Some(initial_target) = initial_target {
-                debug!(target: "reth::cli", %initial_target,  "start backfill sync");
-                // network_handle's sync state is already initialized at Syncing
-                orchestrator.start_backfill_sync(initial_target);
-            } else if startup_sync_state_idle {
+            if !initial_backfill_started && startup_sync_state_idle {
                 network_handle.update_sync_state(SyncState::Idle);
             }
 
@@ -481,9 +513,22 @@ impl EngineNodeLauncher {
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {
                             debug!(target: "reth::cli", "received engine shutdown request");
+                            let (done_tx, done_rx) = oneshot::channel();
                             orchestrator.handler_mut().handler_mut().on_event(
-                                FromOrchestrator::Terminate { tx: req.done_tx }.into()
+                                FromOrchestrator::Terminate { tx: done_tx }.into()
                             );
+                            let outcome = done_rx
+                                .await
+                                .unwrap_or(Err(AdvancePersistenceError::ChannelClosed));
+                            let exit_result = engine_shutdown_outcome_to_exit(&outcome);
+                            if req.done_tx.send(outcome).is_err() {
+                                error!(target: "reth::cli", "Engine shutdown caller dropped before receiving persistence outcome");
+                            }
+                            if let Err(err) = exit_result {
+                                error!(target: "reth::cli", %err, "Engine shutdown failed");
+                                res = Err(err);
+                            }
+                            break;
                         }
                     }
                     _guard = &mut on_graceful_shutdown => {
@@ -495,7 +540,13 @@ impl EngineNodeLauncher {
                         orchestrator.handler_mut().handler_mut().on_event(
                             FromOrchestrator::Terminate { tx: done_tx }.into()
                         );
-                        let _ = done_rx.await;
+                        let outcome = done_rx
+                            .await
+                            .unwrap_or(Err(AdvancePersistenceError::ChannelClosed));
+                        if let Err(err) = engine_shutdown_outcome_to_exit(&outcome) {
+                            error!(target: "reth::cli", %err, "Engine shutdown failed");
+                            res = Err(err);
+                        }
                         break;
                     }
                 }
@@ -536,6 +587,37 @@ impl EngineNodeLauncher {
         };
 
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_shutdown_failure_maps_to_node_exit_error() {
+        let outcome = Err(AdvancePersistenceError::UnsafeShutdownPipelineBusy);
+        let error = engine_shutdown_outcome_to_exit(&outcome)
+            .expect_err("persistence failure must fail node exit");
+        assert!(error
+            .to_string()
+            .contains("refusing graceful persistence flush while pipeline backfill"));
+    }
+
+    #[test]
+    fn engine_shutdown_success_maps_to_clean_node_exit() {
+        assert!(engine_shutdown_outcome_to_exit(&Ok(())).is_ok());
+    }
+
+    #[test]
+    fn disabled_pipeline_rejects_initial_target_before_startup() {
+        let disabled = TreeConfig::default().with_min_blocks_for_pipeline_run(u64::MAX);
+        let target = B256::repeat_byte(0x44);
+        let error = ensure_initial_backfill_allowed(&disabled, Some(target))
+            .expect_err("disabled pipeline cannot repair an initial target");
+        assert!(error.to_string().contains(&target.to_string()));
+        assert!(ensure_initial_backfill_allowed(&disabled, None).is_ok());
+        assert!(ensure_initial_backfill_allowed(&TreeConfig::default(), Some(target)).is_ok());
     }
 }
 
