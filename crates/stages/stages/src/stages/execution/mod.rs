@@ -579,13 +579,28 @@ where
 
         // Update the checkpoint.
         let mut stage_checkpoint = input.checkpoint.execution_stage_checkpoint();
+        let mut progress_invalidated = false;
         if let Some(stage_checkpoint) = stage_checkpoint.as_mut() {
             for block_number in range {
-                stage_checkpoint.progress.processed -= provider
+                let gas_used = provider
                     .header_by_number(block_number)?
                     .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?
                     .gas_used();
+                if !subtract_execution_progress(stage_checkpoint, gas_used) {
+                    warn!(
+                        target: "sync::stages::execution",
+                        block_number,
+                        gas_used,
+                        processed = stage_checkpoint.progress.processed,
+                        "Discarding rebased execution gas progress after unwind crossed its tracked history"
+                    );
+                    progress_invalidated = true;
+                    break
+                }
             }
+        }
+        if progress_invalidated {
+            stage_checkpoint = None;
         }
         let checkpoint = if let Some(stage_checkpoint) = stage_checkpoint {
             StageCheckpoint::new(unwind_to).with_execution_stage_checkpoint(stage_checkpoint)
@@ -616,6 +631,14 @@ fn execution_batch_releases_pipeline(
     max_block: BlockNumber,
 ) -> bool {
     hit_batch_boundary || stage_progress == max_block
+}
+
+fn subtract_execution_progress(checkpoint: &mut ExecutionCheckpoint, gas_used: u64) -> bool {
+    let Some(remaining) = checkpoint.progress.processed.checked_sub(gas_used) else {
+        return false
+    };
+    checkpoint.progress.processed = remaining;
+    true
 }
 
 fn reject_cancun_boundary_unwind<Provider>(
@@ -705,22 +728,26 @@ where
                 },
             }
         }
-        // Otherwise, we recalculate the whole stage checkpoint including the amount of gas
-        // already processed, if there's any.
+        // Otherwise, the auxiliary gas-progress checkpoint is missing or incompatible. It is
+        // observability metadata, not execution state: the block-number checkpoint and database
+        // remain authoritative. Rebase progress to the work this invocation will actually do.
+        // Recomputing `processed` from genesis makes an abrupt restart decompress every historical
+        // header before executing even one new block (tens of minutes on mainnet).
         _ => {
-            let genesis_block_number = provider.genesis_block_number();
-            let processed = calculate_gas_used_from_headers(
-                provider,
-                genesis_block_number..=max(start_block - 1, genesis_block_number),
-            )?;
+            if checkpoint.block_number > provider.genesis_block_number() {
+                warn!(
+                    target: "sync::stages::execution",
+                    checkpoint = checkpoint.block_number,
+                    start_block,
+                    max_block,
+                    "Execution gas-progress metadata is missing or incompatible; rebasing to the current range"
+                );
+            }
+            let total = calculate_gas_used_from_headers(provider, start_block..=max_block)?;
 
             ExecutionCheckpoint {
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
-                progress: EntitiesCheckpoint {
-                    processed,
-                    total: processed +
-                        calculate_gas_used_from_headers(provider, start_block..=max_block)?,
-                },
+                progress: EntitiesCheckpoint { processed: 0, total },
             }
         }
     })
@@ -941,6 +968,80 @@ mod tests {
                 total
             }
         }) if total == block.gas_used);
+    }
+
+    #[test]
+    fn execution_checkpoint_missing_progress_does_not_scan_historical_headers() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider_rw().unwrap();
+        let mut rng = generators::rng();
+
+        let mut genesis = generators::random_block(
+            &mut rng,
+            0,
+            generators::BlockParams { tx_count: Some(0), ..Default::default() },
+        )
+        .unseal();
+        genesis.header.gas_used = 11;
+        let genesis = genesis.seal_slow();
+
+        let mut block_1 = generators::random_block(
+            &mut rng,
+            1,
+            generators::BlockParams {
+                parent: Some(genesis.hash()),
+                tx_count: Some(0),
+                ..Default::default()
+            },
+        )
+        .unseal();
+        block_1.header.gas_used = 22;
+        let block_1 = block_1.seal_slow();
+
+        let mut block_2 = generators::random_block(
+            &mut rng,
+            2,
+            generators::BlockParams {
+                parent: Some(block_1.hash()),
+                tx_count: Some(0),
+                ..Default::default()
+            },
+        )
+        .unseal();
+        block_2.header.gas_used = 33;
+        let block_2 = block_2.seal_slow();
+
+        provider.insert_block(&genesis.try_recover().unwrap()).unwrap();
+        provider.insert_block(&block_1.try_recover().unwrap()).unwrap();
+        provider.insert_block(&block_2.try_recover().unwrap()).unwrap();
+        provider
+            .static_file_provider()
+            .latest_writer(StaticFileSegment::Headers)
+            .unwrap()
+            .commit()
+            .unwrap();
+        provider.commit().unwrap();
+
+        let previous_checkpoint = StageCheckpoint { block_number: 1, stage_checkpoint: None };
+        let stage_checkpoint =
+            execution_checkpoint(&factory.static_file_provider(), 2, 2, previous_checkpoint);
+
+        assert_matches!(stage_checkpoint, Ok(ExecutionCheckpoint {
+            block_range: CheckpointBlockRange { from: 2, to: 2 },
+            progress: EntitiesCheckpoint { processed: 0, total: 33 }
+        }));
+    }
+
+    #[test]
+    fn rebased_execution_progress_invalidates_instead_of_underflowing() {
+        let mut checkpoint = ExecutionCheckpoint {
+            block_range: CheckpointBlockRange { from: 10, to: 20 },
+            progress: EntitiesCheckpoint { processed: 5, total: 10 },
+        };
+        assert!(!subtract_execution_progress(&mut checkpoint, 6));
+        assert_eq!(checkpoint.progress.processed, 5);
+        assert!(subtract_execution_progress(&mut checkpoint, 5));
+        assert_eq!(checkpoint.progress.processed, 0);
     }
 
     #[test]
