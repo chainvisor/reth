@@ -25,7 +25,7 @@ use reth_stages_api::{
 };
 use reth_static_file_types::StaticFileSegment;
 use std::{
-    cmp::{max, Ordering},
+    cmp::Ordering,
     collections::BTreeMap,
     ops::RangeInclusive,
     sync::Arc,
