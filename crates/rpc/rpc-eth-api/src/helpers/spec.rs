@@ -57,7 +57,7 @@ pub trait EthApiSpec: RpcNodeCore + EthApiTypes {
             .iter()
             .find(|(name, _)| name == "Finish")
             .map(|(_, checkpoint)| checkpoint.block_number)
-            .unwrap_or_default();
+            .ok_or_else(|| RethError::msg("Finish stage checkpoint is missing"))?;
         let status = if should_report_syncing(self.is_syncing(), durable_head, canonical_head) {
             let stages = checkpoints
                 .into_iter()
@@ -67,7 +67,10 @@ pub trait EthApiSpec: RpcNodeCore + EthApiTypes {
             SyncStatus::Info(Box::new(SyncInfo {
                 starting_block: self.starting_block(),
                 current_block: U256::from(durable_head),
-                highest_block: U256::from(canonical_head),
+                // Preserve the JSON-RPC invariant currentBlock <= highestBlock
+                // during a transient unwind where the canonical overlay can
+                // temporarily sit behind the restartable Finish checkpoint.
+                highest_block: U256::from(canonical_head.max(durable_head)),
                 warp_chunks_amount: None,
                 warp_chunks_processed: None,
                 stages: Some(stages),
