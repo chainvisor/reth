@@ -154,10 +154,23 @@ impl RocksDBProvider {
             .unwrap_or(0);
 
         // Get the first tx after the checkpoint block from MDBX (authoritative up to checkpoint)
-        let checkpoint_next_tx = provider
+        let Some(checkpoint_next_tx) = provider
             .block_body_indices(checkpoint)?
             .map(|indices| indices.next_tx_num())
-            .unwrap_or(0);
+        else {
+            // Without the checkpoint block's body indices there is no trustworthy transaction
+            // boundary for range healing. Starting at zero would re-hash and delete the entire
+            // retained transaction history when only the snapshot tail is incomplete.
+            let unwind_to = checkpoint.saturating_sub(1);
+            tracing::warn!(
+                target: "reth::providers::rocksdb",
+                checkpoint,
+                sf_tip,
+                unwind_to,
+                "TransactionHashNumbers: checkpoint block body indices missing, unwind needed"
+            );
+            return Ok(Some(unwind_to));
+        };
 
         if sf_tip_end_tx < checkpoint_next_tx {
             // This should never happen in normal operation - static files should have all
@@ -887,6 +900,61 @@ mod tests {
                 rocksdb.get::<tables::TransactionHashNumbers>(*hash).unwrap().is_none(),
                 "tx {} should be pruned",
                 i + 6
+            );
+        }
+    }
+
+    #[test]
+    fn test_transaction_hash_heal_missing_checkpoint_body_indices_unwinds_without_pruning() {
+        let temp_dir = TempDir::new().unwrap();
+        let rocksdb =
+            RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        let mut rng = generators::rng();
+        let blocks = generators::random_block_range(
+            &mut rng,
+            0..=5,
+            BlockRangeParams { parent: Some(B256::ZERO), tx_count: 2..3, ..Default::default() },
+        );
+        let mut tx_hashes = Vec::new();
+
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            let mut tx_number = 0u64;
+            for block in &blocks {
+                provider
+                    .insert_block(&block.clone().try_recover().expect("recover block"))
+                    .unwrap();
+                for transaction in &block.body().transactions {
+                    let hash = transaction.trie_hash();
+                    tx_hashes.push(hash);
+                    rocksdb
+                        .put::<tables::TransactionHashNumbers>(hash, &tx_number)
+                        .unwrap();
+                    tx_number += 1;
+                }
+            }
+            provider
+                .save_stage_checkpoint(StageId::TransactionLookup, StageCheckpoint::new(2))
+                .unwrap();
+
+            let mut cursor =
+                provider.tx_ref().cursor_write::<tables::BlockBodyIndices>().unwrap();
+            assert!(cursor.seek_exact(2).unwrap().is_some());
+            cursor.delete_current().unwrap();
+            drop(cursor);
+            provider.commit().unwrap();
+        }
+
+        let provider = factory.database_provider_ro().unwrap();
+        let result = rocksdb.heal_transaction_hash_numbers(&provider).unwrap();
+        assert_eq!(result, Some(1), "missing checkpoint boundary must unwind one block");
+        for hash in tx_hashes {
+            assert!(
+                rocksdb.get::<tables::TransactionHashNumbers>(hash).unwrap().is_some(),
+                "healing must not delete transaction hashes without a trustworthy boundary"
             );
         }
     }
