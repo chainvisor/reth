@@ -1,7 +1,7 @@
 use crate::{
     changesets_utils::StorageRevertsIter,
     providers::{
-        database::{chain::ChainStorage, metrics},
+        database::{chain::ChainStorage, metrics, CrossStoreWriteGuard},
         rocksdb::{PendingRocksDBBatches, RocksDBProvider, RocksDBWriteCtx},
         static_file::{StaticFileWriteCtx, StaticFileWriter},
         NodeTypesForProvider, StaticFileProvider,
@@ -214,6 +214,8 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     metrics: metrics::DatabaseProviderMetrics,
     /// Database handle used to inspect active MDBX readers during unwind commits.
     reader_txn_tracker: Option<Arc<dyn ReaderTxnTracker>>,
+    /// Keeps this entire read-write provider lifetime inside the cross-store snapshot barrier.
+    cross_store_write_guard: Option<CrossStoreWriteGuard>,
 }
 
 impl<TX: Debug, N: NodeTypes> Debug for DatabaseProvider<TX, N> {
@@ -232,6 +234,7 @@ impl<TX: Debug, N: NodeTypes> Debug for DatabaseProvider<TX, N> {
             .field("commit_order", &self.commit_order)
             .field("minimum_pruning_distance", &self.minimum_pruning_distance)
             .field("reader_txn_tracker", &"<reader txn tracker>")
+            .field("cross_store_write_guard", &self.cross_store_write_guard.is_some())
             .finish()
     }
 }
@@ -254,6 +257,11 @@ impl<TX, N: NodeTypes> DatabaseProvider<TX, N> {
         T: ReaderTxnTracker + 'static,
     {
         self.reader_txn_tracker = Some(Arc::new(reader_txn_tracker));
+        self
+    }
+
+    pub(crate) fn with_cross_store_write_guard(mut self, guard: CrossStoreWriteGuard) -> Self {
+        self.cross_store_write_guard = Some(guard);
         self
     }
 }
@@ -433,6 +441,7 @@ impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
             minimum_pruning_distance: MINIMUM_UNWIND_SAFE_DISTANCE,
             metrics: metrics::DatabaseProviderMetrics::default(),
             reader_txn_tracker: None,
+            cross_store_write_guard: None,
         }
     }
 
@@ -1060,6 +1069,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
             minimum_pruning_distance: MINIMUM_UNWIND_SAFE_DISTANCE,
             metrics: metrics::DatabaseProviderMetrics::default(),
             reader_txn_tracker: None,
+            cross_store_write_guard: None,
         }
     }
 

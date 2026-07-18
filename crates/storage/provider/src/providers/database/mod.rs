@@ -41,7 +41,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -77,6 +77,109 @@ struct ReadOnlySyncState {
     last_refresh: Mutex<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct CrossStoreSnapshotBarrierState {
+    snapshot_active: bool,
+    active_writers: usize,
+}
+
+#[derive(Debug, Default)]
+struct CrossStoreSnapshotBarrierInner {
+    state: Mutex<CrossStoreSnapshotBarrierState>,
+    changed: Condvar,
+}
+
+/// Coordinates an external block-device snapshot with every read-write provider lifetime.
+///
+/// A normal provider commit intentionally persists static files, `RocksDB`, and MDBX in sequence.
+/// Each intermediate point is crash-recoverable, but it is not a clean application checkpoint:
+/// an external filesystem freeze there can expose a static-file tip whose corresponding MDBX
+/// block-body boundary has not committed yet. Writers enter this barrier before opening their MDBX
+/// write transaction and leave only after the whole provider is dropped. A snapshot takes the
+/// exclusive guard, waits for all earlier writers, and prevents new ones until the filesystem
+/// snapshot has completed.
+#[derive(Clone, Debug, Default)]
+pub struct CrossStoreSnapshotBarrier {
+    inner: Arc<CrossStoreSnapshotBarrierInner>,
+}
+
+impl CrossStoreSnapshotBarrier {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, CrossStoreSnapshotBarrierState> {
+        self.inner.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn enter_writer(&self) -> CrossStoreWriteGuard {
+        let mut state = self.lock_state();
+        while state.snapshot_active {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let Some(active_writers) = state.active_writers.checked_add(1) else {
+            std::process::abort();
+        };
+        state.active_writers = active_writers;
+        CrossStoreWriteGuard { barrier: self.clone() }
+    }
+
+    /// Waits for every previously admitted writer and excludes new writers until the returned
+    /// guard is dropped.
+    pub fn quiesce(&self) -> CrossStoreSnapshotQuiesceGuard {
+        let mut state = self.lock_state();
+        while state.snapshot_active {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.snapshot_active = true;
+        while state.active_writers != 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        CrossStoreSnapshotQuiesceGuard { barrier: self.clone() }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CrossStoreWriteGuard {
+    barrier: CrossStoreSnapshotBarrier,
+}
+
+impl Drop for CrossStoreWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self.barrier.lock_state();
+        if state.active_writers == 0 {
+            std::process::abort();
+        }
+        state.active_writers -= 1;
+        self.barrier.inner.changed.notify_all();
+    }
+}
+
+/// Exclusive application checkpoint held across an external filesystem snapshot.
+#[derive(Debug)]
+pub struct CrossStoreSnapshotQuiesceGuard {
+    barrier: CrossStoreSnapshotBarrier,
+}
+
+impl Drop for CrossStoreSnapshotQuiesceGuard {
+    fn drop(&mut self) {
+        let mut state = self.barrier.lock_state();
+        if !state.snapshot_active {
+            std::process::abort();
+        }
+        state.snapshot_active = false;
+        self.barrier.inner.changed.notify_all();
+    }
+}
+
 /// A common provider that fetches data from a database or static file.
 ///
 /// This provider implements most provider or provider factory traits.
@@ -108,6 +211,8 @@ pub struct ProviderFactory<N: NodeTypesWithDB> {
     /// Only set for read-only factories. Can be disabled if there is no concurrent read-write
     /// factory writing to the database (e.g as part of a running reth node).
     read_only_sync: Option<Arc<ReadOnlySyncState>>,
+    /// Cross-store writer admission barrier used by external filesystem snapshots.
+    cross_store_snapshot_barrier: CrossStoreSnapshotBarrier,
 }
 
 impl<N: NodeTypesForProvider> ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>> {
@@ -165,6 +270,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             runtime,
             minimum_pruning_distance: MINIMUM_UNWIND_SAFE_DISTANCE,
             read_only_sync: None,
+            cross_store_snapshot_barrier: CrossStoreSnapshotBarrier::default(),
         })
     }
 
@@ -187,6 +293,11 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
 }
 
 impl<N: NodeTypesWithDB> ProviderFactory<N> {
+    /// Returns the process-wide barrier shared by every clone of this factory.
+    pub fn cross_store_snapshot_barrier(&self) -> CrossStoreSnapshotBarrier {
+        self.cross_store_snapshot_barrier.clone()
+    }
+
     /// Sets the pruning configuration for an existing [`ProviderFactory`].
     pub fn with_prune_modes(mut self, prune_modes: PruneModes) -> Self {
         self.prune_modes = prune_modes;
@@ -422,6 +533,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     /// open.
     #[track_caller]
     pub fn provider_rw(&self) -> ProviderResult<DatabaseProviderRW<N::DB, N>> {
+        let snapshot_write_guard = self.cross_store_snapshot_barrier.enter_writer();
         Ok(DatabaseProviderRW(
             DatabaseProvider::new_rw(
                 self.db.tx_mut()?,
@@ -435,6 +547,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
                 self.runtime.clone(),
                 self.db.path(),
             )
+            .with_cross_store_write_guard(snapshot_write_guard)
             .with_reader_txn_tracker(self.db.clone())
             .with_minimum_pruning_distance(self.minimum_pruning_distance),
         ))
@@ -450,6 +563,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     pub fn unwind_provider_rw(
         &self,
     ) -> ProviderResult<DatabaseProvider<<N::DB as Database>::TXMut, N>> {
+        let snapshot_write_guard = self.cross_store_snapshot_barrier.enter_writer();
         Ok(DatabaseProvider::new_unwind_rw(
             self.db.tx_mut()?,
             self.chain_spec.clone(),
@@ -462,6 +576,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             self.runtime.clone(),
             self.db.path(),
         )
+        .with_cross_store_write_guard(snapshot_write_guard)
         .with_reader_txn_tracker(self.db.clone())
         .with_minimum_pruning_distance(self.minimum_pruning_distance))
     }
@@ -996,6 +1111,7 @@ where
             runtime,
             minimum_pruning_distance,
             read_only_sync,
+            cross_store_snapshot_barrier,
         } = self;
         f.debug_struct("ProviderFactory")
             .field("db", &db)
@@ -1013,6 +1129,7 @@ where
                 "read_only_sync",
                 &read_only_sync.as_ref().map(|s| s.last_synced_txnid.load(Ordering::Relaxed)),
             )
+            .field("cross_store_snapshot_barrier", cross_store_snapshot_barrier)
             .finish()
     }
 }
@@ -1032,6 +1149,7 @@ impl<N: NodeTypesWithDB> Clone for ProviderFactory<N> {
             runtime: self.runtime.clone(),
             minimum_pruning_distance: self.minimum_pruning_distance,
             read_only_sync: self.read_only_sync.clone(),
+            cross_store_snapshot_barrier: self.cross_store_snapshot_barrier.clone(),
         }
     }
 }
@@ -1058,6 +1176,51 @@ mod tests {
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
     use std::{ops::RangeInclusive, sync::Arc};
+
+    #[test]
+    fn cross_store_snapshot_barrier_waits_for_old_writers_and_blocks_new_writers() {
+        let factory = create_test_provider_factory();
+        let barrier = factory.cross_store_snapshot_barrier();
+        let old_writer = factory.provider_rw().expect("open old read-write provider");
+
+        let (snapshot_acquired_tx, snapshot_acquired_rx) = std::sync::mpsc::channel();
+        let (release_snapshot_tx, release_snapshot_rx) = std::sync::mpsc::channel();
+        let snapshot_barrier = barrier.clone();
+        let snapshot_thread = std::thread::spawn(move || {
+            let snapshot = snapshot_barrier.quiesce();
+            snapshot_acquired_tx.send(()).expect("report snapshot acquisition");
+            release_snapshot_rx.recv().expect("release snapshot guard");
+            drop(snapshot);
+        });
+
+        assert!(
+            snapshot_acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot must wait for an already-admitted writer"
+        );
+        drop(old_writer);
+        snapshot_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot acquires after old writer exits");
+
+        let (new_writer_acquired_tx, new_writer_acquired_rx) = std::sync::mpsc::channel();
+        let writer_factory = factory.clone();
+        let writer_thread = std::thread::spawn(move || {
+            let writer = writer_factory.provider_rw().expect("open queued read-write provider");
+            new_writer_acquired_tx.send(()).expect("report writer acquisition");
+            drop(writer);
+        });
+        assert!(
+            new_writer_acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "new writer must wait while the snapshot guard is held"
+        );
+
+        release_snapshot_tx.send(()).expect("release snapshot thread");
+        snapshot_thread.join().expect("snapshot thread joins");
+        new_writer_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("new writer acquires after snapshot release");
+        writer_thread.join().expect("writer thread joins");
+    }
 
     #[test]
     fn common_history_provider() {

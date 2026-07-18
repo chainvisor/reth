@@ -1,7 +1,7 @@
 use crate::{
     providers::{
-        ConsistentProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider,
-        StaticFileProviderRWRefMut,
+        ConsistentProvider, CrossStoreSnapshotBarrier, ProviderNodeTypes, RocksDBProvider,
+        StaticFileProvider, StaticFileProviderRWRefMut,
     },
     AccountReader, BalProvider, BalStoreHandle, BlockHashReader, BlockIdReader, BlockNumReader,
     BlockReader, BlockReaderIdExt, BlockSource, CanonChainTracker, CanonStateNotifications,
@@ -65,6 +65,12 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> BlockchainProvider<N> {
+    /// Returns the application-level barrier that makes an external block-device snapshot land
+    /// between complete static-file/`RocksDB`/MDBX provider transactions.
+    pub fn cross_store_snapshot_barrier(&self) -> CrossStoreSnapshotBarrier {
+        self.database.cross_store_snapshot_barrier()
+    }
+
     /// Create a new [`BlockchainProvider`] using only the storage, fetching the latest
     /// header from the database to initialize the provider.
     pub fn new(storage: ProviderFactory<N>) -> ProviderResult<Self> {

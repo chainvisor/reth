@@ -383,59 +383,79 @@ impl EngineNodeLauncher {
             });
         }
 
-        // chainvisor writer snapshot quiesce (FlushInPlace): when
-        // CV_RETH_FLUSH_ON_SIGUSR1=1, a SIGUSR1 drains all RocksDB memtables to
-        // SST + syncs the WAL (`RocksDBProvider::flush_all_for_snapshot`), then
-        // touches CV_RETH_FLUSH_MARKER_PATH. The writer (chainvisor shadower —
-        // reth's PARENT process in the same container) signals this immediately
-        // BEFORE its FIFREEZE + `lvcreate -s`, then waits for the marker, so the
-        // LVM snapshot captures a crash-consistent RocksDB. Needed because the
-        // writer opens RocksDB with `wal_ttl_seconds=0` (obsolete WALs deleted
-        // immediately): an un-flushed memtable racing the freeze yields a
-        // reader-side `Corruption: SST file is ahead of WALs`. Default off; never
-        // armed on a reader (and `flush_all_for_snapshot` is a no-op on a
-        // read-only/secondary provider regardless).
+        // chainvisor writer snapshot quiesce (FlushInPlace): SIGUSR1 first takes
+        // the provider factory's cross-store writer barrier, so the snapshot can
+        // only land BETWEEN complete static-file/RocksDB/MDBX transactions. It
+        // then drains RocksDB memtables, touches CV_RETH_FLUSH_MARKER_PATH, and
+        // HOLDS the barrier until the parent sends SIGUSR2 after FIFREEZE +
+        // `lvcreate -s` + FITHAW. This is an application-atomic checkpoint, not
+        // merely a crash-recoverable cut through the provider's ordered commit.
+        // Default off and never armed on a reader.
         if std::env::var("CV_RETH_FLUSH_ON_SIGUSR1").as_deref() == Ok("1") {
-            match std::env::var("CV_RETH_FLUSH_MARKER_PATH") {
-                Ok(marker_path) => {
-                    let flush_provider = provider.clone();
-                    ctx.task_executor().spawn_critical_task(
-                        "rocksdb snapshot-flush signal handler",
-                        async move {
-                            loop {
-                                let mut sigusr1 = match tokio::signal::unix::signal(
-                                    tokio::signal::unix::SignalKind::user_defined1(),
-                                ) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        error!(target: "reth::cli", %e, "rocksdb snapshot-flush: SIGUSR1 install failed; retry 30s");
-                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                                        continue;
-                                    }
-                                };
-                                info!(target: "reth::cli", marker = %marker_path, "rocksdb snapshot-flush SIGUSR1 handler armed");
-                                while sigusr1.recv().await.is_some() {
-                                    let started = std::time::Instant::now();
-                                    match flush_provider.rocksdb_provider().flush_all_for_snapshot() {
-                                        Ok(()) => match std::fs::write(&marker_path, b"") {
-                                            Ok(()) => info!(
-                                                target: "reth::cli",
-                                                elapsed_ms = started.elapsed().as_millis() as u64,
-                                                "rocksdb snapshot-flush complete"
-                                            ),
-                                            Err(e) => error!(target: "reth::cli", %e, "rocksdb snapshot-flush: marker write failed"),
-                                        },
-                                        Err(e) => error!(target: "reth::cli", %e, "rocksdb snapshot-flush failed"),
-                                    }
-                                }
+            let marker_path = std::env::var("CV_RETH_FLUSH_MARKER_PATH").map_err(|_| {
+                eyre::eyre!(
+                    "CV_RETH_FLUSH_ON_SIGUSR1=1 requires CV_RETH_FLUSH_MARKER_PATH"
+                )
+            })?;
+            let mut sigusr1 = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::user_defined1(),
+            )
+            .map_err(|error| eyre::eyre!("install snapshot SIGUSR1 handler: {error}"))?;
+            let mut sigusr2 = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::user_defined2(),
+            )
+            .map_err(|error| eyre::eyre!("install snapshot SIGUSR2 handler: {error}"))?;
+            let flush_provider = provider.clone();
+            ctx.task_executor().spawn_critical_task(
+                "cross-store snapshot signal handler",
+                async move {
+                    info!(target: "reth::cli", marker = %marker_path, "cross-store snapshot SIGUSR1/SIGUSR2 handler armed");
+                    while sigusr1.recv().await.is_some() {
+                        let started = std::time::Instant::now();
+                        let barrier = flush_provider.cross_store_snapshot_barrier();
+                        let snapshot_guard = match tokio::task::spawn_blocking(move || {
+                            barrier.quiesce()
+                        })
+                        .await
+                        {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                error!(target: "reth::cli", %error, "cross-store snapshot barrier task failed");
+                                return
                             }
-                        },
-                    );
+                        };
+
+                        match flush_provider.rocksdb_provider().flush_all_for_snapshot() {
+                            Ok(()) => match std::fs::write(&marker_path, b"") {
+                                Ok(()) => info!(
+                                    target: "reth::cli",
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    "cross-store snapshot barrier acquired and RocksDB flushed"
+                                ),
+                                Err(error) => error!(target: "reth::cli", %error, "cross-store snapshot marker write failed"),
+                            },
+                            Err(error) => error!(target: "reth::cli", %error, "cross-store snapshot RocksDB flush failed"),
+                        }
+
+                        // Pair every SIGUSR1 with exactly one SIGUSR2 even when
+                        // flush/marker creation failed. The parent sends SIGUSR2
+                        // on timeout and cancellation too, so no stale resume can
+                        // be consumed by a later snapshot cycle.
+                        if sigusr2.recv().await.is_none() {
+                            error!(target: "reth::cli", "cross-store snapshot SIGUSR2 stream closed while barrier held");
+                            drop(snapshot_guard);
+                            return
+                        }
+                        drop(snapshot_guard);
+                        info!(
+                            target: "reth::cli",
+                            held_ms = started.elapsed().as_millis() as u64,
+                            "cross-store snapshot barrier released after SIGUSR2"
+                        );
+                    }
+                    error!(target: "reth::cli", "cross-store snapshot SIGUSR1 stream closed");
                 }
-                Err(_) => {
-                    error!(target: "reth::cli", "CV_RETH_FLUSH_ON_SIGUSR1=1 but CV_RETH_FLUSH_MARKER_PATH unset — snapshot-flush handler NOT armed");
-                }
-            }
+            );
         }
 
         let (exit, rx) = oneshot::channel();
