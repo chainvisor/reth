@@ -1075,6 +1075,13 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
 
     /// Consume `DbTx` or `DbTxMut`.
     pub fn into_tx(self) -> TX {
+        self.into_raw_transaction()
+    }
+
+    fn into_raw_transaction(self) -> TX {
+        if let Some(guard) = self.cross_store_write_guard.as_ref() {
+            guard.assert_raw_transaction_escape_allowed();
+        }
         self.tx
     }
 
@@ -3867,7 +3874,7 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
     }
 
     fn into_tx(self) -> Self::Tx {
-        self.tx
+        self.into_raw_transaction()
     }
 
     fn prune_modes_ref(&self) -> &PruneModes {

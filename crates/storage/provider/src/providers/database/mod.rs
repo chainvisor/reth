@@ -81,6 +81,7 @@ struct ReadOnlySyncState {
 struct CrossStoreSnapshotBarrierState {
     snapshot_active: bool,
     active_writers: usize,
+    raw_transaction_escape_forbidden: bool,
 }
 
 #[derive(Debug, Default)]
@@ -105,23 +106,41 @@ pub struct CrossStoreSnapshotBarrier {
 
 impl CrossStoreSnapshotBarrier {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, CrossStoreSnapshotBarrierState> {
-        self.inner.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(_) => abort_cross_store_barrier("snapshot barrier mutex poisoned"),
+        }
+    }
+
+    fn wait_for_change<'a>(
+        &self,
+        state: std::sync::MutexGuard<'a, CrossStoreSnapshotBarrierState>,
+    ) -> std::sync::MutexGuard<'a, CrossStoreSnapshotBarrierState> {
+        match self.inner.changed.wait(state) {
+            Ok(state) => state,
+            Err(_) => abort_cross_store_barrier("snapshot barrier condvar wait poisoned"),
+        }
     }
 
     fn enter_writer(&self) -> CrossStoreWriteGuard {
         let mut state = self.lock_state();
         while state.snapshot_active {
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = self.wait_for_change(state);
         }
         let Some(active_writers) = state.active_writers.checked_add(1) else {
-            std::process::abort();
+            abort_cross_store_barrier("active writer counter overflow");
         };
         state.active_writers = active_writers;
         CrossStoreWriteGuard { barrier: self.clone() }
+    }
+
+    /// Permanently forbids consuming a guarded provider into a bare database transaction.
+    ///
+    /// The signal-driven snapshot protocol enables this before accepting its first request. A
+    /// bare transaction cannot carry the cross-store admission guard through its remaining
+    /// lifetime, so allowing one would silently make the advertised snapshot barrier incomplete.
+    pub fn forbid_raw_transaction_escape(&self) {
+        self.lock_state().raw_transaction_escape_forbidden = true;
     }
 
     /// Waits for every previously admitted writer and excludes new writers until the returned
@@ -129,22 +148,24 @@ impl CrossStoreSnapshotBarrier {
     pub fn quiesce(&self) -> CrossStoreSnapshotQuiesceGuard {
         let mut state = self.lock_state();
         while state.snapshot_active {
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = self.wait_for_change(state);
         }
         state.snapshot_active = true;
         while state.active_writers != 0 {
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = self.wait_for_change(state);
         }
         CrossStoreSnapshotQuiesceGuard { barrier: self.clone() }
     }
+}
+
+fn abort_cross_store_barrier(invariant: &str) -> ! {
+    tracing::error!(
+        target: "providers::db",
+        invariant,
+        "fatal cross-store snapshot barrier invariant violation"
+    );
+    eprintln!("FATAL: cross-store snapshot barrier invariant violation: {invariant}");
+    std::process::abort()
 }
 
 #[derive(Debug)]
@@ -152,11 +173,21 @@ pub(crate) struct CrossStoreWriteGuard {
     barrier: CrossStoreSnapshotBarrier,
 }
 
+impl CrossStoreWriteGuard {
+    pub(crate) fn assert_raw_transaction_escape_allowed(&self) {
+        if self.barrier.lock_state().raw_transaction_escape_forbidden {
+            abort_cross_store_barrier(
+                "guarded provider consumed into a raw transaction after snapshot fencing armed",
+            );
+        }
+    }
+}
+
 impl Drop for CrossStoreWriteGuard {
     fn drop(&mut self) {
         let mut state = self.barrier.lock_state();
         if state.active_writers == 0 {
-            std::process::abort();
+            abort_cross_store_barrier("write guard released with zero active writers");
         }
         state.active_writers -= 1;
         self.barrier.inner.changed.notify_all();
@@ -173,7 +204,7 @@ impl Drop for CrossStoreSnapshotQuiesceGuard {
     fn drop(&mut self) {
         let mut state = self.barrier.lock_state();
         if !state.snapshot_active {
-            std::process::abort();
+            abort_cross_store_barrier("snapshot guard released while no snapshot is active");
         }
         state.snapshot_active = false;
         self.barrier.inner.changed.notify_all();

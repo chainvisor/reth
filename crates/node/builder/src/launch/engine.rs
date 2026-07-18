@@ -406,13 +406,15 @@ impl EngineNodeLauncher {
             )
             .map_err(|error| eyre::eyre!("install snapshot SIGUSR2 handler: {error}"))?;
             let flush_provider = provider.clone();
+            let snapshot_barrier = provider.cross_store_snapshot_barrier();
+            snapshot_barrier.forbid_raw_transaction_escape();
             ctx.task_executor().spawn_critical_task(
                 "cross-store snapshot signal handler",
                 async move {
                     info!(target: "reth::cli", marker = %marker_path, "cross-store snapshot SIGUSR1/SIGUSR2 handler armed");
                     while sigusr1.recv().await.is_some() {
                         let started = std::time::Instant::now();
-                        let barrier = flush_provider.cross_store_snapshot_barrier();
+                        let barrier = snapshot_barrier.clone();
                         let snapshot_guard = match tokio::task::spawn_blocking(move || {
                             barrier.quiesce()
                         })
