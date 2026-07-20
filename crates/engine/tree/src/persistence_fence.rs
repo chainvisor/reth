@@ -173,6 +173,12 @@ impl PersistenceCheckpointSnapshot {
             .chain(self.finish)
             .fold(last_persisted, u64::max)
     }
+
+    /// Current durable `Finish` height, retained by the convergence fence so a
+    /// multi-batch pipeline repair must prove strict progress after every run.
+    pub(crate) const fn finish_checkpoint(&self) -> Option<u64> {
+        self.finish
+    }
 }
 
 /// A precise reason why Engine API persistence is not allowed to own the next block range.

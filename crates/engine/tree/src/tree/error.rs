@@ -35,18 +35,22 @@ pub enum AdvancePersistenceError {
         /// Highest checkpoint that must be converged.
         block_number: u64,
     },
-    /// Dispatch of the one permitted convergence run failed.
+    /// Dispatch of a required convergence run failed.
     #[error("engine persistence fence could not dispatch its pipeline convergence action")]
     FenceRepairDispatchFailed,
-    /// The one permitted convergence run completed without aligning all owner stages.
+    /// A convergence run completed without strict durable progress toward its fixed target.
     #[error(
-        "engine persistence fence convergence to {target:?} failed: initial={initial}; current={current}"
+        "engine persistence fence convergence to {target:?} stalled: initial={initial}; previous Finish={previous_finish:?}; current Finish={current_finish:?}; current={current}"
     )]
     FenceRepairFailed {
         /// Pipeline target used by the convergence attempt.
         target: BlockNumHash,
         /// Mismatch that triggered the attempt.
         initial: PersistenceFenceError,
+        /// Durable `Finish` observed before the completed convergence run.
+        previous_finish: Option<u64>,
+        /// Durable `Finish` observed after the completed convergence run.
+        current_finish: Option<u64>,
         /// Mismatch still present after the attempt.
         current: PersistenceFenceError,
     },

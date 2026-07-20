@@ -98,11 +98,29 @@ pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 /// even when the finalized block is not set (e.g., on L2s like Optimism).
 const CHANGESET_CACHE_RETENTION_BLOCKS: u64 = 64;
 
-/// One-shot pipeline repair triggered by the Engine persistence ownership fence.
+/// Bounded pipeline repair triggered by the Engine persistence ownership fence.
+///
+/// The pipeline may intentionally commit a large target in multiple execution
+/// batches. Repeating the exact fixed target is safe only while durable
+/// `Finish` advances strictly toward it; that monotonic bound makes an
+/// arbitrary retry limit unnecessary and prevents a no-progress loop.
 #[derive(Clone, Debug)]
 struct PersistenceFenceRepair {
     target: BlockNumHash,
     mismatch: PersistenceFenceError,
+    last_finish: Option<u64>,
+}
+
+const fn persistence_fence_finish_advanced_toward_target(
+    previous: Option<u64>,
+    current: Option<u64>,
+    target: u64,
+) -> bool {
+    match (previous, current) {
+        (None, Some(current)) => current <= target,
+        (Some(previous), Some(current)) => current > previous && current <= target,
+        _ => false,
+    }
 }
 
 /// A builder for creating state providers that can be used across threads.
@@ -302,7 +320,7 @@ where
     backfill_sync_state: BackfillSyncState,
     /// One tree-originated Pending action that the orchestrator is permitted to consume once.
     backfill_pending_reservation: Option<BackfillAction>,
-    /// The one permitted pipeline convergence attempt for a divergent persistence frontier.
+    /// Strict-progress pipeline convergence toward one fixed persistence frontier.
     persistence_fence_repair: Option<PersistenceFenceRepair>,
     /// Whether startup persistence ownership was checked before accepting Engine input.
     startup_admission_complete: bool,
@@ -1658,8 +1676,10 @@ where
         Ok(target)
     }
 
-    /// Admit Engine persistence only at an exact, unowned frontier. A mismatch schedules one
-    /// forced pipeline convergence even below the normal backfill-distance threshold.
+    /// Admit Engine persistence only at an exact, unowned frontier. A mismatch schedules forced
+    /// pipeline convergence even below the normal backfill-distance threshold. Large targets may
+    /// require multiple pipeline batches, but every completed run must move durable `Finish`
+    /// strictly forward toward the original fixed target.
     fn persistence_fence_allows_save(&mut self) -> Result<bool, AdvancePersistenceError> {
         let provider = self.provider.database_provider_ro()?;
         let snapshot = PersistenceCheckpointSnapshot::read(&provider)?;
@@ -1680,12 +1700,51 @@ where
                 )
                 .increment(1);
 
-                if let Some(attempt) = &self.persistence_fence_repair {
-                    return Err(AdvancePersistenceError::FenceRepairFailed {
-                        target: attempt.target,
-                        initial: attempt.mismatch.clone(),
-                        current: mismatch,
-                    })
+                if let Some(attempt) = &mut self.persistence_fence_repair {
+                    let previous_finish = attempt.last_finish;
+                    let current_finish = snapshot.finish_checkpoint();
+                    if !persistence_fence_finish_advanced_toward_target(
+                        previous_finish,
+                        current_finish,
+                        attempt.target.number,
+                    ) {
+                        return Err(AdvancePersistenceError::FenceRepairFailed {
+                            target: attempt.target,
+                            initial: attempt.mismatch.clone(),
+                            previous_finish,
+                            current_finish,
+                            current: mismatch,
+                        })
+                    }
+
+                    let target = attempt.target;
+                    let initial = attempt.mismatch.clone();
+                    attempt.last_finish = current_finish;
+                    warn!(
+                        target: "engine::tree",
+                        blocking_stage = %mismatch.stage(),
+                        reason = mismatch.reason(),
+                        %mismatch,
+                        %initial,
+                        ?previous_finish,
+                        ?current_finish,
+                        ?target,
+                        "Engine persistence fence convergence made strict progress; scheduling the same fixed target again"
+                    );
+                    ::metrics::counter!(
+                        "consensus_engine_beacon_persistence_fence_repair_runs_total",
+                        "kind" => "continued",
+                    )
+                    .increment(1);
+
+                    let action = BackfillAction::Start(target.hash.into());
+                    self.outgoing
+                        .send(EngineApiEvent::BackfillAction(action.clone()))
+                        .map_err(|_| AdvancePersistenceError::FenceRepairDispatchFailed)?;
+                    self.backfill_sync_state = BackfillSyncState::Pending;
+                    self.backfill_pending_reservation = Some(action);
+                    self.metrics.engine.pipeline_runs.increment(1);
+                    return Ok(false)
                 }
                 if self.config.pipeline_backfill_disabled() {
                     return Err(AdvancePersistenceError::FenceRepairUnavailable { mismatch })
@@ -1700,8 +1759,13 @@ where
                     reason = mismatch.reason(),
                     %mismatch,
                     ?target,
-                    "Engine persistence fenced; scheduling one pipeline convergence run"
+                    "Engine persistence fenced; scheduling pipeline convergence toward a fixed target"
                 );
+                ::metrics::counter!(
+                    "consensus_engine_beacon_persistence_fence_repair_runs_total",
+                    "kind" => "initial",
+                )
+                .increment(1);
 
                 let action = BackfillAction::Start(target.hash.into());
                 self.outgoing
@@ -1710,7 +1774,11 @@ where
                 self.backfill_sync_state = BackfillSyncState::Pending;
                 self.backfill_pending_reservation = Some(action);
                 self.metrics.engine.pipeline_runs.increment(1);
-                self.persistence_fence_repair = Some(PersistenceFenceRepair { target, mismatch });
+                self.persistence_fence_repair = Some(PersistenceFenceRepair {
+                    target,
+                    mismatch,
+                    last_finish: snapshot.finish_checkpoint(),
+                });
                 Ok(false)
             }
         }

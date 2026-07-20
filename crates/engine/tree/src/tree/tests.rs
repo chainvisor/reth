@@ -856,7 +856,7 @@ fn test_disabled_persistence_does_not_emit_save_blocks_or_backpressure() {
 }
 
 #[test]
-fn test_persistence_fence_forces_one_sub_threshold_pipeline_convergence() {
+fn test_persistence_fence_fails_when_convergence_makes_no_progress() {
     let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
     let blocks = executed_chain_from(genesis_hash, 1..5);
     let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
@@ -874,12 +874,78 @@ fn test_persistence_fence_forces_one_sub_threshold_pipeline_convergence() {
     };
     assert_eq!(target.sync_target(), Some(blocks[0].recovered_block().hash()));
 
-    // A completed no-progress repair is fatal; it may not silently schedule a second run.
+    // A completed no-progress repair is fatal; only strict durable progress may schedule another
+    // run toward the same fixed target.
     test_harness.tree.backfill_sync_state = BackfillSyncState::Idle;
     assert!(matches!(
         test_harness.tree.advance_persistence(),
         Err(AdvancePersistenceError::FenceRepairFailed { .. })
     ));
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+    assert!(test_harness.action_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_persistence_fence_repeats_convergence_while_finish_advances() {
+    let genesis_hash = SealedHeader::seal_slow(MAINNET.genesis_header().clone()).hash();
+    let blocks = executed_chain_from(genesis_hash, 1..6);
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    test_harness.tree.config = test_harness.tree.config.with_persistence_threshold(0);
+    let target = blocks[3].recovered_block().num_hash();
+
+    // Headers/Bodies can legitimately remain at the fixed pipeline target while bounded
+    // Execution/Merkle batches advance Finish toward it.
+    test_harness
+        .provider
+        .set_stage_checkpoint(StageId::Headers, StageCheckpoint::new(target.number));
+    test_harness
+        .provider
+        .set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(target.number));
+    test_harness.tree.advance_persistence().unwrap();
+    let first = test_harness.from_tree_rx.try_recv().expect("missing first convergence action");
+    let EngineApiEvent::BackfillAction(BackfillAction::Start(first_target)) = first else {
+        panic!("unexpected event {first:?}");
+    };
+    assert_eq!(first_target.sync_target(), Some(target.hash));
+
+    // One bounded pipeline batch commits only through block 2. Finish moved strictly toward the
+    // fixed block-4 target, so scheduling the same target again is required and finite.
+    let partial = blocks[1].recovered_block().num_hash();
+    for stage in StageId::ALL {
+        test_harness
+            .provider
+            .set_stage_checkpoint(stage, StageCheckpoint::new(partial.number));
+    }
+    test_harness
+        .provider
+        .set_stage_checkpoint(StageId::Headers, StageCheckpoint::new(target.number));
+    test_harness
+        .provider
+        .set_stage_checkpoint(StageId::Bodies, StageCheckpoint::new(target.number));
+    test_harness.tree.persistence_state.finish(partial.hash, partial.number);
+    test_harness.tree.backfill_sync_state = BackfillSyncState::Idle;
+    test_harness.tree.backfill_pending_reservation = None;
+
+    test_harness.tree.advance_persistence().unwrap();
+    let second =
+        test_harness.from_tree_rx.try_recv().expect("missing continued convergence action");
+    let EngineApiEvent::BackfillAction(BackfillAction::Start(second_target)) = second else {
+        panic!("unexpected event {second:?}");
+    };
+    assert_eq!(second_target.sync_target(), Some(target.hash));
+    assert!(test_harness.action_rx.try_recv().is_err());
+
+    // Exact alignment at the fixed target clears the repair and admits Engine persistence.
+    for stage in StageId::ALL {
+        test_harness
+            .provider
+            .set_stage_checkpoint(stage, StageCheckpoint::new(target.number));
+    }
+    test_harness.tree.persistence_state.finish(target.hash, target.number);
+    test_harness.tree.backfill_sync_state = BackfillSyncState::Idle;
+    test_harness.tree.backfill_pending_reservation = None;
+    assert!(test_harness.tree.persistence_fence_allows_save().unwrap());
+    assert!(test_harness.tree.persistence_fence_repair.is_none());
     assert!(test_harness.from_tree_rx.try_recv().is_err());
     assert!(test_harness.action_rx.try_recv().is_err());
 }
