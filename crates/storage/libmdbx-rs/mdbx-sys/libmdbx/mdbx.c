@@ -8718,12 +8718,35 @@ int mdbx_cursor_eof(const MDBX_cursor *mc) {
   return is_eof(mc) ? MDBX_RESULT_TRUE : MDBX_RESULT_FALSE;
 }
 
+/* The public cursor API is the last point at which libmdbx knows exactly
+ * which mapped leaf supplied the returned key/value. Internal traversal
+ * helpers cover branch reads, but several successful cursor operations reuse
+ * an already-positioned outer or duplicate cursor without passing through
+ * those helpers. Mark the actual returned leaf here so a warm writer and a
+ * cold deterministic reader expose the same logical read set. Inline duplicate
+ * subpages live inside the already-marked outer leaf and have no independent
+ * file page number. */
+static __always_inline void chainvisor_mdbx_cursor_result_access(const MDBX_cursor *mc) {
+  if (likely(is_pointed(mc)))
+    chainvisor_mdbx_page_access(mc->pg[mc->top]->pgno);
+
+  if (inner_pointed(mc)) {
+    const MDBX_cursor *const inner = &mc->subcur->cursor;
+    const page_t *const inner_mp = inner->pg[inner->top];
+    if (!is_subpage(inner_mp))
+      chainvisor_mdbx_page_access(inner_mp->pgno);
+  }
+}
+
 int mdbx_cursor_get(MDBX_cursor *mc, MDBX_val *key, MDBX_val *data, MDBX_cursor_op op) {
   int rc = cursor_check_ro(mc);
   if (unlikely(rc != MDBX_SUCCESS))
     return LOG_IFERR(rc);
 
-  return LOG_IFERR(cursor_ops(mc, key, data, op));
+  rc = cursor_ops(mc, key, data, op);
+  if (likely(!MDBX_IS_ERROR(rc)))
+    chainvisor_mdbx_cursor_result_access(mc);
+  return LOG_IFERR(rc);
 }
 
 __hot static int scan_confinue(MDBX_cursor *mc, MDBX_predicate_func *predicate, void *context, void *arg, MDBX_val *key,
@@ -12404,7 +12427,10 @@ int mdbx_get(const MDBX_txn *txn, MDBX_dbi dbi, const MDBX_val *key, MDBX_val *d
   if (unlikely(rc != MDBX_SUCCESS))
     return LOG_IFERR(rc);
 
-  return LOG_IFERR(cursor_seek(&cx.outer, (MDBX_val *)key, data, MDBX_SET).err);
+  rc = cursor_seek(&cx.outer, (MDBX_val *)key, data, MDBX_SET).err;
+  if (likely(!MDBX_IS_ERROR(rc)))
+    chainvisor_mdbx_cursor_result_access(&cx.outer);
+  return LOG_IFERR(rc);
 }
 
 int mdbx_get_equal_or_great(const MDBX_txn *txn, MDBX_dbi dbi, MDBX_val *key, MDBX_val *data) {
