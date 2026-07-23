@@ -6175,6 +6175,17 @@ MDBX_INTERNAL __noinline pgr_t page_get_three(const MDBX_cursor *const mc, const
 
 MDBX_INTERNAL __noinline pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
 
+/* Chainvisor logical-page marker. page_get_* sees pages fetched into a
+ * cursor, but libmdbx deliberately reuses the cursor's current leaf and
+ * root/branch stack without calling page_get_* again. A warm writer then
+ * emits no signal for pages that a cold deterministic reader must fault.
+ *
+ * Keep one stable, out-of-line symbol whose first SysV argument is the MDBX
+ * page number. The body is an observable compiler barrier so LTO cannot
+ * discard or fold calls; chainvisor attaches an entry uprobe and performs all
+ * deduplication downstream. */
+MDBX_INTERNAL __noinline void chainvisor_mdbx_page_access(const pgno_t pgno);
+
 static inline int __must_check_result page_get(const MDBX_cursor *mc, const pgno_t pgno, page_t **mp,
                                                const txnid_t front) {
   pgr_t ret = page_get_three(mc, pgno, front);
@@ -16480,6 +16491,7 @@ static __always_inline int sibling(MDBX_cursor *mc, bool right) {
   }
 
   cursor_pop(mc);
+  chainvisor_mdbx_page_access(mc->pg[mc->top]->pgno);
   DEBUG("parent page is page %" PRIaPGNO ", index %u", mc->pg[mc->top]->pgno, mc->ki[mc->top]);
 
   int err;
@@ -16550,6 +16562,7 @@ static __always_inline int cursor_bring(const bool inner, const bool tend2first,
   }
 
   const page_t *mp = mc->pg[mc->top];
+  chainvisor_mdbx_page_access(mp->pgno);
   if (!MDBX_DISABLE_VALIDATION && unlikely(!check_leaf_type(mc, mp))) {
     ERROR("unexpected leaf-page #%" PRIaPGNO " type 0x%x seen by cursor", mp->pgno, mp->flags);
     return MDBX_CORRUPTED;
@@ -17818,6 +17831,7 @@ __hot csr_t cursor_seek(MDBX_cursor *mc, MDBX_val *key, MDBX_val *data, MDBX_cur
   /* See if we're already on the right page */
   if (is_pointed(mc)) {
     mp = mc->pg[mc->top];
+    chainvisor_mdbx_page_access(mp->pgno);
     cASSERT(mc, is_leaf(mp));
     const size_t nkeys = page_numkeys(mp);
     if (unlikely(nkeys == 0)) {
@@ -18083,6 +18097,7 @@ __hot int cursor_ops(MDBX_cursor *mc, MDBX_val *key, MDBX_val *data, const MDBX_
       return outer_next(mc, key, data, MDBX_NEXT_DUP);
     else {
       const page_t *mp = mc->pg[mc->top];
+      chainvisor_mdbx_page_access(mp->pgno);
       const node_t *node = page_node(mp, mc->ki[mc->top]);
       get_key_optional(node, key);
       if (!data)
@@ -27598,6 +27613,7 @@ node_t *node_shrink(page_t *mp, size_t indx, node_t *node) {
 
 __hot struct node_search_result node_search(MDBX_cursor *mc, const MDBX_val *key) {
   page_t *mp = mc->pg[mc->top];
+  chainvisor_mdbx_page_access(mp->pgno);
   const intptr_t nkeys = page_numkeys(mp);
   DKBUF_DEBUG;
 
@@ -31640,6 +31656,10 @@ __noinline pgr_t page_get_three(const MDBX_cursor *const mc, const pgno_t pgno, 
 __noinline pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
   return page_get_inline(P_ILL_BITS | P_BRANCH | P_LEAF | P_DUPFIX, mc, pgno, front);
 }
+
+__noinline void chainvisor_mdbx_page_access(const pgno_t pgno) {
+  __asm__ __volatile__("" : : "r"(pgno) : "memory");
+}
 /// \copyright SPDX-License-Identifier: Apache-2.0
 /// \author Леонид Юрьев aka Leonid Yuriev <leo@yuriev.ru> \date 2015-2025
 
@@ -31992,6 +32012,7 @@ __hot int page_touch_modifable(MDBX_txn *txn, const page_t *const mp) {
 }
 
 __hot int page_touch_unmodifable(MDBX_txn *txn, MDBX_cursor *mc, const page_t *const mp) {
+  chainvisor_mdbx_page_access(mp->pgno);
   tASSERT(txn, !is_modifable(txn, mp) && !is_largepage(mp));
   if (is_subpage(mp)) {
     ((page_t *)mp)->txnid = txn->front_txnid;
@@ -35735,6 +35756,7 @@ __hot __noinline int tree_search_finalize(MDBX_cursor *mc, const MDBX_val *key, 
   DKBUF_DEBUG;
   int err;
   page_t *mp = mc->pg[mc->top];
+  chainvisor_mdbx_page_access(mp->pgno);
   intptr_t ki = (flags & Z_FIRST) ? 0 : page_numkeys(mp) - 1;
   while (is_branch(mp)) {
     DEBUG("branch page %" PRIaPGNO " has %zu keys", mp->pgno, page_numkeys(mp));
