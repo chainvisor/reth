@@ -6175,6 +6175,14 @@ MDBX_INTERNAL __noinline pgr_t page_get_three(const MDBX_cursor *const mc, const
 
 MDBX_INTERNAL __noinline pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front);
 
+/* Stable chainvisor logical-path marker. A warm cursor can reuse its entire
+ * root-to-leaf stack without calling page_get_three, while a cold deterministic
+ * reader must fault every one of those pages. Six scalar pgno arguments fit in
+ * one x86_64 SysV entry event; deeper paths use consecutive calls. */
+MDBX_INTERNAL __noinline void chainvisor_mdbx_cursor_path(const pgno_t pgno0, const pgno_t pgno1,
+                                                          const pgno_t pgno2, const pgno_t pgno3,
+                                                          const pgno_t pgno4, const pgno_t pgno5);
+
 static inline int __must_check_result page_get(const MDBX_cursor *mc, const pgno_t pgno, page_t **mp,
                                                const txnid_t front) {
   pgr_t ret = page_get_three(mc, pgno, front);
@@ -8707,12 +8715,41 @@ int mdbx_cursor_eof(const MDBX_cursor *mc) {
   return is_eof(mc) ? MDBX_RESULT_TRUE : MDBX_RESULT_FALSE;
 }
 
+static __always_inline void chainvisor_mdbx_emit_one_cursor_path(const MDBX_cursor *mc) {
+  if (!is_pointed(mc))
+    return;
+
+  for (intptr_t base = 0; base <= mc->top; base += 6) {
+    pgno_t batch[6] = {P_INVALID, P_INVALID, P_INVALID, P_INVALID, P_INVALID, P_INVALID};
+    bool any = false;
+    for (intptr_t slot = 0; slot < 6 && base + slot <= mc->top; ++slot) {
+      const page_t *const mp = mc->pg[base + slot];
+      /* Inline duplicate subpages are bytes inside their outer leaf, not
+       * independent pages in mdbx.dat. The outer path is emitted separately. */
+      if (!is_subpage(mp)) {
+        batch[slot] = mp->pgno;
+        any = true;
+      }
+    }
+    if (any)
+      chainvisor_mdbx_cursor_path(batch[0], batch[1], batch[2], batch[3], batch[4], batch[5]);
+  }
+}
+
+static __always_inline void chainvisor_mdbx_emit_cursor_paths(const MDBX_cursor *mc) {
+  chainvisor_mdbx_emit_one_cursor_path(mc);
+  if (inner_pointed(mc))
+    chainvisor_mdbx_emit_one_cursor_path(&mc->subcur->cursor);
+}
+
 int mdbx_cursor_get(MDBX_cursor *mc, MDBX_val *key, MDBX_val *data, MDBX_cursor_op op) {
   int rc = cursor_check_ro(mc);
   if (unlikely(rc != MDBX_SUCCESS))
     return LOG_IFERR(rc);
 
-  return LOG_IFERR(cursor_ops(mc, key, data, op));
+  rc = cursor_ops(mc, key, data, op);
+  chainvisor_mdbx_emit_cursor_paths(mc);
+  return LOG_IFERR(rc);
 }
 
 __hot static int scan_confinue(MDBX_cursor *mc, MDBX_predicate_func *predicate, void *context, void *arg, MDBX_val *key,
@@ -12393,7 +12430,9 @@ int mdbx_get(const MDBX_txn *txn, MDBX_dbi dbi, const MDBX_val *key, MDBX_val *d
   if (unlikely(rc != MDBX_SUCCESS))
     return LOG_IFERR(rc);
 
-  return LOG_IFERR(cursor_seek(&cx.outer, (MDBX_val *)key, data, MDBX_SET).err);
+  rc = cursor_seek(&cx.outer, (MDBX_val *)key, data, MDBX_SET).err;
+  chainvisor_mdbx_emit_cursor_paths(&cx.outer);
+  return LOG_IFERR(rc);
 }
 
 int mdbx_get_equal_or_great(const MDBX_txn *txn, MDBX_dbi dbi, MDBX_val *key, MDBX_val *data) {
@@ -31639,6 +31678,11 @@ __noinline pgr_t page_get_three(const MDBX_cursor *const mc, const pgno_t pgno, 
 
 __noinline pgr_t page_get_large(const MDBX_cursor *const mc, const pgno_t pgno, const txnid_t front) {
   return page_get_inline(P_ILL_BITS | P_BRANCH | P_LEAF | P_DUPFIX, mc, pgno, front);
+}
+
+__noinline void chainvisor_mdbx_cursor_path(const pgno_t pgno0, const pgno_t pgno1, const pgno_t pgno2,
+                                            const pgno_t pgno3, const pgno_t pgno4, const pgno_t pgno5) {
+  __asm__ __volatile__("" : : "r"(pgno0), "r"(pgno1), "r"(pgno2), "r"(pgno3), "r"(pgno4), "r"(pgno5) : "memory");
 }
 /// \copyright SPDX-License-Identifier: Apache-2.0
 /// \author Леонид Юрьев aka Leonid Yuriev <leo@yuriev.ru> \date 2015-2025
