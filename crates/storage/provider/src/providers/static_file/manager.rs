@@ -409,27 +409,39 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// This uses the in-memory index to get file sizes from mmap handles instead of reading
     /// filesystem metadata.
+    ///
+    /// chainvisor: the implementation previously contradicted that doc comment. It called
+    /// `iter_static_files(&self.path)` (re-reading the directory AND every jar header) and then
+    /// `get_segment_provider_for_range` for every block range, which OPENS and mmaps every jar
+    /// that is not already resident — purely to populate metrics gauges.
+    ///
+    /// On a normal node that is a local-disk scan. On a chainvisor reader the static files live on
+    /// an S3-backed virtual block device, so it faults the ENTIRE static-file index over the
+    /// network. It is wired as a metrics hook on a 5-minute throttle
+    /// (`node/builder/src/launch/common.rs`), so it did this at startup and then again every 5
+    /// minutes forever, competing with the guest's real reads.
+    ///
+    /// Now it reports from jars ALREADY resident in `self.map`, using each `LoadedJar`'s in-memory
+    /// mmap handle — which is exactly what the doc comment promises. It never opens a jar, never
+    /// touches the filesystem, and cannot generate a single cold fault. Metrics therefore describe
+    /// what is actually loaded, which for a lazily-loaded provider is the honest measurement
+    /// anyway.
     pub fn report_metrics(&self) -> ProviderResult<()> {
         let Some(metrics) = &self.metrics else { return Ok(()) };
 
-        let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
-        for (segment, headers) in &*static_files {
-            let mut entries = 0;
-            let mut size = 0;
+        // (size_bytes, jar_count, rows) per segment, from resident jars only.
+        let mut per_segment: std::collections::HashMap<StaticFileSegment, (u64, usize, usize)> =
+            std::collections::HashMap::new();
+        for entry in self.map.iter() {
+            let jar = entry.value();
+            let slot = per_segment.entry(jar.segment()).or_insert((0, 0, 0));
+            slot.0 = slot.0.saturating_add(jar.size() as u64);
+            slot.1 = slot.1.saturating_add(1);
+            slot.2 = slot.2.saturating_add(jar.rows());
+        }
 
-            for (block_range, _) in headers {
-                let fixed_block_range = self.find_fixed_range(segment, block_range.start());
-                let jar_provider = self
-                    .get_segment_provider_for_range(segment, || Some(fixed_block_range), None)?
-                    .ok_or_else(|| {
-                        ProviderError::MissingStaticFileBlock(segment, block_range.start())
-                    })?;
-
-                entries += jar_provider.rows();
-                size += jar_provider.size() as u64;
-            }
-
-            metrics.record_segment(segment, size, headers.len(), entries);
+        for (segment, (size, files, entries)) in per_segment {
+            metrics.record_segment(segment, size, files, entries);
         }
 
         Ok(())
