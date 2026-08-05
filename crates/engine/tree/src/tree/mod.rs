@@ -349,6 +349,84 @@ where
     building_payload: bool,
     /// Task runtime for spawning blocking work on named, reusable threads.
     runtime: reth_tasks::Runtime,
+    /// G2 adopt-anchoring (chainvisor): rate-limited watch of the reader-
+    /// delivered advanced-base anchor file. See [`Self::try_anchor_jump`].
+    adopt_anchor_watch: AdoptAnchorWatch,
+}
+
+/// G2 adopt-anchoring (chainvisor). The chainvisor reader delivers the
+/// advanced base's head descriptor (`eth-head-anchor/1`, captured by the
+/// writer inside its snapshot exactness bracket) to `CV_ADOPT_ANCHOR_PATH`
+/// after every verified base advance. When this guest is far BEHIND that
+/// head, the linear adopt in `try_adopt_committed_payload` can never fire
+/// mid-gap — jumping the canonical head to the anchored block (which the
+/// advanced base provably holds) replaces re-executing the whole gap.
+#[derive(Debug, Default)]
+struct AdoptAnchorWatch {
+    path: Option<std::path::PathBuf>,
+    last_check: Option<std::time::Instant>,
+    last_modified: Option<std::time::SystemTime>,
+    cached: Option<(u64, B256)>,
+}
+
+impl AdoptAnchorWatch {
+    fn from_env() -> Self {
+        Self {
+            path: std::env::var("CV_ADOPT_ANCHOR_PATH")
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
+            ..Default::default()
+        }
+    }
+
+    /// Latest anchor `(number, hash)`, re-reading the file at most once per
+    /// second and only when its mtime changed. Any IO/parse problem clears
+    /// the cache and returns `None` — anchoring is strictly best-effort.
+    fn poll(&mut self) -> Option<(u64, B256)> {
+        self.path.as_ref()?;
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_check {
+            if now.duration_since(last) < std::time::Duration::from_secs(1) {
+                return self.cached;
+            }
+        }
+        self.last_check = Some(now);
+        let path = self.path.as_ref()?;
+        let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if modified.is_some() && modified == self.last_modified {
+            return self.cached;
+        }
+        self.last_modified = modified;
+        self.cached = std::fs::read_to_string(path).ok().and_then(|s| Self::parse(&s));
+        self.cached
+    }
+
+    /// Strict parser for the writer-emitted `eth-head-anchor/1` descriptor —
+    /// a fixed format this stack emits itself (chainvisor
+    /// `common/src/guests/evm_node.rs`), so exact-shape matching is sound.
+    fn parse(s: &str) -> Option<(u64, B256)> {
+        if !s.contains(r#""schema":"eth-head-anchor/1""#) {
+            return None;
+        }
+        let field = |name: &str| -> Option<&str> {
+            let tag = format!(r#""{name}":"0x"#);
+            let start = s.find(&tag)? + tag.len();
+            let end = start + s[start..].find('"')?;
+            Some(&s[start..end])
+        };
+        let number = u64::from_str_radix(field("number")?, 16).ok()?;
+        let hex = field("hash")?;
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in bytes.iter_mut().enumerate() {
+            *chunk = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some((number, B256::from(bytes)))
+    }
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -446,6 +524,7 @@ where
             execution_timing_stats: HashMap::new(),
             building_payload: false,
             runtime,
+            adopt_anchor_watch: AdoptAnchorWatch::from_env(),
         }
     }
 
@@ -856,6 +935,18 @@ where
             if let Some(status) = self.try_adopt_committed_payload(&payload)? {
                 return Ok(TreeOutcome::new(status));
             }
+            // G2 adopt-anchoring (chainvisor): when this guest is far BEHIND
+            // the advanced base, the linear adopt above can never fire — the
+            // tip payload's parent isn't our stale head. Jump the canonical
+            // head to the reader-delivered anchor (the exact block the writer
+            // proved the advanced base holds) instead of executing the whole
+            // gap, and answer SYNCING so the CL re-drives from the new head;
+            // the small residual tail then executes warm.
+            if self.try_anchor_jump()? {
+                return Ok(TreeOutcome::new(PayloadStatus::from_status(
+                    PayloadStatusEnum::Syncing,
+                )));
+            }
         }
 
         let mut outcome = if !self.pipeline_busy() {
@@ -1156,6 +1247,40 @@ where
             "force-at-tip: ADOPTED writer-committed block (no execution)"
         );
         Ok(Some(PayloadStatus::new(PayloadStatusEnum::Valid, Some(num_hash.hash))))
+    }
+
+    /// G2 adopt-anchoring (chainvisor): when this reader guest is BEHIND the
+    /// mounted base, jump the canonical head forward to the reader-delivered
+    /// anchor — the exact head the writer's snapshot exactness bracket proved
+    /// the advanced base holds. Forward-only, and only when the anchored
+    /// block is actually on-disk (`sealed_header_by_hash` — the same trust
+    /// basis as `try_adopt_committed_payload`: same binary, same data, same
+    /// hash). Every miss is a silent no-op; the next advance redelivers.
+    fn try_anchor_jump(&mut self) -> ProviderResult<bool> {
+        let Some((number, hash)) = self.adopt_anchor_watch.poll() else {
+            return Ok(false);
+        };
+        if number <= self.state.tree_state.canonical_block_number() {
+            return Ok(false);
+        }
+        if self.state.tree_state.canonical_block_hash() == hash {
+            return Ok(false);
+        }
+        let Some(header) = self.provider.sealed_header_by_hash(hash)? else {
+            return Ok(false);
+        };
+        if header.number() != number {
+            return Ok(false);
+        }
+        self.update_latest_block_to_canonical_ancestor(&header)?;
+        self.persistence_state.last_persisted_block = header.num_hash();
+        debug!(
+            target: "engine::tree",
+            number,
+            hash = ?hash,
+            "adopt-anchor: jumped canonical head to the advanced base's anchored block"
+        );
+        Ok(true)
     }
 
     /// Updates the latest block state to the specified canonical ancestor.
