@@ -753,6 +753,20 @@ where
                 }
             }
             StateRootStrategy::Synchronous => {}
+            StateRootStrategy::TrustHeader => {
+                // Trusting-reader: the CL delivered and attested this payload;
+                // the adopted writer state re-verifies/replaces everything each
+                // epoch. Computing the root locally costs ~20k cold trie-node
+                // faults per block (measured 112 s vs ~2 s execution) and adds
+                // no safety a stale root check would rescue us from — a
+                // divergent execution would corrupt state either way until the
+                // next adopt. Empty trie updates: trie tables refresh on adopt.
+                maybe_state_root = Some((
+                    block.header().state_root(),
+                    Arc::new(TrieUpdates::default()),
+                    root_time.elapsed(),
+                ));
+            }
         }
 
         // Determine the state root.
@@ -1478,7 +1492,9 @@ where
 
                 Ok(handle)
             }
-            StateRootStrategy::Parallel | StateRootStrategy::Synchronous => {
+            StateRootStrategy::Parallel |
+            StateRootStrategy::Synchronous |
+            StateRootStrategy::TrustHeader => {
                 let start = Instant::now();
                 let handle =
                     self.payload_processor.spawn_cache_exclusive(env, txs, provider_builder);
@@ -1530,7 +1546,9 @@ where
     /// Note: Use state root task only if prefix sets are empty, otherwise proof generation is
     /// too expensive because it requires walking all paths in every proof.
     const fn plan_state_root_computation(&self) -> StateRootStrategy {
-        if self.config.state_root_fallback() {
+        if self.config.reader_trust_state_root() {
+            StateRootStrategy::TrustHeader
+        } else if self.config.state_root_fallback() {
             StateRootStrategy::Synchronous
         } else if self.config.use_state_root_task() {
             StateRootStrategy::StateRootTask
@@ -1884,6 +1902,9 @@ enum StateRootStrategy {
     Parallel,
     /// Fall back to synchronous computation via the state provider.
     Synchronous,
+    /// Trusting-reader: adopt the CL-verified header's state root without
+    /// computing it (no proof workers, no trie walk, empty trie updates).
+    TrustHeader,
 }
 
 /// Type that validates the payloads processed by the engine.

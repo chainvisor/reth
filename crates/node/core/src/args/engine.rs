@@ -566,6 +566,21 @@ pub struct EngineArgs {
     #[arg(long = "engine.reader-wait-for-commit", default_value_t = false)]
     pub reader_wait_for_commit: bool,
 
+    /// Trusting-reader: adopt the CL-verified header's state root instead of
+    /// computing it. The sparse-trie root walk faults ~20k cold trie nodes per
+    /// block through the reader's device (measured 112 s/block against ~2 s
+    /// execution); on a replica whose state is re-adopted from the writer every
+    /// epoch, local root verification adds latency, not safety. Trie table
+    /// updates are not persisted between adopts (they refresh on adopt), so
+    /// eth_getProof answers lag the adopted base between epochs. Pairs with
+    /// --engine.reader-force-at-tip. Default off.
+    #[arg(
+        long = "engine.reader-trust-state-root",
+        env = "CV_RETH_READER_TRUST_STATE_ROOT",
+        default_value_t = false
+    )]
+    pub reader_trust_state_root: bool,
+
     /// Trusting-reader (pure-adopt): open MDBX RDONLY (no COW meta shadow → the
     /// writer's base meta is served) and ADOPT the writer's committed head via a
     /// head-pointer poller, NEVER executing payloads. Per poll, read the on-disk
@@ -671,6 +686,7 @@ impl Default for EngineArgs {
             bal_parallel_state_root_disabled,
             disable_bal_batch_io: false,
             reader_force_at_tip: false,
+            reader_trust_state_root: false,
             reader_wait_for_commit: false,
             reader_trusting: false,
             #[cfg(feature = "trie-debug")]
@@ -733,6 +749,7 @@ impl EngineArgs {
             .without_bal_parallel_state_root(self.bal_parallel_state_root_disabled)
             .without_bal_batch_io(self.disable_bal_batch_io)
             .with_reader_wait_for_commit(self.reader_wait_for_commit)
+            .with_reader_trust_state_root(self.reader_trust_state_root)
             .with_reader_trusting(self.reader_trusting)
             .with_min_blocks_for_pipeline_run(if self.reader_force_at_tip {
                 u64::MAX
@@ -807,6 +824,7 @@ mod tests {
             bal_parallel_state_root_disabled: true,
             disable_bal_batch_io: true,
             reader_force_at_tip: false,
+            reader_trust_state_root: false,
             reader_wait_for_commit: false,
             reader_trusting: false,
             #[cfg(feature = "trie-debug")]
