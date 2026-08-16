@@ -577,7 +577,10 @@ pub struct EngineArgs {
     #[arg(
         long = "engine.reader-trust-state-root",
         env = "CV_RETH_READER_TRUST_STATE_ROOT",
-        default_value_t = false
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub reader_trust_state_root: bool,
 
