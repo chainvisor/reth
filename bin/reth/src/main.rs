@@ -17,6 +17,11 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
+/// chainvisor semantic delta emitter. Installed only when
+/// `CV_EXEX_DELTA_SPOOL` is set, so this module is inert in every build
+/// that does not opt in.
+mod cv_exex;
+
 fn main() {
     reth_cli_util::sigsegv_handler::install();
 
@@ -45,7 +50,26 @@ fn main() {
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "reth::cli", "Launching node");
-        let handle = builder.node(EthereumNode::default()).launch_with_debug_capabilities().await?;
+
+        // chainvisor semantic delta stream (CVSD). The ExEx writes one
+        // segment per committed block into this directory; a host-side
+        // uploader ships them to the object store, where userspace readers
+        // tail them. Unset means not installed at all — no notification
+        // subscription, no ExEx WAL, no behaviour change whatsoever.
+        let spool = std::env::var("CV_EXEX_DELTA_SPOOL").ok();
+        let cv_delta_enabled = spool.is_some();
+        if cv_delta_enabled {
+            info!(target: "reth::cli", spool = ?spool, "installing chainvisor cv-delta ExEx");
+        }
+
+        let handle = builder
+            .node(EthereumNode::default())
+            .install_exex_if(cv_delta_enabled, "cv-delta", move |ctx| {
+                let dir = std::path::PathBuf::from(spool.clone().unwrap_or_default());
+                async move { Ok(crate::cv_exex::run(ctx, dir)) }
+            })
+            .launch_with_debug_capabilities()
+            .await?;
 
         handle.wait_for_node_exit().await
     }) {

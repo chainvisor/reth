@@ -30,6 +30,15 @@ workspace = true
 # chainvisor: SIGUSR1 disposition shield in main() (FlushInPlace quiesce safety)
 libc.workspace = true
 
+# chainvisor: the cv-delta ExEx (semantic per-block delta stream). Inert
+# unless CV_EXEX_DELTA_SPOOL is set; see src/cv_exex.rs.
+reth-exex.workspace = true
+reth-execution-types.workspace = true
+revm-primitives.workspace = true
+futures-util.workspace = true
+eyre.workspace = true
+serde_json.workspace = true
+
 # reth
 reth-ethereum-cli.workspace = true
 reth-chainspec.workspace = true
@@ -77,7 +86,6 @@ alloy-node-bindings = "2.0.0"
 alloy-provider = { workspace = true, features = ["reqwest"] }
 alloy-rpc-types-eth.workspace = true
 backon.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml.workspace = true
