@@ -255,11 +255,25 @@ fn emit_chain(dir: &Path, chain: &Chain<EthPrimitives>) -> eyre::Result<Stats> {
         let mut seg_stats = Stats::default();
         let delta = build_delta(pre, prev.as_ref(), &post, aggregate, &mut seg_stats);
         let header = block.header();
+        // RLP of the consensus header, so a reader can prove every field it
+        // executes against: a block hash IS the commitment to the header, so
+        // `keccak256(header_rlp) == hash` certifies gas limit, base fee,
+        // prevrandao, beneficiary AND the state root that base observations
+        // are proved against. Without it a reader takes all of them on this
+        // emitter's word, which the zero-wrong-answers bar does not allow.
+        // See chainvisor docs/claims/cvsd-correctness-guarantee.md.
+        let header_rlp = alloy_rlp::encode(header);
+        debug_assert_eq!(
+            revm_primitives::keccak256(&header_rlp),
+            block.hash(),
+            "header RLP must hash to the block hash"
+        );
         let record = json!({
             "v": WIRE_V,
             "kind": "commit",
             "block": n,
             "hash": format!("{:#x}", block.hash()),
+            "header_rlp": format!("0x{}", alloy_primitives::hex::encode(&header_rlp)),
             "parent": format!("{:#x}", header.parent_hash),
             "ts": header.timestamp,
             "src": "exex",

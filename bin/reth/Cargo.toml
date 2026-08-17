@@ -35,6 +35,9 @@ libc.workspace = true
 reth-exex.workspace = true
 reth-execution-types.workspace = true
 revm-primitives.workspace = true
+# cv-delta ExEx: RLP-encode the consensus header so readers can verify it
+# against the block hash rather than trusting this emitter.
+alloy-rlp.workspace = true
 futures-util.workspace = true
 eyre.workspace = true
 serde_json.workspace = true
