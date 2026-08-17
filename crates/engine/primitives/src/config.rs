@@ -144,6 +144,14 @@ pub struct TreeConfig {
     /// EXECUTING it. Avoids cold-faulting the uncommitted tip's `older` state
     /// at reader S3-read speed (the sawtooth). Gated; default off.
     reader_wait_for_commit: bool,
+    /// Trusting-reader: adopt the CL-verified header's state root instead of
+    /// computing it. The sparse-trie root walk faults ~20k cold trie nodes
+    /// per block through the reader's device (measured 112 s/block vs ~2 s
+    /// execution); the adopted writer state refreshes the trie tables every
+    /// epoch, so local root verification adds latency, not safety, on a
+    /// replica whose payloads the CL already attests. Trie updates are not
+    /// persisted between adopts. Gated; default off.
+    reader_trust_state_root: bool,
     /// Trusting-reader (pure-adopt): the engine never executes payloads; a
     /// head-pointer poller adopts the writer's committed on-disk head. When set,
     /// the new-payload path short-circuits (returns SYNCING) so the RDONLY DB is
@@ -255,6 +263,7 @@ impl Default for TreeConfig {
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             precompile_cache_disabled: false,
             reader_wait_for_commit: false,
+            reader_trust_state_root: false,
             reader_trusting: false,
             state_root_fallback: false,
             always_process_payload_attributes_on_canonical_head: false,
@@ -336,6 +345,7 @@ impl TreeConfig {
             reserved_cpu_cores,
             precompile_cache_disabled,
             reader_wait_for_commit: false,
+            reader_trust_state_root: false,
             reader_trusting: false,
             state_root_fallback,
             always_process_payload_attributes_on_canonical_head,
@@ -482,6 +492,12 @@ impl TreeConfig {
     /// linear tip block instead of executing it (see field docs).
     pub const fn reader_wait_for_commit(&self) -> bool {
         self.reader_wait_for_commit
+    }
+
+    /// Trusting-reader: whether to adopt the CL-verified header state root
+    /// instead of computing it locally (see field docs).
+    pub const fn reader_trust_state_root(&self) -> bool {
+        self.reader_trust_state_root
     }
 
     /// Trusting-reader (pure-adopt): whether the engine should NOT execute
@@ -654,6 +670,12 @@ impl TreeConfig {
     /// Setter for trusting-reader wait-for-commit (see field docs).
     pub const fn with_reader_wait_for_commit(mut self, reader_wait_for_commit: bool) -> Self {
         self.reader_wait_for_commit = reader_wait_for_commit;
+        self
+    }
+
+    /// Setter for trusting-reader trust-state-root (see field docs).
+    pub const fn with_reader_trust_state_root(mut self, reader_trust_state_root: bool) -> Self {
+        self.reader_trust_state_root = reader_trust_state_root;
         self
     }
 
