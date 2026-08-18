@@ -1,0 +1,13 @@
+[package]
+name = "cvsd-export"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "One-shot PlainState export: reth's own tables -> sorted fixed-record shards for the CVSD state base on S3"
+
+[dependencies]
+reth-db = { workspace = true, features = ["mdbx"] }
+reth-db-api = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+eyre = { workspace = true }
+serde_json = { workspace = true }

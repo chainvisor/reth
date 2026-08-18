@@ -9,6 +9,7 @@ exclude = [".github/"]
 
 [workspace]
 members = [
+    "bin/cvsd-export/",
     "bin/reth-bb/",
     "bin/reth-bench/",
     "bin/reth/",

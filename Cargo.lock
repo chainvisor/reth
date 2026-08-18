@@ -2842,6 +2842,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvsd-export"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eyre",
+ "reth-db",
+ "reth-db-api",
+ "serde_json",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
