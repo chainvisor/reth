@@ -7373,8 +7373,8 @@ version = "2.2.0"
 dependencies = [
  "alloy-node-bindings",
  "alloy-primitives",
- "alloy-rlp",
  "alloy-provider",
+ "alloy-rlp",
  "alloy-rpc-types",
  "alloy-rpc-types-eth",
  "aquamarine",

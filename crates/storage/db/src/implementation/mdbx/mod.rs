@@ -32,6 +32,7 @@ use std::{
 use tx::Tx;
 
 pub mod cursor;
+mod barrier;
 pub mod tx;
 
 mod utils;
@@ -263,12 +264,19 @@ impl Database for DatabaseEnv {
     type TXMut = tx::Tx<RW>;
 
     fn tx(&self) -> Result<Self::TX, DatabaseError> {
-        Tx::new(
+        // chainvisor CVBD barrier: consume pending cache invalidation
+        // and hold the shared lock for this txn's lifetime (inert
+        // unless CV_READER_TXN_BARRIER is set — see barrier.rs).
+        let barrier_guard =
+            barrier::get(&self.path).and_then(|b| b.enter_read_txn());
+        let mut tx = Tx::new(
             self.inner.begin_ro_txn().map_err(|e| DatabaseError::InitTx(e.into()))?,
             self.dbis.clone(),
             self.metrics.clone(),
         )
-        .map_err(|e| DatabaseError::InitTx(e.into()))
+        .map_err(|e| DatabaseError::InitTx(e.into()))?;
+        tx.barrier_guard = barrier_guard;
+        Ok(tx)
     }
 
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {

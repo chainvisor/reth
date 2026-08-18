@@ -40,6 +40,13 @@ pub struct Tx<K: TransactionKind> {
     ///
     /// If [Some], then metrics are reported.
     metrics_handler: Option<MetricsHandler<K>>,
+
+    /// chainvisor CVBD reader-txn barrier guard: a SHARED flock held
+    /// for this transaction's lifetime so the local delta applier
+    /// (which takes it EXCLUSIVE per batch) can never rewrite pages
+    /// under an open snapshot. None everywhere except CVBD readers
+    /// (CV_READER_TXN_BARRIER). Dropping the file releases the lock.
+    pub(crate) barrier_guard: Option<std::fs::File>,
 }
 
 impl<K: TransactionKind> Tx<K> {
@@ -59,7 +66,7 @@ impl<K: TransactionKind> Tx<K> {
                 Ok(handler)
             })
             .transpose()?;
-        Ok(Self { inner, dbis, metrics_handler })
+        Ok(Self { inner, dbis, metrics_handler , barrier_guard: None })
     }
 
     /// Returns a reference to the inner libmdbx transaction.
