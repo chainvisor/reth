@@ -6,6 +6,7 @@ publish = false
 description = "One-shot PlainState export: reth's own tables -> sorted fixed-record shards for the CVSD state base on S3"
 
 [dependencies]
+alloy-primitives = { workspace = true }
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
