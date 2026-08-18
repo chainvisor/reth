@@ -98,6 +98,39 @@ struct Args {
     /// the SAME block.
     #[arg(long, default_value_t = false)]
     finalize: bool,
+    /// Read-only PAGE WARMER: N range-cursors fault this table's pages
+    /// into the OS cache in parallel and discard everything. A serial
+    /// walker running behind them sweeps warm pages at RAM speed —
+    /// useful exactly when a flat walk is the long pole and the table
+    /// fits page cache (Bytecodes ~25GB vs 113GB free, measured).
+    #[arg(long)]
+    warm_only: Option<String>,
+    /// Range-shard the accounts/slots walks this many ways. A single
+    /// cursor is bound by SERIAL page-fault latency (~45k rec/s measured
+    /// — 10h for mainnet slots); the hashed keyspace is uniform, so N
+    /// disjoint-range cursors are ~N× the IOPS parallelism. Shards write
+    /// their own part sequences (`slots-03.00017`); concatenated in
+    /// shard order they are still ONE globally sorted stream, which is
+    /// all the compactor needs. Codes stay flat (small).
+    #[arg(long, default_value_t = 16)]
+    shards: u32,
+}
+
+/// Shard i of n covers hashed keys [lo, hi): equal slices of the B256
+/// space, exact at the edges.
+fn shard_bounds(i: u32, n: u32) -> ([u8; 32], Option<[u8; 32]>) {
+    let step = (u128::MAX / n as u128).wrapping_add(1);
+    let lo_hi128 = step.wrapping_mul(i as u128);
+    let mut lo = [0u8; 32];
+    lo[..16].copy_from_slice(&lo_hi128.to_be_bytes());
+    if i + 1 == n {
+        (lo, None)
+    } else {
+        let hi_hi128 = step.wrapping_mul((i + 1) as u128);
+        let mut hi = [0u8; 32];
+        hi[..16].copy_from_slice(&hi_hi128.to_be_bytes());
+        (lo, Some(hi))
+    }
 }
 
 // ---------------------------------------------------------------- S3 I/O
@@ -307,27 +340,40 @@ impl Sink {
 /// are block-pinned, so this also proves all three walked the same
 /// frozen image. meta.json stays the single commit point.
 fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
-    let mut vals = std::collections::HashMap::new();
-    for t in ["accounts", "slots", "codes"] {
+    let read_marker = |name: &str| -> eyre::Result<(u64, u64)> {
         let body = s3
-            .get(&format!("progress/{t}.json"))
-            .ok_or_else(|| eyre::eyre!("{t}: no progress marker — table not exported"))?;
+            .get(&format!("progress/{name}.json"))
+            .ok_or_else(|| eyre::eyre!("{name}: no progress marker — not exported"))?;
         let m: serde_json::Value = serde_json::from_slice(&body)?;
-        eyre::ensure!(m["done"].as_bool() == Some(true), "{t}: not done");
+        eyre::ensure!(m["done"].as_bool() == Some(true), "{name}: not done");
         eyre::ensure!(
             m["block"].as_u64() == Some(block),
-            "{t}: marker block {:?} != db block {block}",
+            "{name}: marker block {:?} != db block {block}",
             m["block"]
         );
-        vals.insert(t, (m["count"].as_u64().unwrap_or(0), m["part"].as_u64().unwrap_or(0)));
+        Ok((m["count"].as_u64().unwrap_or(0), m["part"].as_u64().unwrap_or(0)))
+    };
+    let mut totals = std::collections::HashMap::new();
+    let mut shard_parts = std::collections::HashMap::new();
+    for t in ["accounts", "slots"] {
+        let (mut count, mut parts) = (0u64, Vec::new());
+        for i in 0..args.shards {
+            let (c, p) = read_marker(&format!("{t}-{i:02}"))?;
+            count += c;
+            parts.push(p);
+        }
+        totals.insert(t, count);
+        shard_parts.insert(t, parts);
     }
+    let (codes_count, codes_parts) = read_marker("codes")?;
     let meta = serde_json::to_vec_pretty(&serde_json::json!({
-        "v": 2,
+        "v": 3,
         "block": block,
-        "accounts": vals["accounts"].0,
-        "slots": vals["slots"].0,
-        "codes": vals["codes"].0,
-        "parts": {"accounts": vals["accounts"].1, "slots": vals["slots"].1, "codes": vals["codes"].1},
+        "accounts": totals["accounts"],
+        "slots": totals["slots"],
+        "codes": codes_count,
+        "sharded": {"accounts": args.shards, "slots": args.shards},
+        "parts": {"accounts": shard_parts["accounts"], "slots": shard_parts["slots"], "codes": codes_parts},
         "record": {"accounts": 104, "slots": 96},
         "keyed": "hashed",
         "part_bytes": args.part_bytes,
@@ -336,6 +382,178 @@ fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
     }))?;
     s3.put("meta.json", &meta)?;
     eprintln!("done at block {block}");
+    Ok(())
+}
+
+fn walk_accounts(
+    env: &reth_db::DatabaseEnv,
+    s3: &S3,
+    name: &'static str,
+    part_bytes: usize,
+    index_every: u64,
+    block: u64,
+    lo: [u8; 32],
+    hi: Option<[u8; 32]>,
+) -> eyre::Result<()> {
+    let (mut sink, done) = Sink::open(s3, name, part_bytes, index_every, block)?;
+    if done {
+        return Ok(());
+    }
+    loop {
+        let tx = env.tx()?;
+        let mut cur = tx.cursor_read::<tables::HashedAccounts>()?;
+        let mut pair = match &sink.last_key {
+            None => cur.seek(B256::from(lo))?,
+            Some(k) => {
+                let kk = B256::from_slice(k);
+                match cur.seek(kk)? {
+                    Some((fk, _)) if fk == kk => cur.next()?,
+                    other => other,
+                }
+            }
+        };
+        let mut rec = [0u8; 104];
+        while let Some((hashed, acct)) = pair {
+            if hi.is_some_and(|h| hashed.as_slice() >= &h[..]) {
+                pair = None;
+                break;
+            }
+            rec[..32].copy_from_slice(hashed.as_slice());
+            rec[32..40].copy_from_slice(&acct.nonce.to_be_bytes());
+            rec[40..72].copy_from_slice(&acct.balance.to_be_bytes::<32>());
+            match acct.bytecode_hash {
+                Some(h) => rec[72..104].copy_from_slice(h.as_slice()),
+                None => rec[72..104].fill(0),
+            }
+            sink.push(&rec, hashed.as_slice());
+            if sink.part_full() {
+                break;
+            }
+            pair = cur.next()?;
+        }
+        let at_end = !sink.part_full();
+        drop(cur);
+        drop(tx);
+        if at_end {
+            break;
+        }
+        sink.flush(block, false)?;
+    }
+    sink.finish(block)?;
+    Ok(())
+}
+
+fn walk_slots(
+    env: &reth_db::DatabaseEnv,
+    s3: &S3,
+    name: &'static str,
+    part_bytes: usize,
+    index_every: u64,
+    block: u64,
+    lo: [u8; 32],
+    hi: Option<[u8; 32]>,
+) -> eyre::Result<()> {
+    let (mut sink, done) = Sink::open(s3, name, part_bytes, index_every, block)?;
+    if done {
+        return Ok(());
+    }
+    loop {
+        let tx = env.tx()?;
+        let mut cur = tx.cursor_read::<tables::HashedStorages>()?;
+        let mut pair = match &sink.last_key {
+            None => cur.seek(B256::from(lo))?,
+            Some(k) => {
+                let (a, sk) = (B256::from_slice(&k[..32]), B256::from_slice(&k[32..]));
+                match cur.seek_by_key_subkey(a, sk)? {
+                    Some(e) if e.key == sk => cur.next()?,
+                    Some(e) => Some((a, e)),
+                    None => {
+                        let _ = cur.seek(a)?;
+                        cur.next_no_dup()?
+                    }
+                }
+            }
+        };
+        let mut rec = [0u8; 96];
+        while let Some((hashed_addr, entry)) = pair {
+            if hi.is_some_and(|h| hashed_addr.as_slice() >= &h[..]) {
+                pair = None;
+                break;
+            }
+            rec[..32].copy_from_slice(hashed_addr.as_slice());
+            rec[32..64].copy_from_slice(entry.key.as_slice());
+            rec[64..96].copy_from_slice(&entry.value.to_be_bytes::<32>());
+            let mut key = [0u8; 64];
+            key[..32].copy_from_slice(hashed_addr.as_slice());
+            key[32..].copy_from_slice(entry.key.as_slice());
+            sink.push(&rec, &key);
+            if sink.part_full() {
+                break;
+            }
+            pair = cur.next()?;
+        }
+        let at_end = !sink.part_full();
+        drop(cur);
+        drop(tx);
+        if at_end {
+            break;
+        }
+        sink.flush(block, false)?;
+    }
+    sink.finish(block)?;
+    Ok(())
+}
+
+fn walk_codes(
+    env: &reth_db::DatabaseEnv,
+    s3: &S3,
+    part_bytes: usize,
+    index_every: u64,
+    block: u64,
+) -> eyre::Result<()> {
+    let (mut sink, done) = Sink::open(s3, "codes", part_bytes, index_every, block)?;
+    if done {
+        return Ok(());
+    }
+    loop {
+        let tx = env.tx()?;
+        let mut cur = tx.cursor_read::<tables::Bytecodes>()?;
+        let mut pair = match &sink.last_key {
+            None => cur.first()?,
+            Some(k) => {
+                let kk = B256::from_slice(k);
+                match cur.seek(kk)? {
+                    Some((fk, _)) if fk == kk => cur.next()?,
+                    other => other,
+                }
+            }
+        };
+        while let Some((hash, code)) = pair {
+            let bytes = code.original_bytes();
+            let got = keccak256(&bytes);
+            eyre::ensure!(
+                got == hash,
+                "bytecode {hash:#x} hashes to {got:#x} — refusing to export a corrupt record"
+            );
+            let mut rec = Vec::with_capacity(36 + bytes.len());
+            rec.extend_from_slice(hash.as_slice());
+            rec.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            rec.extend_from_slice(&bytes);
+            sink.push(&rec, hash.as_slice());
+            if sink.part_full() {
+                break;
+            }
+            pair = cur.next()?;
+        }
+        let at_end = !sink.part_full();
+        drop(cur);
+        drop(tx);
+        if at_end {
+            break;
+        }
+        sink.flush(block, false)?;
+    }
+    sink.finish(block)?;
     Ok(())
 }
 
@@ -393,160 +611,89 @@ fn main() -> eyre::Result<()> {
         eprintln!("single-table mode: {o}");
     }
 
-    // ---- accounts: fixed 104 B records over HashedAccounts -------------
-    let (mut sink, done) = Sink::open(&s3, "accounts", args.part_bytes, args.index_every, block)?;
-    if want("accounts") && !done {
-        loop {
-            let tx = env.tx()?;
-            let mut cur = tx.cursor_read::<tables::HashedAccounts>()?;
-            let mut pair = match &sink.last_key {
-                None => cur.first()?,
-                Some(k) => {
-                    let kk = B256::from_slice(k);
-                    match cur.seek(kk)? {
-                        Some((fk, _)) if fk == kk => cur.next()?,
-                        other => other,
-                    }
-                }
-            };
-            let mut rec = [0u8; 104];
-            while let Some((hashed, acct)) = pair {
-                rec[..32].copy_from_slice(hashed.as_slice());
-                rec[32..40].copy_from_slice(&acct.nonce.to_be_bytes());
-                rec[40..72].copy_from_slice(&acct.balance.to_be_bytes::<32>());
-                match acct.bytecode_hash {
-                    Some(h) => rec[72..104].copy_from_slice(h.as_slice()),
-                    None => rec[72..104].fill(0),
-                }
-                sink.push(&rec, hashed.as_slice());
-                if sink.part_full() {
-                    break;
-                }
-                pair = cur.next()?;
-            }
-            let at_end = !sink.part_full();
-            drop(cur);
-            drop(tx);
-            if at_end {
-                break;
-            }
-            sink.flush(block, false)?;
-        }
-    }
-    let (n_accounts, parts_accounts) = if want("accounts") { sink.finish(block)? } else { (0, 0) };
+    let env = std::sync::Arc::new(env);
 
-    // ---- slots: fixed 96 B records over HashedStorages (dupsort) -------
-    let (mut sink, done) = Sink::open(&s3, "slots", args.part_bytes, args.index_every, block)?;
-    if want("slots") && !done {
-        loop {
-            let tx = env.tx()?;
-            let mut cur = tx.cursor_read::<tables::HashedStorages>()?;
-            let mut pair = match &sink.last_key {
-                None => cur.first()?,
-                Some(k) => {
-                    let (a, s) = (B256::from_slice(&k[..32]), B256::from_slice(&k[32..]));
-                    match cur.seek_by_key_subkey(a, s)? {
-                        // Exact hit: continue after it. MDBX_NEXT walks
-                        // across keys, so this covers the rest of the table.
-                        Some(e) if e.key == s => cur.next()?,
-                        // Landed on a later dup of the same key: unemitted.
-                        Some(e) => Some((a, e)),
-                        // `s` was the last dup of `a`: hop to the next key.
-                        None => {
-                            let _ = cur.seek(a)?;
-                            cur.next_no_dup()?
-                        }
+    if let Some(t) = args.warm_only.as_deref() {
+        eyre::ensure!(t == "codes", "--warm-only supports codes");
+        let started = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for i in 0..args.shards {
+            let (lo, hi) = shard_bounds(i, args.shards);
+            let env = env.clone();
+            handles.push(std::thread::spawn(move || -> eyre::Result<u64> {
+                let tx = env.tx()?;
+                let mut cur = tx.cursor_read::<tables::Bytecodes>()?;
+                let mut pair = cur.seek(B256::from(lo))?;
+                let mut bytes = 0u64;
+                while let Some((h, v)) = pair {
+                    if hi.is_some_and(|b| h.as_slice() >= &b[..]) {
+                        break;
                     }
+                    bytes += v.original_bytes().len() as u64;
+                    pair = cur.next()?;
                 }
-            };
-            let mut rec = [0u8; 96];
-            while let Some((hashed_addr, entry)) = pair {
-                rec[..32].copy_from_slice(hashed_addr.as_slice());
-                rec[32..64].copy_from_slice(entry.key.as_slice());
-                rec[64..96].copy_from_slice(&entry.value.to_be_bytes::<32>());
-                let mut key = [0u8; 64];
-                key[..32].copy_from_slice(hashed_addr.as_slice());
-                key[32..].copy_from_slice(entry.key.as_slice());
-                sink.push(&rec, &key);
-                if sink.part_full() {
-                    break;
-                }
-                pair = cur.next()?;
-            }
-            let at_end = !sink.part_full();
-            drop(cur);
-            drop(tx);
-            if at_end {
-                break;
-            }
-            sink.flush(block, false)?;
+                Ok(bytes)
+            }));
         }
-    }
-    let (n_slots, parts_slots) = if want("slots") { sink.finish(block)? } else { (0, 0) };
-
-    // ---- codes: variable records over Bytecodes ------------------------
-    let (mut sink, done) = Sink::open(&s3, "codes", args.part_bytes, args.codes_index_every, block)?;
-    if want("codes") && !done {
-        loop {
-            let tx = env.tx()?;
-            let mut cur = tx.cursor_read::<tables::Bytecodes>()?;
-            let mut pair = match &sink.last_key {
-                None => cur.first()?,
-                Some(k) => {
-                    let kk = B256::from_slice(k);
-                    match cur.seek(kk)? {
-                        Some((fk, _)) if fk == kk => cur.next()?,
-                        other => other,
-                    }
-                }
-            };
-            while let Some((hash, code)) = pair {
-                let bytes = code.original_bytes();
-                let got = keccak256(&bytes);
-                eyre::ensure!(
-                    got == hash,
-                    "bytecode {hash:#x} hashes to {got:#x} — refusing to export a corrupt record"
-                );
-                let mut rec = Vec::with_capacity(36 + bytes.len());
-                rec.extend_from_slice(hash.as_slice());
-                rec.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                rec.extend_from_slice(&bytes);
-                sink.push(&rec, hash.as_slice());
-                if sink.part_full() {
-                    break;
-                }
-                pair = cur.next()?;
-            }
-            let at_end = !sink.part_full();
-            drop(cur);
-            drop(tx);
-            if at_end {
-                break;
-            }
-            sink.flush(block, false)?;
+        let mut total = 0u64;
+        for h in handles {
+            total += h.join().map_err(|_| eyre::eyre!("warm thread panicked"))??;
         }
-    }
-    let (n_codes, parts_codes) = if want("codes") { sink.finish(block)? } else { (0, 0) };
-
-    if args.only.is_some() {
-        eprintln!("table complete; run --finalize once all three tables are done");
+        eprintln!(
+            "warm-only {t}: {} MB touched in {}s",
+            total / 1_000_000,
+            started.elapsed().as_secs()
+        );
         return Ok(());
     }
-    // meta.json LAST: readers treat its presence as "base complete".
-    let meta = serde_json::to_vec_pretty(&serde_json::json!({
-        "v": 2,
-        "block": block,
-        "accounts": n_accounts,
-        "slots": n_slots,
-        "codes": n_codes,
-        "parts": {"accounts": parts_accounts, "slots": parts_slots, "codes": parts_codes},
-        "record": {"accounts": 104, "slots": 96},
-        "keyed": "hashed",
-        "part_bytes": args.part_bytes,
-        "index_every": args.index_every,
-        "codes_index_every": args.codes_index_every,
-    }))?;
-    s3.put("meta.json", &meta)?;
-    eprintln!("done at block {block}");
+
+    // ---- accounts + slots: sharded walks; codes: flat ------------------
+    let run_shards = |table: &'static str| -> eyre::Result<()> {
+        let mut handles = Vec::new();
+        for i in 0..args.shards {
+            let (lo, hi) = shard_bounds(i, args.shards);
+            let name: &'static str =
+                Box::leak(format!("{table}-{i:02}").into_boxed_str());
+            let env = env.clone();
+            let s3 = s3.clone();
+            let (pb, ie) = (args.part_bytes, args.index_every);
+            handles.push(std::thread::spawn(move || -> eyre::Result<()> {
+                match table {
+                    "accounts" => walk_accounts(&env, &s3, name, pb, ie, block, lo, hi),
+                    _ => walk_slots(&env, &s3, name, pb, ie, block, lo, hi),
+                }
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| eyre::eyre!("{table} shard thread panicked"))??;
+        }
+        Ok(())
+    };
+    if want("accounts") {
+        run_shards("accounts")?;
+        eprintln!("accounts: all {} shards complete", args.shards);
+    }
+    if want("slots") {
+        run_shards("slots")?;
+        eprintln!("slots: all {} shards complete", args.shards);
+    }
+    if want("codes") {
+        walk_codes(&env, &s3, args.part_bytes, args.codes_index_every, block)?;
+    }
+
+    // Single-table runs end at their markers; the LAST finisher (or an
+    // explicit --finalize) assembles meta.json from all of them. Trying
+    // unconditionally here made every early-finishing --only process
+    // exit nonzero on its siblings' unfinished markers (measured:
+    // codes finished first and 'failed' on slots-01) — harmless because
+    // the last process still succeeded, but a false FAILED in every
+    // orchestrator log.
+    match finalize(&s3, block, &args) {
+        Ok(()) => {}
+        Err(e) if args.only.is_some() => {
+            eprintln!("table done; meta waits for the last finisher ({e:#})");
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
