@@ -105,6 +105,13 @@ struct Args {
     /// fits page cache (Bytecodes ~25GB vs 113GB free, measured).
     #[arg(long)]
     warm_only: Option<String>,
+    /// Warm only [lo, hi) of the hashed keyspace (32-byte hex, hi
+    /// optional): point the warmer at ONE cold region — e.g. a whale
+    /// shard's remaining range — instead of the whole table.
+    #[arg(long)]
+    warm_lo: Option<String>,
+    #[arg(long)]
+    warm_hi: Option<String>,
     /// Range-shard the accounts/slots walks this many ways. A single
     /// cursor is bound by SERIAL page-fault latency (~45k rec/s measured
     /// — 10h for mainnet slots); the hashed keyspace is uniform, so N
@@ -189,6 +196,11 @@ struct Sink {
     /// The last key pushed, hex — persisted in the marker so a fresh
     /// transaction can seek straight back to it.
     last_key: Option<Vec<u8>>,
+    /// Exact bytes of every shipped part, in part order — persisted in the
+    /// marker and published in meta.json by `finalize`. The reader maps
+    /// global offsets to (part, inner) through these: part geometry is
+    /// authored HERE, where the parts are written, never re-derived.
+    sizes: Vec<u64>,
     /// In-flight part uploads: (join handle, idx fragment, marker body).
     /// The fragment and marker for part N upload only AFTER part N's
     /// body lands — resume correctness depends on that order — but the
@@ -212,6 +224,7 @@ impl Sink {
             count: 0,
             global_off: 0,
             last_key: None,
+            sizes: Vec::new(),
             pending: std::collections::VecDeque::new(),
         };
         let mut done = false;
@@ -234,6 +247,18 @@ impl Sink {
                         sink.last_key = Some(hex_decode(k)?);
                     }
                 }
+                sink.sizes = m["sizes"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
+                eyre::ensure!(
+                    sink.sizes.len() as u32 == sink.part,
+                    "{name}: marker knows {} parts but carries {} sizes — it predates the \
+                     sizes field; delete {}/progress/ and re-export",
+                    sink.part,
+                    sink.sizes.len(),
+                    s3.base
+                );
                 eprintln!(
                     "{name}: resuming at part {} ({} records already exported{})",
                     sink.part, sink.count, if done { ", table complete" } else { "" }
@@ -279,6 +304,7 @@ impl Sink {
         if !self.buf.is_empty() {
             let body = std::mem::take(&mut self.buf);
             let frag = std::mem::take(&mut self.idx_frag);
+            self.sizes.push(body.len() as u64);
             let key = format!("{}.{:05}", self.name, self.part);
             let s3 = self.s3.clone();
             let count = self.count;
@@ -297,6 +323,7 @@ impl Sink {
                 "count": self.count,
                 "global_off": self.global_off,
                 "last_key": self.last_key.as_deref().map(hex_encode).unwrap_or_default(),
+                "sizes": self.sizes,
                 "done": false,
             });
             self.pending.push_back((h, frag, serde_json::to_vec(&marker)?));
@@ -312,6 +339,7 @@ impl Sink {
                 "count": self.count,
                 "global_off": self.global_off,
                 "last_key": self.last_key.as_deref().map(hex_encode).unwrap_or_default(),
+                "sizes": self.sizes,
                 "done": true,
             });
             self.s3.put(&format!("progress/{}.json", self.name), &serde_json::to_vec(&marker)?)?;
@@ -340,7 +368,7 @@ impl Sink {
 /// are block-pinned, so this also proves all three walked the same
 /// frozen image. meta.json stays the single commit point.
 fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
-    let read_marker = |name: &str| -> eyre::Result<(u64, u64)> {
+    let read_marker = |name: &str| -> eyre::Result<(u64, Vec<u64>)> {
         let body = s3
             .get(&format!("progress/{name}.json"))
             .ok_or_else(|| eyre::eyre!("{name}: no progress marker — not exported"))?;
@@ -351,21 +379,33 @@ fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
             "{name}: marker block {:?} != db block {block}",
             m["block"]
         );
-        Ok((m["count"].as_u64().unwrap_or(0), m["part"].as_u64().unwrap_or(0)))
+        let sizes: Vec<u64> = m["sizes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+            .unwrap_or_default();
+        eyre::ensure!(
+            sizes.len() == m["part"].as_u64().unwrap_or(0) as usize,
+            "{name}: marker knows {:?} parts but carries {} sizes — re-export with a \
+             sizes-aware exporter",
+            m["part"],
+            sizes.len()
+        );
+        Ok((m["count"].as_u64().unwrap_or(0), sizes))
     };
     let mut totals = std::collections::HashMap::new();
-    let mut shard_parts = std::collections::HashMap::new();
+    let mut sizes = serde_json::Map::new();
     for t in ["accounts", "slots"] {
-        let (mut count, mut parts) = (0u64, Vec::new());
+        let mut count = 0u64;
         for i in 0..args.shards {
-            let (c, p) = read_marker(&format!("{t}-{i:02}"))?;
+            let name = format!("{t}-{i:02}");
+            let (c, sz) = read_marker(&name)?;
             count += c;
-            parts.push(p);
+            sizes.insert(name, serde_json::json!(sz));
         }
         totals.insert(t, count);
-        shard_parts.insert(t, parts);
     }
-    let (codes_count, codes_parts) = read_marker("codes")?;
+    let (codes_count, codes_sizes) = read_marker("codes")?;
+    sizes.insert("codes".to_string(), serde_json::json!(codes_sizes));
     let meta = serde_json::to_vec_pretty(&serde_json::json!({
         "v": 3,
         "block": block,
@@ -373,7 +413,7 @@ fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
         "slots": totals["slots"],
         "codes": codes_count,
         "sharded": {"accounts": args.shards, "slots": args.shards},
-        "parts": {"accounts": shard_parts["accounts"], "slots": shard_parts["slots"], "codes": codes_parts},
+        "sizes": sizes,
         "record": {"accounts": 104, "slots": 96},
         "keyed": "hashed",
         "part_bytes": args.part_bytes,
@@ -614,23 +654,63 @@ fn main() -> eyre::Result<()> {
     let env = std::sync::Arc::new(env);
 
     if let Some(t) = args.warm_only.as_deref() {
-        eyre::ensure!(t == "codes", "--warm-only supports codes");
+        eyre::ensure!(matches!(t, "codes" | "slots"), "--warm-only supports codes|slots");
+        // Region: explicit --warm-lo/--warm-hi, else the whole keyspace;
+        // split into `shards` sub-ranges by u128 interpolation on the
+        // leading bytes (keccak keys are uniform).
+        let parse32 = |h: &str| -> eyre::Result<[u8; 32]> {
+            let h = h.trim_start_matches("0x");
+            let v = hex_decode(h)?;
+            eyre::ensure!(v.len() == 32, "bound must be 32 bytes hex");
+            Ok(v.try_into().unwrap())
+        };
+        let region_lo = args.warm_lo.as_deref().map(&parse32).transpose()?.unwrap_or([0u8; 32]);
+        let region_hi = args.warm_hi.as_deref().map(&parse32).transpose()?;
+        let lo128 = u128::from_be_bytes(region_lo[..16].try_into().unwrap());
+        let hi128 = region_hi
+            .map(|h| u128::from_be_bytes(h[..16].try_into().unwrap()))
+            .unwrap_or(u128::MAX);
         let started = std::time::Instant::now();
         let mut handles = Vec::new();
         for i in 0..args.shards {
-            let (lo, hi) = shard_bounds(i, args.shards);
+            let n = args.shards as u128;
+            let step = (hi128 - lo128) / n;
+            let a = lo128 + step * i as u128;
+            let b = if i + 1 == args.shards { hi128 } else { lo128 + step * (i as u128 + 1) };
+            let mut lo = [0u8; 32];
+            lo[..16].copy_from_slice(&a.to_be_bytes());
+            let mut hib = [0xffu8; 32];
+            hib[..16].copy_from_slice(&b.to_be_bytes());
+            let hi = Some(hib);
             let env = env.clone();
+            let t = t.to_string();
             handles.push(std::thread::spawn(move || -> eyre::Result<u64> {
                 let tx = env.tx()?;
-                let mut cur = tx.cursor_read::<tables::Bytecodes>()?;
-                let mut pair = cur.seek(B256::from(lo))?;
                 let mut bytes = 0u64;
-                while let Some((h, v)) = pair {
-                    if hi.is_some_and(|b| h.as_slice() >= &b[..]) {
-                        break;
+                match t.as_str() {
+                    "codes" => {
+                        let mut cur = tx.cursor_read::<tables::Bytecodes>()?;
+                        let mut pair = cur.seek(B256::from(lo))?;
+                        while let Some((h, v)) = pair {
+                            if hi.is_some_and(|b| h.as_slice() >= &b[..]) {
+                                break;
+                            }
+                            bytes += v.original_bytes().len() as u64;
+                            pair = cur.next()?;
+                        }
                     }
-                    bytes += v.original_bytes().len() as u64;
-                    pair = cur.next()?;
+                    _ => {
+                        let mut cur = tx.cursor_read::<tables::HashedStorages>()?;
+                        let mut pair = cur.seek(B256::from(lo))?;
+                        while let Some((h, v)) = pair {
+                            if hi.is_some_and(|b| h.as_slice() >= &b[..]) {
+                                break;
+                            }
+                            bytes += 32 + v.value.to_be_bytes::<32>()[0] as u64 % 1;
+                            bytes += 96;
+                            pair = cur.next()?;
+                        }
+                    }
                 }
                 Ok(bytes)
             }));
