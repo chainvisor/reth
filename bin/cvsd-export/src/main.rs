@@ -87,6 +87,17 @@ struct Args {
     /// a few records instead of a few megabytes.
     #[arg(long, default_value_t = 8)]
     codes_index_every: u64,
+    /// Export ONLY this table (accounts|slots|codes). The three tables
+    /// are independent — separate progress markers, separate parts — so
+    /// three processes against the same frozen image parallelize the
+    /// walk cleanly. Finish with `--finalize`.
+    #[arg(long)]
+    only: Option<String>,
+    /// Assemble meta.json from the three tables' done-markers (run after
+    /// the per-table processes complete). Verifies all three finished at
+    /// the SAME block.
+    #[arg(long, default_value_t = false)]
+    finalize: bool,
 }
 
 // ---------------------------------------------------------------- S3 I/O
@@ -145,6 +156,11 @@ struct Sink {
     /// The last key pushed, hex — persisted in the marker so a fresh
     /// transaction can seek straight back to it.
     last_key: Option<Vec<u8>>,
+    /// In-flight part uploads: (join handle, idx fragment, marker body).
+    /// The fragment and marker for part N upload only AFTER part N's
+    /// body lands — resume correctness depends on that order — but the
+    /// WALK continues while bodies ship. Bounded at 2 (~512MB).
+    pending: std::collections::VecDeque<(std::thread::JoinHandle<eyre::Result<()>>, Vec<u8>, Vec<u8>)>,
 }
 
 impl Sink {
@@ -163,6 +179,7 @@ impl Sink {
             count: 0,
             global_off: 0,
             last_key: None,
+            pending: std::collections::VecDeque::new(),
         };
         let mut done = false;
         if let Some(body) = s3.get(&format!("progress/{name}.json")) {
@@ -208,28 +225,64 @@ impl Sink {
         self.buf.len() >= self.part_bytes
     }
 
-    /// Upload the buffered part, its index fragment, then the marker —
-    /// marker LAST, so a crash between writes re-does the part (same
-    /// bytes) instead of skipping it.
+    /// Drain in-flight uploads down to `max_left`, completing each
+    /// part's fragment + marker in order as its body lands.
+    fn reap(&mut self, max_left: usize) -> eyre::Result<()> {
+        while self.pending.len() > max_left {
+            let (h, frag, marker) = self.pending.pop_front().unwrap();
+            h.join().map_err(|_| eyre::eyre!("upload thread panicked"))??;
+            let done_part = self.part - self.pending.len() as u32 - 1;
+            self.s3.put(&format!("idxfrag/{}.{:05}", self.name, done_part), &frag)?;
+            self.s3.put(&format!("progress/{}.json", self.name), &marker)?;
+        }
+        Ok(())
+    }
+
+    /// Ship the buffered part in the BACKGROUND — the walk continues
+    /// while the 256MB body uploads — then queue its index fragment and
+    /// marker to land strictly after it (resume correctness). A crash
+    /// between writes re-does at most the un-markered parts, same bytes.
     fn flush(&mut self, block: u64, done: bool) -> eyre::Result<()> {
         if !self.buf.is_empty() {
             let body = std::mem::take(&mut self.buf);
-            self.s3.put(&format!("{}.{:05}", self.name, self.part), &body)?;
             let frag = std::mem::take(&mut self.idx_frag);
-            self.s3.put(&format!("idxfrag/{}.{:05}", self.name, self.part), &frag)?;
-            eprintln!("{}.{:05} uploaded ({} records so far)", self.name, self.part, self.count);
+            let key = format!("{}.{:05}", self.name, self.part);
+            let s3 = self.s3.clone();
+            let count = self.count;
+            let name = self.name;
+            let part = self.part;
+            let h = std::thread::spawn(move || {
+                let r = s3.put(&key, &body);
+                if r.is_ok() {
+                    eprintln!("{name}.{part:05} uploaded ({count} records so far)");
+                }
+                r
+            });
+            let marker = serde_json::json!({
+                "block": block,
+                "part": self.part + 1,
+                "count": self.count,
+                "global_off": self.global_off,
+                "last_key": self.last_key.as_deref().map(hex_encode).unwrap_or_default(),
+                "done": false,
+            });
+            self.pending.push_back((h, frag, serde_json::to_vec(&marker)?));
             self.part += 1;
             self.buf = Vec::with_capacity(self.part_bytes);
+            self.reap(1)?;
         }
-        let marker = serde_json::json!({
-            "block": block,
-            "part": self.part,
-            "count": self.count,
-            "global_off": self.global_off,
-            "last_key": self.last_key.as_deref().map(hex_encode).unwrap_or_default(),
-            "done": done,
-        });
-        self.s3.put(&format!("progress/{}.json", self.name), &serde_json::to_vec(&marker)?)?;
+        if done {
+            self.reap(0)?;
+            let marker = serde_json::json!({
+                "block": block,
+                "part": self.part,
+                "count": self.count,
+                "global_off": self.global_off,
+                "last_key": self.last_key.as_deref().map(hex_encode).unwrap_or_default(),
+                "done": true,
+            });
+            self.s3.put(&format!("progress/{}.json", self.name), &serde_json::to_vec(&marker)?)?;
+        }
         Ok(())
     }
 
@@ -248,6 +301,42 @@ impl Sink {
         eprintln!("{}: {} records, {} parts, idx {} bytes", self.name, self.count, self.part, idx.len());
         Ok((self.count, self.part))
     }
+}
+
+/// Assemble meta.json from the three tables' DONE markers. The markers
+/// are block-pinned, so this also proves all three walked the same
+/// frozen image. meta.json stays the single commit point.
+fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
+    let mut vals = std::collections::HashMap::new();
+    for t in ["accounts", "slots", "codes"] {
+        let body = s3
+            .get(&format!("progress/{t}.json"))
+            .ok_or_else(|| eyre::eyre!("{t}: no progress marker — table not exported"))?;
+        let m: serde_json::Value = serde_json::from_slice(&body)?;
+        eyre::ensure!(m["done"].as_bool() == Some(true), "{t}: not done");
+        eyre::ensure!(
+            m["block"].as_u64() == Some(block),
+            "{t}: marker block {:?} != db block {block}",
+            m["block"]
+        );
+        vals.insert(t, (m["count"].as_u64().unwrap_or(0), m["part"].as_u64().unwrap_or(0)));
+    }
+    let meta = serde_json::to_vec_pretty(&serde_json::json!({
+        "v": 2,
+        "block": block,
+        "accounts": vals["accounts"].0,
+        "slots": vals["slots"].0,
+        "codes": vals["codes"].0,
+        "parts": {"accounts": vals["accounts"].1, "slots": vals["slots"].1, "codes": vals["codes"].1},
+        "record": {"accounts": 104, "slots": 96},
+        "keyed": "hashed",
+        "part_bytes": args.part_bytes,
+        "index_every": args.index_every,
+        "codes_index_every": args.codes_index_every,
+    }))?;
+    s3.put("meta.json", &meta)?;
+    eprintln!("done at block {block}");
+    Ok(())
 }
 
 fn hex_encode(b: &[u8]) -> String {
@@ -292,9 +381,21 @@ fn main() -> eyre::Result<()> {
     eyre::ensure!(block > 0, "no Finish stage checkpoint — refusing to export unanchored state");
     eprintln!("exporting state at block {block}");
 
+    if args.finalize {
+        return finalize(&s3, block, &args);
+    }
+    let want = |t: &str| args.only.as_deref().is_none_or(|o| o == t);
+    if let Some(o) = args.only.as_deref() {
+        eyre::ensure!(
+            matches!(o, "accounts" | "slots" | "codes"),
+            "--only must be accounts|slots|codes"
+        );
+        eprintln!("single-table mode: {o}");
+    }
+
     // ---- accounts: fixed 104 B records over HashedAccounts -------------
     let (mut sink, done) = Sink::open(&s3, "accounts", args.part_bytes, args.index_every, block)?;
-    if !done {
+    if want("accounts") && !done {
         loop {
             let tx = env.tx()?;
             let mut cur = tx.cursor_read::<tables::HashedAccounts>()?;
@@ -332,11 +433,11 @@ fn main() -> eyre::Result<()> {
             sink.flush(block, false)?;
         }
     }
-    let (n_accounts, parts_accounts) = sink.finish(block)?;
+    let (n_accounts, parts_accounts) = if want("accounts") { sink.finish(block)? } else { (0, 0) };
 
     // ---- slots: fixed 96 B records over HashedStorages (dupsort) -------
     let (mut sink, done) = Sink::open(&s3, "slots", args.part_bytes, args.index_every, block)?;
-    if !done {
+    if want("slots") && !done {
         loop {
             let tx = env.tx()?;
             let mut cur = tx.cursor_read::<tables::HashedStorages>()?;
@@ -381,11 +482,11 @@ fn main() -> eyre::Result<()> {
             sink.flush(block, false)?;
         }
     }
-    let (n_slots, parts_slots) = sink.finish(block)?;
+    let (n_slots, parts_slots) = if want("slots") { sink.finish(block)? } else { (0, 0) };
 
     // ---- codes: variable records over Bytecodes ------------------------
     let (mut sink, done) = Sink::open(&s3, "codes", args.part_bytes, args.codes_index_every, block)?;
-    if !done {
+    if want("codes") && !done {
         loop {
             let tx = env.tx()?;
             let mut cur = tx.cursor_read::<tables::Bytecodes>()?;
@@ -425,8 +526,12 @@ fn main() -> eyre::Result<()> {
             sink.flush(block, false)?;
         }
     }
-    let (n_codes, parts_codes) = sink.finish(block)?;
+    let (n_codes, parts_codes) = if want("codes") { sink.finish(block)? } else { (0, 0) };
 
+    if args.only.is_some() {
+        eprintln!("table complete; run --finalize once all three tables are done");
+        return Ok(());
+    }
     // meta.json LAST: readers treat its presence as "base complete".
     let meta = serde_json::to_vec_pretty(&serde_json::json!({
         "v": 2,
