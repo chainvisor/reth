@@ -23,13 +23,17 @@
 //! bytes is worse than pausing, so lock acquisition blocks; sidecar
 //! parse errors fall back to full-cache invalidation.
 
+#![allow(clippy::missing_const_for_fn)]
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-pub(crate) struct Barrier {
+pub struct Barrier {
     lock_path: PathBuf,
     ranges_path: PathBuf,
     data_path: PathBuf,
@@ -38,7 +42,7 @@ pub(crate) struct Barrier {
 
 static BARRIER: OnceLock<Option<Barrier>> = OnceLock::new();
 
-pub(crate) fn get(env_dir: &Path) -> Option<&'static Barrier> {
+pub fn get(env_dir: &Path) -> Option<&'static Barrier> {
     BARRIER
         .get_or_init(|| {
             let lock = std::env::var("CV_READER_TXN_BARRIER").ok()?;
@@ -58,7 +62,7 @@ impl Barrier {
     /// Take the shared lock for a transaction's lifetime (the
     /// returned file's close releases it) and consume any pending
     /// invalidation sidecar first.
-    pub(crate) fn enter_read_txn(&self) -> Option<std::fs::File> {
+    pub fn enter_read_txn(&self) -> Option<std::fs::File> {
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -225,4 +229,22 @@ fn device_to_file(extents: &[(u64, u64, u64)], dev_off: u64, len: u64) -> Vec<(u
         out.push((logical + (s - physical), e - s));
     }
     out
+}
+
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux_impl::{get, Barrier};
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct Barrier;
+#[cfg(not(target_os = "linux"))]
+impl Barrier {
+    pub(crate) fn enter_read_txn(&self) -> Option<std::fs::File> {
+        None
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn get(_env_dir: &std::path::Path) -> Option<&'static Barrier> {
+    None
 }
