@@ -122,8 +122,8 @@ where
     ///
     /// If `metrics` feature is enabled, it also updates the metrics.
     fn seek_hashed_entry(&mut self, key: B256) -> Result<Option<(B256, H::Value)>, DatabaseError> {
-        if let Some((last_key, last_value)) = self.last_next_result &&
-            last_key == key
+        if let Some((last_key, last_value)) = self.last_next_result
+            && last_key == key
         {
             trace!(target: "trie::node_iter", seek_key = ?key, "reusing result from last next() call instead of seeking");
             self.last_next_result = None; // Consume the cached value
@@ -217,7 +217,7 @@ where
                             *key,
                             self.walker.hash().unwrap(),
                             self.walker.children_are_in_trie(),
-                        ))))
+                        ))));
                     }
                 }
             }
@@ -227,7 +227,7 @@ where
                 // Check if the walker's key is less than the key of the current hashed entry
                 if self.walker.key().is_some_and(|key| key < &Nibbles::unpack(hashed_key)) {
                     self.should_check_walker_key = false;
-                    continue
+                    continue;
                 }
 
                 // Set the next hashed entry as a leaf node and return
@@ -236,7 +236,7 @@ where
 
                 #[cfg(feature = "metrics")]
                 self.metrics.inc_leaf_nodes_returned();
-                return Ok(Some(TrieElement::Leaf(hashed_key, value)))
+                return Ok(Some(TrieElement::Leaf(hashed_key, value)));
             }
 
             // Handle seeking and advancing based on the previous hashed key
@@ -278,9 +278,9 @@ where
                     //
                     // A deeper stored key may leave unvisited hashed entries between the seek
                     // prefix and the walker, so only skip the seek at the exact prefix.
-                    if can_skip_node &&
-                        self.walker.key().is_some_and(|key| key == &seek_prefix) &&
-                        self.walker.children_are_in_trie()
+                    if can_skip_node
+                        && self.walker.key().is_some_and(|key| key == &seek_prefix)
+                        && self.walker.children_are_in_trie()
                     {
                         trace!(
                             target: "trie::node_iter",
@@ -290,7 +290,7 @@ where
                         );
 
                         self.should_check_walker_key = false;
-                        continue
+                        continue;
                     }
 
                     self.current_hashed_entry = self.seek_hashed_entry(seek_key)?;
@@ -402,10 +402,12 @@ mod tests {
             slot(&[0x10, 0xa1]),
         ];
         let inserted = slot(&[0x10, 0x00]);
-        let old_state =
-            HashedPostState::default().with_accounts([(address, Some(account()))]).with_storages([
-                (address, HashedStorage::from_iter(old_slots.map(|slot| (slot, U256::from(1))))),
-            ]);
+        let old_state = HashedPostState::default()
+            .with_accounts([(address, Some(account()))])
+            .with_storages([(
+                address,
+                HashedStorage::from_iter(false, old_slots.map(|slot| (slot, U256::from(1)))),
+            )]);
         let old_sorted = old_state.clone().into_sorted();
         let (old_root, old_updates) = StateRoot::new(
             NoopTrieCursorFactory::default(),
@@ -420,12 +422,14 @@ mod tests {
             .with_storages([(
                 address,
                 HashedStorage::from_iter(
+                    false,
                     old_slots.into_iter().chain([inserted]).map(|slot| (slot, U256::from(1))),
                 ),
             )]);
-        let delta = HashedPostState::default()
-            .with_accounts([(address, Some(account()))])
-            .with_storages([(address, HashedStorage::from_iter([(inserted, U256::from(1))]))]);
+        let delta =
+            HashedPostState::default().with_accounts([(address, Some(account()))]).with_storages([
+                (address, HashedStorage::from_iter(false, [(inserted, U256::from(1))])),
+            ]);
         let new_sorted = new_state.clone().into_sorted();
         let rebuilt_root = StateRoot::new(
             NoopTrieCursorFactory::default(),
