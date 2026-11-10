@@ -34,7 +34,11 @@
 //! * `meta.json` — export block height and hash, counts, part size. Written LAST:
 //!   it is the commit point. The reader inserts results as base
 //!   observations AT THAT BLOCK; the segment stream carries every change
-//!   after it.
+//!   after it. The hash comes from the operator (`--hash`, the node's
+//!   `eth_getBlockByNumber` at the exported block): this reth keeps
+//!   headers and `CanonicalHeaders` in static files, which a frozen
+//!   `db/` copy lacks. `HeaderNumbers` stays in MDBX, so finalize checks
+//!   the hash against it in the same read transaction as the block.
 //!
 //! ## Per-part transactions + resume (why the loops look like this)
 //!
@@ -95,9 +99,15 @@ struct Args {
     only: Option<String>,
     /// Assemble meta.json from the three tables' done-markers (run after
     /// the per-table processes complete). Verifies all three finished at
-    /// the SAME block.
+    /// the SAME block. Needs `--hash`.
     #[arg(long, default_value_t = false)]
     finalize: bool,
+    /// Block hash at the exported block, written to meta.json. Get it from
+    /// the node's `eth_getBlockByNumber` at that block. Checked against the
+    /// DB's `HeaderNumbers`. Required with `--finalize`; table exports do
+    /// not need it.
+    #[arg(long, required_if_eq("finalize", "true"))]
+    hash: Option<B256>,
     /// Read-only PAGE WARMER: N range-cursors fault this table's pages
     /// into the OS cache in parallel and discard everything. A serial
     /// walker running behind them sweeps warm pages at RAM speed —
@@ -370,9 +380,13 @@ impl Sink {
 /// written when its totals equal the frozen DB's table entries
 /// (`[HashedAccounts, HashedStorages, Bytecodes]`): a wrong `--shards`
 /// otherwise publishes a partial state that readers serve as empty.
-/// `hash` is the canonical block hash at `block`: v2-convert needs it as
-/// the v2 top generation's hash.
-fn finalize(s3: &S3, block: u64, hash: B256, args: &Args, entries: [u64; 3]) -> eyre::Result<()> {
+/// The operator's `--hash` is the block hash at `block` (main checked it
+/// against `HeaderNumbers`): v2-convert needs it as the v2 top
+/// generation's hash.
+fn finalize(s3: &S3, block: u64, args: &Args, entries: [u64; 3]) -> eyre::Result<()> {
+    let hash = args.hash.ok_or_else(|| {
+        eyre::eyre!("refusing to write meta.json: no --hash (the block hash at {block})")
+    })?;
     for t in ["accounts", "slots"] {
         let extra = format!("progress/{t}-{:02}.json", args.shards);
         eyre::ensure!(
@@ -648,7 +662,7 @@ fn main() -> eyre::Result<()> {
     let s3 = S3 { base: args.s3.trim_end_matches('/').to_string(), endpoint: args.endpoint.clone() };
 
     // The height this state is true at: the Finish stage checkpoint.
-    let (block, hash, entries) = {
+    let (block, entries) = {
         let tx = env.tx()?;
         let mut stages = tx.cursor_read::<tables::StageCheckpoints>()?;
         let mut block = 0u64;
@@ -667,18 +681,22 @@ fn main() -> eyre::Result<()> {
             "table entries: HashedAccounts={} HashedStorages={} Bytecodes={}",
             entries[0], entries[1], entries[2],
         );
-        // Read in the same transaction as `block`, so meta.json pairs the
-        // height with the hash of the exact frozen image.
-        let hash = tx
-            .get::<tables::CanonicalHeaders>(block)?
-            .ok_or_else(|| eyre::eyre!("no canonical hash at block {block} — refusing to export"))?;
-        (block, hash, entries)
+        // Same transaction as `block`: the operator's hash must name
+        // exactly this frozen image's block.
+        if let Some(hash) = args.hash {
+            let at = tx.get::<tables::HeaderNumbers>(hash)?;
+            eyre::ensure!(
+                at == Some(block),
+                "--hash {hash} is not block {block}: HeaderNumbers maps it to {at:?}"
+            );
+        }
+        (block, entries)
     };
     eyre::ensure!(block > 0, "no Finish stage checkpoint — refusing to export unanchored state");
-    eprintln!("exporting state at block {block} ({hash})");
+    eprintln!("exporting state at block {block}");
 
     if args.finalize {
-        return finalize(&s3, block, hash, &args, entries);
+        return finalize(&s3, block, &args, entries);
     }
     let want = |t: &str| args.only.as_deref().is_none_or(|o| o == t);
     if let Some(o) = args.only.as_deref() {
@@ -806,7 +824,7 @@ fn main() -> eyre::Result<()> {
     // codes finished first and 'failed' on slots-01) — harmless because
     // the last process still succeeded, but a false FAILED in every
     // orchestrator log.
-    match finalize(&s3, block, hash, &args, entries) {
+    match finalize(&s3, block, &args, entries) {
         Ok(()) => {}
         Err(e) if args.only.is_some() => {
             eprintln!("table done; meta waits for the last finisher ({e:#})");
