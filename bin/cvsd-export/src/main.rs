@@ -31,7 +31,7 @@
 //!   at boot and answers any key with ONE ranged GET. Codes index every
 //!   8th record (variable sizes; a stripe is bounded by the NEXT entry's
 //!   offset, so sparser would inflate the per-miss fetch).
-//! * `meta.json` — export block height, counts, part size. Written LAST:
+//! * `meta.json` — export block height and hash, counts, part size. Written LAST:
 //!   it is the commit point. The reader inserts results as base
 //!   observations AT THAT BLOCK; the segment stream carries every change
 //!   after it.
@@ -370,7 +370,9 @@ impl Sink {
 /// written when its totals equal the frozen DB's table entries
 /// (`[HashedAccounts, HashedStorages, Bytecodes]`): a wrong `--shards`
 /// otherwise publishes a partial state that readers serve as empty.
-fn finalize(s3: &S3, block: u64, args: &Args, entries: [u64; 3]) -> eyre::Result<()> {
+/// `hash` is the canonical block hash at `block`: v2-convert needs it as
+/// the v2 top generation's hash.
+fn finalize(s3: &S3, block: u64, hash: B256, args: &Args, entries: [u64; 3]) -> eyre::Result<()> {
     for t in ["accounts", "slots"] {
         let extra = format!("progress/{t}-{:02}.json", args.shards);
         eyre::ensure!(
@@ -436,6 +438,7 @@ fn finalize(s3: &S3, block: u64, args: &Args, entries: [u64; 3]) -> eyre::Result
     let meta = serde_json::to_vec_pretty(&serde_json::json!({
         "v": 3,
         "block": block,
+        "hash": format!("{hash}"),
         "accounts": totals["accounts"],
         "slots": totals["slots"],
         "codes": codes_count,
@@ -645,7 +648,7 @@ fn main() -> eyre::Result<()> {
     let s3 = S3 { base: args.s3.trim_end_matches('/').to_string(), endpoint: args.endpoint.clone() };
 
     // The height this state is true at: the Finish stage checkpoint.
-    let (block, entries) = {
+    let (block, hash, entries) = {
         let tx = env.tx()?;
         let mut stages = tx.cursor_read::<tables::StageCheckpoints>()?;
         let mut block = 0u64;
@@ -664,13 +667,18 @@ fn main() -> eyre::Result<()> {
             "table entries: HashedAccounts={} HashedStorages={} Bytecodes={}",
             entries[0], entries[1], entries[2],
         );
-        (block, entries)
+        // Read in the same transaction as `block`, so meta.json pairs the
+        // height with the hash of the exact frozen image.
+        let hash = tx
+            .get::<tables::CanonicalHeaders>(block)?
+            .ok_or_else(|| eyre::eyre!("no canonical hash at block {block} — refusing to export"))?;
+        (block, hash, entries)
     };
     eyre::ensure!(block > 0, "no Finish stage checkpoint — refusing to export unanchored state");
-    eprintln!("exporting state at block {block}");
+    eprintln!("exporting state at block {block} ({hash})");
 
     if args.finalize {
-        return finalize(&s3, block, &args, entries);
+        return finalize(&s3, block, hash, &args, entries);
     }
     let want = |t: &str| args.only.as_deref().is_none_or(|o| o == t);
     if let Some(o) = args.only.as_deref() {
@@ -798,7 +806,7 @@ fn main() -> eyre::Result<()> {
     // codes finished first and 'failed' on slots-01) — harmless because
     // the last process still succeeded, but a false FAILED in every
     // orchestrator log.
-    match finalize(&s3, block, &args, entries) {
+    match finalize(&s3, block, hash, &args, entries) {
         Ok(()) => {}
         Err(e) if args.only.is_some() => {
             eprintln!("table done; meta waits for the last finisher ({e:#})");
