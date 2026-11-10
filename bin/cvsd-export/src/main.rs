@@ -366,8 +366,21 @@ impl Sink {
 
 /// Assemble meta.json from the three tables' DONE markers. The markers
 /// are block-pinned, so this also proves all three walked the same
-/// frozen image. meta.json stays the single commit point.
-fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
+/// frozen image. meta.json stays the single commit point, so it is only
+/// written when its totals equal the frozen DB's table entries
+/// (`[HashedAccounts, HashedStorages, Bytecodes]`): a wrong `--shards`
+/// otherwise publishes a partial state that readers serve as empty.
+fn finalize(s3: &S3, block: u64, args: &Args, entries: [u64; 3]) -> eyre::Result<()> {
+    for t in ["accounts", "slots"] {
+        let extra = format!("progress/{t}-{:02}.json", args.shards);
+        eyre::ensure!(
+            s3.get(&extra).is_none(),
+            "{}/{extra} exists, so the export used more than --shards {} shards; \
+             rerun --finalize with the export's --shards",
+            s3.base,
+            args.shards
+        );
+    }
     let read_marker = |name: &str| -> eyre::Result<(u64, Vec<u64>)> {
         let body = s3
             .get(&format!("progress/{name}.json"))
@@ -406,6 +419,20 @@ fn finalize(s3: &S3, block: u64, args: &Args) -> eyre::Result<()> {
     }
     let (codes_count, codes_sizes) = read_marker("codes")?;
     sizes.insert("codes".to_string(), serde_json::json!(codes_sizes));
+    let found = [totals["accounts"], totals["slots"], codes_count];
+    let mismatches: Vec<String> = ["HashedAccounts", "HashedStorages", "Bytecodes"]
+        .iter()
+        .zip(entries.iter().zip(found))
+        .filter(|(_, (e, f))| **e != *f)
+        .map(|(t, (e, f))| format!("{t}: expected {e}, found {f}"))
+        .collect();
+    eyre::ensure!(
+        mismatches.is_empty(),
+        "refusing to write meta.json: marker totals differ from the DB at block {block} ({}) — \
+         likely a wrong --shards (used {})",
+        mismatches.join("; "),
+        args.shards
+    );
     let meta = serde_json::to_vec_pretty(&serde_json::json!({
         "v": 3,
         "block": block,
@@ -618,7 +645,7 @@ fn main() -> eyre::Result<()> {
     let s3 = S3 { base: args.s3.trim_end_matches('/').to_string(), endpoint: args.endpoint.clone() };
 
     // The height this state is true at: the Finish stage checkpoint.
-    let block = {
+    let (block, entries) = {
         let tx = env.tx()?;
         let mut stages = tx.cursor_read::<tables::StageCheckpoints>()?;
         let mut block = 0u64;
@@ -628,19 +655,22 @@ fn main() -> eyre::Result<()> {
                 block = cp.block_number;
             }
         }
+        let entries = [
+            tx.entries::<tables::HashedAccounts>()? as u64,
+            tx.entries::<tables::HashedStorages>()? as u64,
+            tx.entries::<tables::Bytecodes>()? as u64,
+        ];
         eprintln!(
-            "table entries: HashedAccounts={:?} HashedStorages={:?} Bytecodes={:?}",
-            tx.entries::<tables::HashedAccounts>(),
-            tx.entries::<tables::HashedStorages>(),
-            tx.entries::<tables::Bytecodes>(),
+            "table entries: HashedAccounts={} HashedStorages={} Bytecodes={}",
+            entries[0], entries[1], entries[2],
         );
-        block
+        (block, entries)
     };
     eyre::ensure!(block > 0, "no Finish stage checkpoint — refusing to export unanchored state");
     eprintln!("exporting state at block {block}");
 
     if args.finalize {
-        return finalize(&s3, block, &args);
+        return finalize(&s3, block, &args, entries);
     }
     let want = |t: &str| args.only.as_deref().is_none_or(|o| o == t);
     if let Some(o) = args.only.as_deref() {
@@ -768,7 +798,7 @@ fn main() -> eyre::Result<()> {
     // codes finished first and 'failed' on slots-01) — harmless because
     // the last process still succeeded, but a false FAILED in every
     // orchestrator log.
-    match finalize(&s3, block, &args) {
+    match finalize(&s3, block, &args, entries) {
         Ok(()) => {}
         Err(e) if args.only.is_some() => {
             eprintln!("table done; meta waits for the last finisher ({e:#})");
