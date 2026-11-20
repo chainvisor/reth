@@ -1155,8 +1155,9 @@ where
 
     /// Creates an [`ExExLauncher`] for the installed ExExes.
     ///
-    /// This returns the launcher before calling `.launch()`, allowing custom configuration
-    /// such as setting the WAL blocks warning threshold for L2 chains with faster block times:
+    /// The WAL blocks warning threshold comes from `--exex.wal-blocks-warning` when set.
+    /// This returns the launcher before calling `.launch()`, allowing further custom
+    /// configuration, such as a threshold set in code for L2 chains with faster block times:
     ///
     /// ```ignore
     /// ctx.exex_launcher(exexes)
@@ -1172,12 +1173,16 @@ where
             Box<dyn crate::exex::BoxedLaunchExEx<NodeAdapter<T, CB::Components>>>,
         )>,
     ) -> ExExLauncher<NodeAdapter<T, CB::Components>> {
-        ExExLauncher::new(
+        let launcher = ExExLauncher::new(
             self.head(),
             self.node_adapter().clone(),
             installed_exex,
             self.configs().clone(),
-        )
+        );
+        match self.node_config().exex.wal_blocks_warning {
+            Some(threshold) => launcher.with_wal_blocks_warning(threshold),
+            None => launcher,
+        }
     }
 
     /// Creates the ERA import source based on node configuration.

@@ -80,5 +80,9 @@ pub use storage::{DefaultStorageValues, StorageArgs};
 mod jit;
 pub use jit::JitArgs;
 
+/// `ExExArgs` for configuring the ExEx manager.
+mod exex;
+pub use exex::ExExArgs;
+
 mod error;
 pub mod types;
