@@ -1207,6 +1207,12 @@ JIT:
 
           IR, assembly, and bytecode are written to `<datadir>/jit/<spec_id>/<code_hash>/` for each compiled contract. Note that this is not ever cleaned up, and has a non negligible performance overhead.
 
+ExEx:
+      --exex.wal-blocks-warning <BLOCKS>
+          Number of blocks in the ExEx write-ahead log above which the node warns that the WAL is not getting cleared.
+
+          The WAL keeps every block above the lower of the finalized block and the lowest ExEx finished height, so on a healthy chain it holds about the blocks between finalized and head. Chains with short block times need a higher value than the default of 128, which suits 12-second blocks.
+
 Logging:
       --log.stdout.format <FORMAT>
           The format to use for logs written to stdout

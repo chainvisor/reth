@@ -2,7 +2,7 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, JitArgs, NetworkArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, ExExArgs, JitArgs, NetworkArgs,
         PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
@@ -158,6 +158,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All JIT related arguments with --jit prefix
     pub jit: JitArgs,
+
+    /// All ExEx related arguments with --exex prefix
+    pub exex: ExExArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -191,6 +194,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files: StaticFilesArgs::default(),
             storage: StorageArgs::default(),
             jit: JitArgs::default(),
+            exex: ExExArgs::default(),
         }
     }
 
@@ -272,6 +276,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files,
             storage,
             jit,
+            exex,
             ..
         } = self;
         NodeConfig {
@@ -293,6 +298,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files,
             storage,
             jit,
+            exex,
         }
     }
 
@@ -372,6 +378,12 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     /// Set the storage args for the node
     pub const fn with_storage(mut self, storage: StorageArgs) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Set the ExEx args for the node
+    pub const fn with_exex(mut self, exex: ExExArgs) -> Self {
+        self.exex = exex;
         self
     }
 
@@ -592,6 +604,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files: self.static_files,
             storage: self.storage,
             jit: self.jit,
+            exex: self.exex,
         }
     }
 
@@ -635,6 +648,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             static_files: self.static_files,
             storage: self.storage,
             jit: self.jit.clone(),
+            exex: self.exex,
         }
     }
 }
